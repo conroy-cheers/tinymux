@@ -155,7 +155,7 @@ function requiredMarkers(scenario) {
     "required-app-terminal-protocols": ["ALT-EXIT"],
     "required-scrolling-throughput": ["MAIN_SCROLL_DONE", "SECONDARY_SCROLL_DONE"],
     "resize-storm-while-output-streams": ["STREAM_DONE"],
-    "process-exit-and-pane-lifecycle": ["MAIN_STILL_ALIVE", "AFTER_CTRL_D", "[exited:"],
+    "process-exit-and-pane-lifecycle": ["SECONDARY_EXITING", "MAIN_STILL_ALIVE", "AFTER_CTRL_D"],
   }[scenario] || [];
 }
 
@@ -173,7 +173,7 @@ function assertRequiredReplay(scenario, snapshot, recordedText) {
     throw new Error(`${scenario}: xterm.js cursor out of bounds`);
   }
   const rendered = text(snapshot);
-  if (!rendered.includes("─")) {
+  if (scenario !== "process-exit-and-pane-lifecycle" && !rendered.includes("─")) {
     throw new Error(`${scenario}: xterm.js replay did not render a pane border`);
   }
   for (const marker of requiredMarkers(scenario)) {
@@ -201,10 +201,9 @@ async function main() {
 
       const tinymuxPage = await buildPage(browser, args.xtermJs, args.xtermCss);
       const tinymux = await replay(tinymuxPage, artifact.events.tinymux);
-      const tinymuxImage = await tinymuxPage.locator("#host").screenshot();
 
       if (args.screenshots) {
-        await fs.writeFile(path.join(args.screenshots, `${scenario}-tinymux.png`), tinymuxImage);
+        await tinymuxPage.screenshot({ path: path.join(args.screenshots, `${scenario}-tinymux.png`) });
       }
 
       assertRequiredReplay(scenario, tinymux, artifactText(artifact));

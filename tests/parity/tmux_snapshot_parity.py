@@ -577,7 +577,7 @@ def tmux_command(
         "set-option",
         "-g",
         "remain-on-exit",
-        "on",
+        "off",
         ";",
         "set-option",
         "-g",
@@ -882,7 +882,12 @@ def scenarios() -> tuple[Scenario, ...]:
             ("LIFE-001", "LIFE-002", "LIFE-003", "TERM-003"),
             (
                 Step("focus-secondary", pane_down(), frames=8),
-                Step("secondary-exit", shell_line(f"{marker_command('SECONDARY_EXITING')}; exit"), wait_for="SECONDARY_EXITING", frames=16),
+                Step(
+                    "secondary-exit",
+                    shell_line(f"{marker_command('SECONDARY_EXITING')}; sleep 0.05; exit"),
+                    wait_for="SECONDARY_EXITING",
+                    frames=16,
+                ),
                 Step("focus-main", pane_up(), frames=8),
                 Step("main-still-alive", printf_line("MAIN_STILL_ALIVE"), wait_for="MAIN_STILL_ALIVE", frames=8),
                 Step("cat-ctrl-d", shell_line("cat"), frames=8),
@@ -1039,8 +1044,12 @@ def required_scenario_invariants(scenario: Scenario, traces: dict[str, Any]) -> 
     elif scenario.name == "process-exit-and-pane-lifecycle":
         for text in ("SECONDARY_EXITING", "MAIN_STILL_ALIVE", "AFTER_CTRL_D"):
             require_text(text)
-        if "[exited:" not in visible:
-            failures.append(f"{scenario.name}: exited pane marker never appeared")
+        if "[exited:" in visible:
+            failures.append(f"{scenario.name}: tinymux rendered an exited pane marker")
+        if "SECONDARY_EXITING" in latest:
+            failures.append(f"{scenario.name}: exited pane content remained visible")
+        if "─" in latest:
+            failures.append(f"{scenario.name}: pane border remained after secondary pane exited")
 
     if not latest and snapshots:
         failures.append(f"{scenario.name}: final snapshot was empty")

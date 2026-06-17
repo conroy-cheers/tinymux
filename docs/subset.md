@@ -7,15 +7,17 @@ but is not required for v1.
 
 ## Layout
 
-- `LAYOUT-001` REQUIRED: tinymux presents exactly two panes.
+- `LAYOUT-001` REQUIRED: tinymux starts with exactly two panes.
 - `LAYOUT-002` REQUIRED: the main pane is always above the secondary pane.
-- `LAYOUT-003` REQUIRED: the two panes are separated by one horizontal border.
+- `LAYOUT-003` REQUIRED: while both panes are alive, the two panes are
+  separated by one horizontal border.
 - `LAYOUT-004` REQUIRED: the secondary pane defaults to 9 rows of content.
 - `LAYOUT-005` REQUIRED: on small terminals, tinymux clamps pane heights to keep
-  both panes visible whenever the terminal can fit one main row, one border row,
-  and one secondary row.
-- `LAYOUT-006` REQUIRED: v1 does not support creating, destroying, rearranging,
-  or interactively resizing panes.
+  both live panes visible whenever the terminal can fit one main row, one border
+  row, and one secondary row.
+- `LAYOUT-006` REQUIRED: v1 does not support creating, rearranging, or
+  interactively resizing panes. Panes are destroyed only when their child
+  process exits.
 
 ## Startup and Commands
 
@@ -25,6 +27,8 @@ but is not required for v1.
 - `CLI-003` REQUIRED: each command string is executed as `$SHELL -lc <cmd>`.
 - `CLI-004` REQUIRED: if `$SHELL` is unset or empty, tinymux may use `/bin/sh`.
 - `CLI-005` REQUIRED: both commands run immediately when the UI starts.
+- `CLI-006` REQUIRED: `--terminal-profile <TERM>` selects the `TERM` value
+  advertised to pane processes. The default is `auto`.
 
 ## Input and Focus
 
@@ -37,9 +41,10 @@ but is not required for v1.
 
 ## Pane Lifecycle
 
-- `LIFE-001` REQUIRED: if either pane's child process exits, the pane remains
-  visible in an exited state.
-- `LIFE-002` REQUIRED: after one pane exits, the other pane remains usable.
+- `LIFE-001` REQUIRED: if either pane's child process exits, that pane is
+  removed from the layout.
+- `LIFE-002` REQUIRED: after one pane exits, the other pane remains usable and
+  expands to the full terminal.
 - `LIFE-003` REQUIRED: v1 does not require respawning exited pane commands.
 
 ## Terminal Behavior
@@ -62,6 +67,27 @@ but is not required for v1.
   tmux for focused terminal applications.
 - `TERM-010` REQUIRED: sustained output and resize churn must not corrupt pane
   contents or route output to the wrong pane.
+
+## Terminal Profiles
+
+- `PROFILE-001` REQUIRED: `--terminal-profile auto` inspects the outer
+  terminal's `$TERM` and advertises the richest common terminfo profile that is
+  both supported by the outer terminal and implemented by tinymux.
+- `PROFILE-002` REQUIRED: tinymux does not translate between incompatible
+  terminal protocols. A forced profile is a startup error if the outer terminal
+  does not advertise the required features.
+- `PROFILE-003` REQUIRED: a forced profile is a startup error if it requires
+  protocol behavior that tinymux does not emulate yet.
+- `PROFILE-004` REQUIRED: common profiles include the vt100/ansi/linux,
+  xterm/xterm-256color/xterm-direct, screen, tmux, alacritty, foot, wezterm,
+  xterm-kitty, xterm-ghostty, rio, contour, st, rxvt, putty, gnome, konsole,
+  iTerm2, vte, and cygwin families.
+- `PROFILE-005` REQUIRED: pane processes inherit the parent terminfo search path
+  so host-specific terminfo entries remain discoverable inside panes.
+- `PROFILE-006` REQUIRED: xterm-kitty and xterm-ghostty profiles remain
+  available in `auto` mode when the outer terminal advertises their required
+  protocols, including synchronized updates, the kitty keyboard protocol, and
+  kitty graphics passthrough.
 
 ## Extended Compatibility
 

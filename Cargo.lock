@@ -591,6 +591,7 @@ dependencies = [
  "portable-pty",
  "signal-hook",
  "vt100",
+ "vte",
 ]
 
 [[package]]
