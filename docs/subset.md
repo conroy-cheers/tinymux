@@ -67,6 +67,8 @@ but is not required for v1.
   tmux for focused terminal applications.
 - `TERM-010` REQUIRED: sustained output and resize churn must not corrupt pane
   contents or route output to the wrong pane.
+- `TERM-011` REQUIRED: both panes retain scrollback and can be scrolled without
+  leaking wheel input to child shells when mouse reporting is disabled.
 
 ## Terminal Profiles
 
@@ -91,7 +93,8 @@ but is not required for v1.
 
 ## Extended Compatibility
 
-- `EXT-001` EXTENDED: copy-mode scrollback is not part of v1 required behavior.
+- `EXT-001` EXTENDED: full tmux copy-mode selection, search, and buffer commands
+  are not part of v1 required behavior.
 - `EXT-002` EXTENDED: tmux sessions, windows, additional panes, arbitrary splits,
   command prompts, status bars, tmux configuration files, and tmux plugin
   compatibility are not part of v1 required behavior.

@@ -19,6 +19,8 @@ const DEFAULT_MAIN_ROWS: u16 = DEFAULT_TOTAL_ROWS - SECONDARY_ROWS - 1;
 const FLOOD_BATCH: usize = 1024 * 1024;
 const BACKGROUND_FLUSH: Duration = Duration::from_millis(16);
 const FLOOD_FLUSH: Duration = Duration::from_millis(8);
+const SCROLLBACK_LINES: usize = 10_000;
+const WHEEL_SCROLL_LINES: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -592,13 +594,72 @@ enum KittyGraphicsScanner {
     },
 }
 
+impl KittyGraphicsScanner {
+    fn feed(&mut self, byte: u8) -> Option<Vec<u8>> {
+        let state = mem::take(self);
+        let mut completed = None;
+        *self = match state {
+            KittyGraphicsScanner::Ground => match byte {
+                b'\x1b' => KittyGraphicsScanner::Esc,
+                0x9f => KittyGraphicsScanner::C1Apc,
+                _ => KittyGraphicsScanner::Ground,
+            },
+            KittyGraphicsScanner::Esc => match byte {
+                b'_' => KittyGraphicsScanner::EscUnderscore,
+                b'\x1b' => KittyGraphicsScanner::Esc,
+                0x9f => KittyGraphicsScanner::C1Apc,
+                _ => KittyGraphicsScanner::Ground,
+            },
+            KittyGraphicsScanner::EscUnderscore => match byte {
+                b'G' => KittyGraphicsScanner::Capturing {
+                    bytes: vec![b'\x1b', b'_', b'G'],
+                    pending_esc: false,
+                },
+                b'\x1b' => KittyGraphicsScanner::Esc,
+                0x9f => KittyGraphicsScanner::C1Apc,
+                _ => KittyGraphicsScanner::Ground,
+            },
+            KittyGraphicsScanner::C1Apc => match byte {
+                b'G' => KittyGraphicsScanner::Capturing {
+                    bytes: vec![0x9f, b'G'],
+                    pending_esc: false,
+                },
+                b'\x1b' => KittyGraphicsScanner::Esc,
+                0x9f => KittyGraphicsScanner::C1Apc,
+                _ => KittyGraphicsScanner::Ground,
+            },
+            KittyGraphicsScanner::Capturing {
+                mut bytes,
+                pending_esc,
+            } => {
+                bytes.push(byte);
+                if byte == 0x9c || (pending_esc && byte == b'\\') {
+                    completed = Some(bytes);
+                    KittyGraphicsScanner::Ground
+                } else {
+                    KittyGraphicsScanner::Capturing {
+                        bytes,
+                        pending_esc: byte == b'\x1b',
+                    }
+                }
+            }
+        };
+        completed
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlacedKittyGraphic {
+    sequence: Vec<u8>,
+    cursor_position: (u16, u16),
+}
+
 struct ProtocolEngine {
     profile: TerminalProfile,
     parser: vte::Parser,
     dcs_capture: Option<DcsCapture>,
     keyboard: KittyKeyboardState,
     synchronized_update: bool,
-    kitty_graphics: KittyGraphicsScanner,
 }
 
 impl ProtocolEngine {
@@ -609,7 +670,6 @@ impl ProtocolEngine {
             dcs_capture: None,
             keyboard: KittyKeyboardState::default(),
             synchronized_update: false,
-            kitty_graphics: KittyGraphicsScanner::default(),
         }
     }
 
@@ -622,11 +682,6 @@ impl ProtocolEngine {
     }
 
     fn process(&mut self, bytes: &[u8], cursor_position: (u16, u16)) -> TerminalEffects {
-        let kitty_graphics = if self.profile.features.kitty_graphics {
-            scan_kitty_graphics(&mut self.kitty_graphics, bytes)
-        } else {
-            Vec::new()
-        };
         let keyboard_before = self.keyboard.flags();
         let mut responder = ProtocolResponder {
             profile: self.profile,
@@ -646,7 +701,6 @@ impl ProtocolEngine {
         TerminalEffects {
             child_responses: responder.child_responses,
             outer_passthrough: responder.outer_passthrough,
-            kitty_graphics,
             keyboard_flags: if responder.keyboard_changed
                 && self.keyboard.flags() != keyboard_before
             {
@@ -662,7 +716,6 @@ impl ProtocolEngine {
 struct TerminalEffects {
     child_responses: Vec<u8>,
     outer_passthrough: Vec<u8>,
-    kitty_graphics: Vec<Vec<u8>>,
     keyboard_flags: Option<u16>,
 }
 
@@ -825,7 +878,8 @@ struct Pane {
     master: Box<dyn MasterPty + Send>,
     reader_eof: bool,
     exit_status: Option<String>,
-    pending_kitty_graphics: Vec<Vec<u8>>,
+    kitty_graphics: KittyGraphicsScanner,
+    pending_kitty_graphics: Vec<PlacedKittyGraphic>,
 }
 
 impl Pane {
@@ -915,14 +969,47 @@ impl Pane {
             .context("spawn child waiter thread")?;
 
         Ok(Self {
-            parser: vt100::Parser::new(rows, layout.cols, 0),
+            parser: vt100::Parser::new(rows, layout.cols, SCROLLBACK_LINES),
             protocol: ProtocolEngine::new(terminal.advertised_profile),
             writer,
             master: pair.master,
             reader_eof: false,
             exit_status: None,
+            kitty_graphics: KittyGraphicsScanner::default(),
             pending_kitty_graphics: Vec::new(),
         })
+    }
+
+    fn process_output(&mut self, bytes: &[u8]) -> Vec<PlacedKittyGraphic> {
+        process_terminal_output(
+            &mut self.parser,
+            &mut self.kitty_graphics,
+            self.protocol.profile.features.kitty_graphics,
+            bytes,
+        )
+    }
+
+    fn mouse_mode_enabled(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    fn scroll_by(&mut self, delta: isize) -> bool {
+        let before = self.scrollback();
+        let next = if delta.is_negative() {
+            before.saturating_sub(delta.unsigned_abs())
+        } else {
+            before.saturating_add(delta as usize)
+        };
+        self.parser.screen_mut().set_scrollback(next);
+        self.scrollback() != before
+    }
+
+    fn scroll_to_live(&mut self) -> bool {
+        self.scroll_by(-(self.scrollback() as isize))
     }
 
     fn is_complete(&self) -> bool {
@@ -970,9 +1057,11 @@ struct App {
     panes: [Option<Pane>; 2],
     focus: PaneId,
     prefix: PrefixState,
+    scroll_mode: bool,
     rendered_once: bool,
     dirty: bool,
     pending_bytes: usize,
+    input_pending: Vec<u8>,
     outer_passthrough: Vec<u8>,
     outer_post_render: Vec<u8>,
     outer_keyboard_layer_active: bool,
@@ -999,9 +1088,11 @@ impl App {
             panes: [Some(main), Some(secondary)],
             focus: PaneId::Main,
             prefix: PrefixState::Idle,
+            scroll_mode: false,
             rendered_once: false,
             dirty: true,
             pending_bytes: 0,
+            input_pending: Vec::new(),
             outer_passthrough,
             outer_post_render: Vec::new(),
             outer_keyboard_layer_active,
@@ -1043,6 +1134,65 @@ impl App {
         self.focused_pane()
             .map(|(_, pane)| pane.protocol.kitty_keyboard_flags())
             .unwrap_or(0)
+    }
+
+    fn pane_at_row(&self, row: u16) -> Option<PaneId> {
+        if !self.both_panes_active() {
+            return self.focused_pane().map(|(id, _)| id);
+        }
+        if row == 0 || row > self.layout.rows {
+            return None;
+        }
+        if row <= self.layout.main_rows {
+            Some(PaneId::Main)
+        } else if row == self.layout.border_row {
+            None
+        } else {
+            Some(PaneId::Secondary)
+        }
+    }
+
+    fn pane_page_size(&self, id: PaneId) -> usize {
+        let rows = if self.both_panes_active() {
+            self.layout.pane_rows(id)
+        } else {
+            self.layout.rows
+        };
+        usize::from(rows.saturating_sub(1).max(1))
+    }
+
+    fn scroll_pane_by(&mut self, id: PaneId, delta: isize) -> bool {
+        let changed = self
+            .pane_mut(id)
+            .map(|pane| pane.scroll_by(delta))
+            .unwrap_or(false);
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
+    fn scroll_focused_by(&mut self, delta: isize) -> bool {
+        self.scroll_pane_by(self.focus, delta)
+    }
+
+    fn scroll_focused_page(&mut self, direction: ScrollDirection) -> bool {
+        let amount = self.pane_page_size(self.focus) as isize;
+        match direction {
+            ScrollDirection::Up => self.scroll_focused_by(amount),
+            ScrollDirection::Down => self.scroll_focused_by(-amount),
+        }
+    }
+
+    fn exit_scroll_mode(&mut self) {
+        self.scroll_mode = false;
+        let changed = self
+            .pane_mut(self.focus)
+            .map(|pane| pane.scroll_to_live())
+            .unwrap_or(false);
+        if changed {
+            self.dirty = true;
+        }
     }
 
     fn sync_outer_keyboard(&mut self, target: u16) {
@@ -1140,11 +1290,14 @@ impl App {
                     return Ok(true);
                 }
                 self.pending_bytes += bytes.len();
-                let effects = {
+                let (effects, placed_graphics) = {
                     let pane = self.pane_mut(id).expect("pane checked above");
-                    pane.parser.process(&bytes);
+                    let placed_graphics = pane.process_output(&bytes);
                     let cursor_position = pane.parser.screen().cursor_position();
-                    pane.protocol.process(&bytes, cursor_position)
+                    (
+                        pane.protocol.process(&bytes, cursor_position),
+                        placed_graphics,
+                    )
                 };
                 if !effects.child_responses.is_empty() {
                     let pane = self.pane_mut(id).expect("pane checked above");
@@ -1160,7 +1313,7 @@ impl App {
                 let mut graphics_to_render = Vec::new();
                 let synchronized = {
                     let pane = self.pane_mut(id).expect("pane checked above");
-                    pane.pending_kitty_graphics.extend(effects.kitty_graphics);
+                    pane.pending_kitty_graphics.extend(placed_graphics);
                     if pane.protocol.synchronized_update() {
                         true
                     } else {
@@ -1209,27 +1362,124 @@ impl App {
     }
 
     fn handle_input(&mut self, bytes: &[u8]) -> Result<()> {
-        for byte in bytes {
-            match self.prefix.feed(*byte) {
-                PrefixAction::None => {}
-                PrefixAction::Forward(data) => {
-                    if let Some(pane) = self.pane_mut(self.focus) {
-                        pane.writer.write_all(&data)?;
+        self.input_pending.extend_from_slice(bytes);
+        let pending = mem::take(&mut self.input_pending);
+        let mut idx = 0;
+        while idx < pending.len() {
+            match parse_sgr_mouse(&pending[idx..]) {
+                ParseResult::Complete(len, event) => {
+                    if self.handle_mouse_event(event)? {
+                        idx += len;
+                        continue;
                     }
                 }
-                PrefixAction::Focus(id) => {
-                    if self.pane(id).is_some() {
-                        self.focus = id;
-                        self.sync_outer_keyboard(self.focused_keyboard_flags());
-                        self.dirty = true;
+                ParseResult::Incomplete => break,
+                ParseResult::NoMatch => {}
+            }
+
+            if self.scroll_mode {
+                match parse_scroll_mode_input(&pending[idx..]) {
+                    ParseResult::Complete(len, action) => {
+                        self.handle_scroll_action(action);
+                        idx += len;
+                        continue;
+                    }
+                    ParseResult::Incomplete => break,
+                    ParseResult::NoMatch => {
+                        idx += 1;
+                        continue;
                     }
                 }
             }
+
+            let byte = pending[idx];
+            idx += 1;
+            self.handle_input_byte(byte)?;
+        }
+        if idx < pending.len() {
+            self.input_pending.extend_from_slice(&pending[idx..]);
         }
         if let Some(pane) = self.pane_mut(self.focus) {
             pane.writer.flush()?;
         }
         Ok(())
+    }
+
+    fn handle_input_byte(&mut self, byte: u8) -> Result<()> {
+        match self.prefix.feed(byte) {
+            PrefixAction::None => {}
+            PrefixAction::Forward(data) => {
+                let scrolled = if let Some(pane) = self.pane_mut(self.focus) {
+                    let scrolled = pane.scroll_to_live();
+                    pane.writer.write_all(&data)?;
+                    scrolled
+                } else {
+                    false
+                };
+                if scrolled {
+                    self.dirty = true;
+                }
+            }
+            PrefixAction::Focus(id) => {
+                if self.pane(id).is_some() {
+                    self.focus = id;
+                    self.sync_outer_keyboard(self.focused_keyboard_flags());
+                    self.dirty = true;
+                }
+            }
+            PrefixAction::EnterScrollMode => {
+                self.scroll_mode = true;
+                self.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_mouse_event(&mut self, event: SgrMouseEvent) -> Result<bool> {
+        if !event.pressed {
+            return Ok(false);
+        }
+        let Some(direction) = event.wheel_direction() else {
+            return Ok(false);
+        };
+        let Some(id) = self.pane_at_row(event.row) else {
+            return Ok(true);
+        };
+        if self
+            .pane(id)
+            .map(|pane| pane.mouse_mode_enabled())
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let amount = WHEEL_SCROLL_LINES as isize;
+        match direction {
+            ScrollDirection::Up => {
+                self.scroll_pane_by(id, amount);
+            }
+            ScrollDirection::Down => {
+                self.scroll_pane_by(id, -amount);
+            }
+        }
+        Ok(true)
+    }
+
+    fn handle_scroll_action(&mut self, action: ScrollAction) {
+        match action {
+            ScrollAction::LineUp => {
+                self.scroll_focused_by(1);
+            }
+            ScrollAction::LineDown => {
+                self.scroll_focused_by(-1);
+            }
+            ScrollAction::PageUp => {
+                self.scroll_focused_page(ScrollDirection::Up);
+            }
+            ScrollAction::PageDown => {
+                self.scroll_focused_page(ScrollDirection::Down);
+            }
+            ScrollAction::Exit => self.exit_scroll_mode(),
+        }
     }
 
     fn resize(&mut self) -> Result<()> {
@@ -1242,18 +1492,18 @@ impl App {
         Ok(())
     }
 
-    fn queue_kitty_graphics(&mut self, id: PaneId, graphics: Vec<Vec<u8>>) -> Result<()> {
-        let Some(pane) = self.pane(id) else {
-            return Ok(());
-        };
-        let (row, col) = pane.parser.screen().cursor_position();
-        let global_row = pane_top(self.layout, id, self.both_panes_active())
-            .saturating_add(row)
-            .min(self.layout.rows.max(1));
-        let global_col = col.saturating_add(1).min(self.layout.cols.max(1));
-        for sequence in graphics {
+    fn queue_kitty_graphics(
+        &mut self,
+        id: PaneId,
+        graphics: Vec<PlacedKittyGraphic>,
+    ) -> Result<()> {
+        let pane_top = pane_top(self.layout, id, self.both_panes_active());
+        for graphic in graphics {
+            let (row, col) = graphic.cursor_position;
+            let global_row = pane_top.saturating_add(row).min(self.layout.rows.max(1));
+            let global_col = col.saturating_add(1).min(self.layout.cols.max(1));
             write!(self.outer_post_render, "\x1b[{global_row};{global_col}H")?;
-            self.outer_post_render.extend(sequence);
+            self.outer_post_render.extend(graphic.sequence);
         }
         Ok(())
     }
@@ -1353,6 +1603,7 @@ enum PrefixAction {
     None,
     Forward(Vec<u8>),
     Focus(PaneId),
+    EnterScrollMode,
 }
 
 impl PrefixState {
@@ -1366,6 +1617,10 @@ impl PrefixState {
             PrefixState::SawPrefix if byte == b'\x1b' => {
                 *self = PrefixState::SawEsc;
                 PrefixAction::None
+            }
+            PrefixState::SawPrefix if byte == b'[' => {
+                *self = PrefixState::Idle;
+                PrefixAction::EnterScrollMode
             }
             PrefixState::SawPrefix => {
                 *self = PrefixState::Idle;
@@ -1389,6 +1644,120 @@ impl PrefixState {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScrollAction {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SgrMouseEvent {
+    button: u16,
+    col: u16,
+    row: u16,
+    pressed: bool,
+}
+
+impl SgrMouseEvent {
+    fn wheel_direction(self) -> Option<ScrollDirection> {
+        match self.button & !0x1c {
+            64 => Some(ScrollDirection::Up),
+            65 => Some(ScrollDirection::Down),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParseResult<T> {
+    Complete(usize, T),
+    Incomplete,
+    NoMatch,
+}
+
+fn parse_sgr_mouse(input: &[u8]) -> ParseResult<SgrMouseEvent> {
+    const PREFIX: &[u8] = b"\x1b[<";
+    if !input.starts_with(PREFIX) {
+        return ParseResult::NoMatch;
+    }
+    let Some(end) = input.iter().position(|byte| matches!(*byte, b'M' | b'm')) else {
+        return ParseResult::Incomplete;
+    };
+    let final_byte = input[end];
+    let body = &input[PREFIX.len()..end];
+    let Some((button, col, row)) = parse_sgr_mouse_body(body) else {
+        return ParseResult::NoMatch;
+    };
+    ParseResult::Complete(
+        end + 1,
+        SgrMouseEvent {
+            button,
+            col,
+            row,
+            pressed: final_byte == b'M',
+        },
+    )
+}
+
+fn parse_sgr_mouse_body(body: &[u8]) -> Option<(u16, u16, u16)> {
+    let mut parts = body.split(|byte| *byte == b';');
+    let button = parse_u16_ascii(parts.next()?)?;
+    let col = parse_u16_ascii(parts.next()?)?;
+    let row = parse_u16_ascii(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((button, col, row))
+}
+
+fn parse_u16_ascii(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0_u16;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u16::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn parse_scroll_mode_input(input: &[u8]) -> ParseResult<ScrollAction> {
+    for (sequence, action) in [
+        (&b"\x1b[5~"[..], ScrollAction::PageUp),
+        (&b"\x1b[6~"[..], ScrollAction::PageDown),
+        (&b"\x1b[A"[..], ScrollAction::LineUp),
+        (&b"\x1b[B"[..], ScrollAction::LineDown),
+    ] {
+        if input.starts_with(sequence) {
+            return ParseResult::Complete(sequence.len(), action);
+        }
+        if sequence.starts_with(input) {
+            return ParseResult::Incomplete;
+        }
+    }
+    match input.first().copied() {
+        Some(b'q' | b'\x1b' | b'\x03') => ParseResult::Complete(1, ScrollAction::Exit),
+        Some(b'k') => ParseResult::Complete(1, ScrollAction::LineUp),
+        Some(b'j') => ParseResult::Complete(1, ScrollAction::LineDown),
+        Some(b'u') => ParseResult::Complete(1, ScrollAction::PageUp),
+        Some(b'd') => ParseResult::Complete(1, ScrollAction::PageDown),
+        Some(_) => ParseResult::NoMatch,
+        None => ParseResult::Incomplete,
     }
 }
 
@@ -1479,7 +1848,7 @@ fn render_focused_cursor<W: Write>(
     let (row, col) = screen.cursor_position();
     let global_row = pane_top.saturating_add(row).min(layout.rows.max(1));
     let global_col = col.saturating_add(1).min(layout.cols.max(1));
-    if screen.hide_cursor() {
+    if screen.hide_cursor() || screen.scrollback() > 0 {
         out.write_all(b"\x1b[?25l")?;
     } else {
         out.write_all(b"\x1b[?25h")?;
@@ -1493,58 +1862,34 @@ fn render_input_modes<W: Write>(out: &mut W, pane: &Pane) -> Result<()> {
     Ok(())
 }
 
-fn scan_kitty_graphics(scanner: &mut KittyGraphicsScanner, bytes: &[u8]) -> Vec<Vec<u8>> {
-    let mut completed = Vec::new();
-    for byte in bytes {
-        let state = mem::take(scanner);
-        *scanner = match state {
-            KittyGraphicsScanner::Ground => match *byte {
-                b'\x1b' => KittyGraphicsScanner::Esc,
-                0x9f => KittyGraphicsScanner::C1Apc,
-                _ => KittyGraphicsScanner::Ground,
-            },
-            KittyGraphicsScanner::Esc => match *byte {
-                b'_' => KittyGraphicsScanner::EscUnderscore,
-                b'\x1b' => KittyGraphicsScanner::Esc,
-                0x9f => KittyGraphicsScanner::C1Apc,
-                _ => KittyGraphicsScanner::Ground,
-            },
-            KittyGraphicsScanner::EscUnderscore => match *byte {
-                b'G' => KittyGraphicsScanner::Capturing {
-                    bytes: vec![b'\x1b', b'_', b'G'],
-                    pending_esc: false,
-                },
-                b'\x1b' => KittyGraphicsScanner::Esc,
-                0x9f => KittyGraphicsScanner::C1Apc,
-                _ => KittyGraphicsScanner::Ground,
-            },
-            KittyGraphicsScanner::C1Apc => match *byte {
-                b'G' => KittyGraphicsScanner::Capturing {
-                    bytes: vec![0x9f, b'G'],
-                    pending_esc: false,
-                },
-                b'\x1b' => KittyGraphicsScanner::Esc,
-                0x9f => KittyGraphicsScanner::C1Apc,
-                _ => KittyGraphicsScanner::Ground,
-            },
-            KittyGraphicsScanner::Capturing {
-                mut bytes,
-                pending_esc,
-            } => {
-                bytes.push(*byte);
-                if *byte == 0x9c || (pending_esc && *byte == b'\\') {
-                    completed.push(bytes);
-                    KittyGraphicsScanner::Ground
-                } else {
-                    KittyGraphicsScanner::Capturing {
-                        bytes,
-                        pending_esc: *byte == b'\x1b',
-                    }
-                }
-            }
-        };
+fn process_terminal_output(
+    parser: &mut vt100::Parser,
+    graphics_scanner: &mut KittyGraphicsScanner,
+    kitty_graphics: bool,
+    bytes: &[u8],
+) -> Vec<PlacedKittyGraphic> {
+    if !kitty_graphics {
+        parser.process(bytes);
+        return Vec::new();
     }
-    completed
+
+    let mut graphics = Vec::new();
+    let mut segment_start = 0;
+    for (idx, byte) in bytes.iter().enumerate() {
+        let Some(sequence) = graphics_scanner.feed(*byte) else {
+            continue;
+        };
+        parser.process(&bytes[segment_start..=idx]);
+        graphics.push(PlacedKittyGraphic {
+            sequence,
+            cursor_position: parser.screen().cursor_position(),
+        });
+        segment_start = idx + 1;
+    }
+    if segment_start < bytes.len() {
+        parser.process(&bytes[segment_start..]);
+    }
+    graphics
 }
 
 fn first_param(params: &Params) -> u16 {
@@ -1810,6 +2155,36 @@ mod tests {
     }
 
     #[test]
+    fn pane_parser_keeps_scrollback_rows_available() {
+        let mut parser = vt100::Parser::new(3, 24, SCROLLBACK_LINES);
+        parser.process(b"line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\n");
+        assert_eq!(parser.screen().scrollback(), 0);
+        let live = parser.screen().contents();
+
+        parser.screen_mut().set_scrollback(2);
+
+        assert_eq!(parser.screen().scrollback(), 2);
+        assert_ne!(parser.screen().contents(), live);
+    }
+
+    #[test]
+    fn sgr_wheel_events_are_parsed_with_coordinates() {
+        assert_eq!(
+            parse_sgr_mouse(b"\x1b[<64;9;12M"),
+            ParseResult::Complete(
+                11,
+                SgrMouseEvent {
+                    button: 64,
+                    col: 9,
+                    row: 12,
+                    pressed: true,
+                }
+            )
+        );
+        assert_eq!(parse_sgr_mouse(b"\x1b[<65;9"), ParseResult::Incomplete);
+    }
+
+    #[test]
     fn terminal_responder_answers_fish_startup_queries() {
         let output = b"\x1b[?u\x1b[>0q\x1b]11;?\x1b\\\x1b[0c\x1bP+q696e646e\x1b\\";
         let mut protocol = ProtocolEngine::new(profile_xterm_256color());
@@ -1893,27 +2268,44 @@ mod tests {
     }
 
     #[test]
-    fn kitty_graphics_apc_is_forwarded_to_outer_terminal() {
-        let mut protocol = ProtocolEngine::new(profile_kitty());
+    fn kitty_graphics_apc_is_placed_at_terminator_cursor() {
+        let mut parser = vt100::Parser::new(5, 20, SCROLLBACK_LINES);
+        let mut scanner = KittyGraphicsScanner::default();
         let sequence = b"\x1b_Ga=t,f=24;AAAA\x1b\\";
-        let effects = protocol.process(sequence, (0, 0));
+        let mut input = b"\x1b[3;5H".to_vec();
+        input.extend_from_slice(sequence);
+        input.extend_from_slice(b"\x1b[1;1H");
+        let graphics = process_terminal_output(&mut parser, &mut scanner, true, &input);
 
-        assert!(effects.child_responses.is_empty());
-        assert_eq!(effects.kitty_graphics, vec![sequence.to_vec()]);
+        assert_eq!(
+            graphics,
+            vec![PlacedKittyGraphic {
+                sequence: sequence.to_vec(),
+                cursor_position: (2, 4),
+            }]
+        );
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
     }
 
     #[test]
-    fn split_kitty_graphics_apc_is_forwarded_after_terminator() {
-        let mut protocol = ProtocolEngine::new(profile_kitty());
+    fn split_kitty_graphics_apc_is_placed_after_terminator() {
+        let mut parser = vt100::Parser::new(5, 20, SCROLLBACK_LINES);
+        let mut scanner = KittyGraphicsScanner::default();
 
-        let first = protocol.process(b"\x1b_Ga=t;", (0, 0));
-        assert!(first.kitty_graphics.is_empty());
+        let first =
+            process_terminal_output(&mut parser, &mut scanner, true, b"\x1b[2;4H\x1b_Ga=t;");
+        assert!(first.is_empty());
 
-        let second = protocol.process(b"AAAA\x1b\\", (0, 0));
+        let second =
+            process_terminal_output(&mut parser, &mut scanner, true, b"AAAA\x1b\\\x1b[1;1H");
         assert_eq!(
-            second.kitty_graphics,
-            vec![b"\x1b_Ga=t;AAAA\x1b\\".to_vec()]
+            second,
+            vec![PlacedKittyGraphic {
+                sequence: b"\x1b_Ga=t;AAAA\x1b\\".to_vec(),
+                cursor_position: (1, 3),
+            }]
         );
+        assert_eq!(parser.screen().cursor_position(), (0, 0));
     }
 
     #[test]
