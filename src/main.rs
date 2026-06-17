@@ -22,6 +22,37 @@ const BACKGROUND_FLUSH: Duration = Duration::from_millis(16);
 const FLOOD_FLUSH: Duration = Duration::from_millis(8);
 const SCROLLBACK_LINES: usize = 10_000;
 const WHEEL_SCROLL_LINES: usize = 3;
+const RICH_TERMINAL_ENV_VARS: &[&str] = &[
+    "ALACRITTY_LOG",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_WINDOW_ID",
+    "GHOSTTY_BIN_DIR",
+    "GHOSTTY_RESOURCES_DIR",
+    "ITERM2_COOKIE",
+    "ITERM2_SQUELCH_MARK",
+    "ITERM_PROFILE",
+    "ITERM_SESSION_ID",
+    "KITTY_INSTALLATION_DIR",
+    "KITTY_LISTEN_ON",
+    "KITTY_PID",
+    "KITTY_WINDOW_ID",
+    "KONSOLE_DBUS_SESSION",
+    "KONSOLE_DBUS_SERVICE",
+    "KONSOLE_DBUS_WINDOW",
+    "KONSOLE_PROFILE_NAME",
+    "KONSOLE_VERSION",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "VTE_VERSION",
+    "WEZTERM_CONFIG_FILE",
+    "WEZTERM_EXECUTABLE",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "WT_PROFILE_ID",
+    "WT_SESSION",
+];
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -512,6 +543,7 @@ struct Layout {
 
 impl Layout {
     fn new(rows: u16, cols: u16) -> Self {
+        let cols = cols.max(1);
         if rows >= 3 {
             let main_rows = DEFAULT_MAIN_ROWS.min(rows.saturating_sub(2)).max(1);
             let secondary_rows = rows.saturating_sub(main_rows + 1).max(1);
@@ -702,6 +734,44 @@ impl KittyGraphicsScanner {
 struct PlacedKittyGraphic {
     sequence: Vec<u8>,
     cursor_position: (u16, u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KittyGraphicsCursorMovement {
+    rows: u16,
+    cols: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KittyGraphicsPlacement {
+    cursor_movement: Option<KittyGraphicsCursorMovement>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KittyGraphicsCommand {
+    placement: Option<KittyGraphicsPlacement>,
+    more_chunks: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct KittyGraphicsCursorTracker {
+    pending_placement: Option<KittyGraphicsPlacement>,
+}
+
+impl KittyGraphicsCursorTracker {
+    fn complete_command(&mut self, sequence: &[u8]) -> Option<KittyGraphicsPlacement> {
+        let command = parse_kitty_graphics_command(sequence)?;
+        if command.more_chunks {
+            if command.placement.is_some() {
+                self.pending_placement = command.placement;
+            }
+            None
+        } else {
+            let placement = command.placement.or(self.pending_placement);
+            self.pending_placement = None;
+            placement
+        }
+    }
 }
 
 struct ProtocolEngine {
@@ -1047,6 +1117,16 @@ impl BottomRegionState {
         }
     }
 
+    fn apply_kitty_graphics_cursor_movement(&mut self, movement: KittyGraphicsCursorMovement) {
+        if movement.rows == 0 || movement.cols == 0 {
+            return;
+        }
+        self.pending_wrap = false;
+        let (row, col) = kitty_graphics_cursor_after(self.cursor(), self.rows, self.cols, movement);
+        self.cursor_row = row;
+        self.cursor_col = col;
+    }
+
     fn reset_local(&mut self) {
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -1091,6 +1171,7 @@ struct BottomRegionProxy {
     model: vt100::Parser,
     state: BottomRegionState,
     kitty_graphics: KittyGraphicsScanner,
+    kitty_graphics_cursor: KittyGraphicsCursorTracker,
 }
 
 impl BottomRegionProxy {
@@ -1100,6 +1181,7 @@ impl BottomRegionProxy {
             model: vt100::Parser::new(region.rows, region.cols, SCROLLBACK_LINES),
             state: BottomRegionState::new(profile, region.rows, region.cols),
             kitty_graphics: KittyGraphicsScanner::default(),
+            kitty_graphics_cursor: KittyGraphicsCursorTracker::default(),
         }
     }
 
@@ -1126,7 +1208,6 @@ impl BottomRegionProxy {
         let initial_cursor = self.state.cursor();
         let initial_scroll_region = self.state.scroll_region();
         let was_alternate_screen = self.model.screen().alternate_screen();
-        self.model.process(bytes);
         let mut body = Vec::new();
         let mut child_responses = Vec::new();
         let mut segment_start = 0;
@@ -1141,7 +1222,13 @@ impl BottomRegionProxy {
                 &mut child_responses,
             );
             if self.state.features().kitty_graphics {
-                body.extend(sequence);
+                body.extend_from_slice(&sequence);
+                if let Some(placement) = self.kitty_graphics_cursor.complete_command(&sequence) {
+                    if let Some(movement) = placement.cursor_movement {
+                        self.state.apply_kitty_graphics_cursor_movement(movement);
+                        move_model_cursor(&mut self.model, self.state.cursor());
+                    }
+                }
             }
             segment_start = idx + 1;
         }
@@ -1186,6 +1273,7 @@ impl BottomRegionProxy {
         if bytes.is_empty() {
             return;
         }
+        self.model.process(bytes);
         let mut responder = BottomRegionResponder {
             region,
             state: self.state.clone(),
@@ -1582,6 +1670,38 @@ impl Perform for BottomRegionResponder {
     }
 }
 
+fn configure_pane_command_environment(
+    cmd: &mut CommandBuilder,
+    profile: TerminalProfile,
+    shell: &str,
+) {
+    cmd.env("TERM", profile.term);
+    cmd.env("SHELL", shell);
+    if let Ok(home) = env::var("HOME") {
+        cmd.env("HOME", home);
+    }
+    if let Ok(path) = env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Ok(terminfo) = env::var("TERMINFO") {
+        cmd.env("TERMINFO", terminfo);
+    }
+    if let Ok(terminfo_dirs) = env::var("TERMINFO_DIRS") {
+        cmd.env("TERMINFO_DIRS", terminfo_dirs);
+    }
+    if let Ok(colorterm) = env::var("COLORTERM") {
+        cmd.env("COLORTERM", colorterm);
+    } else if profile.features.color >= ColorLevel::Direct {
+        cmd.env("COLORTERM", "truecolor");
+    }
+
+    if !profile.features.kitty_graphics {
+        for name in RICH_TERMINAL_ENV_VARS {
+            cmd.env_remove(name);
+        }
+    }
+}
+
 struct Pane {
     parser: vt100::Parser,
     protocol: ProtocolEngine,
@@ -1590,6 +1710,7 @@ struct Pane {
     reader_eof: bool,
     exit_status: Option<String>,
     kitty_graphics: KittyGraphicsScanner,
+    kitty_graphics_cursor: KittyGraphicsCursorTracker,
     pending_kitty_graphics: Vec<PlacedKittyGraphic>,
 }
 
@@ -1616,25 +1737,7 @@ impl Pane {
         let mut cmd = CommandBuilder::new(&shell);
         cmd.arg("-lc");
         cmd.arg(command);
-        cmd.env("TERM", profile.term);
-        cmd.env("SHELL", &shell);
-        if let Ok(home) = env::var("HOME") {
-            cmd.env("HOME", home);
-        }
-        if let Ok(path) = env::var("PATH") {
-            cmd.env("PATH", path);
-        }
-        if let Ok(terminfo) = env::var("TERMINFO") {
-            cmd.env("TERMINFO", terminfo);
-        }
-        if let Ok(terminfo_dirs) = env::var("TERMINFO_DIRS") {
-            cmd.env("TERMINFO_DIRS", terminfo_dirs);
-        }
-        if let Ok(colorterm) = env::var("COLORTERM") {
-            cmd.env("COLORTERM", colorterm);
-        } else if profile.features.color >= ColorLevel::Direct {
-            cmd.env("COLORTERM", "truecolor");
-        }
+        configure_pane_command_environment(&mut cmd, profile, &shell);
 
         let child = pair
             .slave
@@ -1687,6 +1790,7 @@ impl Pane {
             reader_eof: false,
             exit_status: None,
             kitty_graphics: KittyGraphicsScanner::default(),
+            kitty_graphics_cursor: KittyGraphicsCursorTracker::default(),
             pending_kitty_graphics: Vec::new(),
         })
     }
@@ -1695,6 +1799,7 @@ impl Pane {
         process_terminal_output(
             &mut self.parser,
             &mut self.kitty_graphics,
+            &mut self.kitty_graphics_cursor,
             self.protocol.profile.features.kitty_graphics,
             bytes,
         )
@@ -2583,6 +2688,22 @@ fn parse_u16_ascii(bytes: &[u8]) -> Option<u16> {
     Some(value)
 }
 
+fn parse_u16_saturating_ascii(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0_u32;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .saturating_mul(10)
+            .saturating_add(u32::from(byte - b'0'));
+    }
+    Some(value.min(u32::from(u16::MAX)) as u16)
+}
+
 fn parse_scroll_mode_input(input: &[u8]) -> ParseResult<ScrollAction> {
     for (sequence, action) in [
         (&b"\x1b[5~"[..], ScrollAction::PageUp),
@@ -2755,6 +2876,7 @@ fn render_model_region(region: TerminalRegion, parser: &vt100::Parser, output: &
 fn process_terminal_output(
     parser: &mut vt100::Parser,
     graphics_scanner: &mut KittyGraphicsScanner,
+    graphics_cursor: &mut KittyGraphicsCursorTracker,
     kitty_graphics: bool,
     bytes: &[u8],
 ) -> Vec<PlacedKittyGraphic> {
@@ -2770,16 +2892,132 @@ fn process_terminal_output(
             continue;
         };
         parser.process(&bytes[segment_start..=idx]);
+        let cursor_position = parser.screen().cursor_position();
+        let placement = graphics_cursor.complete_command(&sequence);
         graphics.push(PlacedKittyGraphic {
             sequence,
-            cursor_position: parser.screen().cursor_position(),
+            cursor_position,
         });
+        if let Some(movement) = placement.and_then(|placement| placement.cursor_movement) {
+            move_parser_after_kitty_graphics(parser, movement);
+        }
         segment_start = idx + 1;
     }
     if segment_start < bytes.len() {
         parser.process(&bytes[segment_start..]);
     }
     graphics
+}
+
+fn move_model_cursor(parser: &mut vt100::Parser, cursor: (u16, u16)) {
+    let mut bytes = Vec::new();
+    write!(bytes, "\x1b[{};{}H", cursor.0 + 1, cursor.1 + 1).expect("write to vec");
+    parser.process(&bytes);
+}
+
+fn move_parser_after_kitty_graphics(
+    parser: &mut vt100::Parser,
+    movement: KittyGraphicsCursorMovement,
+) {
+    let (screen_rows, screen_cols) = parser.screen().size();
+    let cursor = parser.screen().cursor_position();
+    move_model_cursor(
+        parser,
+        kitty_graphics_cursor_after(cursor, screen_rows, screen_cols, movement),
+    );
+}
+
+fn kitty_graphics_cursor_after(
+    cursor: (u16, u16),
+    screen_rows: u16,
+    screen_cols: u16,
+    movement: KittyGraphicsCursorMovement,
+) -> (u16, u16) {
+    (
+        cursor
+            .0
+            .saturating_add(movement.rows.saturating_sub(1))
+            .min(screen_rows.saturating_sub(1)),
+        cursor
+            .1
+            .saturating_add(movement.cols)
+            .min(screen_cols.saturating_sub(1)),
+    )
+}
+
+fn parse_kitty_graphics_command(sequence: &[u8]) -> Option<KittyGraphicsCommand> {
+    let mut body = if sequence.starts_with(b"\x1b_G") {
+        &sequence[3..]
+    } else if sequence.starts_with(&[0x9f, b'G']) {
+        &sequence[2..]
+    } else {
+        return None;
+    };
+
+    body = if body.ends_with(b"\x1b\\") {
+        &body[..body.len().saturating_sub(2)]
+    } else if body.ends_with(&[0x9c]) {
+        &body[..body.len().saturating_sub(1)]
+    } else {
+        body
+    };
+
+    let control = body
+        .iter()
+        .position(|byte| *byte == b';')
+        .map(|idx| &body[..idx])
+        .unwrap_or(body);
+    let mut action = b't';
+    let mut cols = 0;
+    let mut rows = 0;
+    let mut no_cursor_movement = false;
+    let mut virtual_placement = false;
+    let mut relative_placement = false;
+    let mut more_chunks = false;
+
+    for part in control.split(|byte| *byte == b',') {
+        let Some((key, value)) = split_kitty_graphics_key_value(part) else {
+            continue;
+        };
+        match key {
+            b'a' => {
+                if let Some(value) = value.first() {
+                    action = *value;
+                }
+            }
+            b'c' => cols = parse_u16_saturating_ascii(value).unwrap_or(0),
+            b'r' => rows = parse_u16_saturating_ascii(value).unwrap_or(0),
+            b'C' => no_cursor_movement = parse_u16_saturating_ascii(value).unwrap_or(0) == 1,
+            b'U' => virtual_placement = parse_u16_saturating_ascii(value).unwrap_or(0) == 1,
+            b'P' | b'Q' => {
+                relative_placement |= parse_u16_saturating_ascii(value).unwrap_or(0) != 0;
+            }
+            b'm' => more_chunks = parse_u16_saturating_ascii(value).unwrap_or(0) != 0,
+            _ => {}
+        }
+    }
+
+    let places_image = matches!(action, b'T' | b'p') && !virtual_placement && !relative_placement;
+    let placement = places_image.then(|| KittyGraphicsPlacement {
+        cursor_movement: (!no_cursor_movement && rows > 0 && cols > 0)
+            .then_some(KittyGraphicsCursorMovement { rows, cols }),
+    });
+
+    Some(KittyGraphicsCommand {
+        placement,
+        more_chunks,
+    })
+}
+
+fn split_kitty_graphics_key_value(part: &[u8]) -> Option<(u8, &[u8])> {
+    let idx = part.iter().position(|byte| *byte == b'=')?;
+    let (key, value_with_separator) = part.split_at(idx);
+    let value = &value_with_separator[1..];
+    if key.len() == 1 {
+        Some((key[0], value))
+    } else {
+        None
+    }
 }
 
 fn first_param(params: &Params) -> u16 {
@@ -3104,13 +3342,29 @@ mod tests {
         let region = test_bottom_region();
         let mut proxy = BottomRegionProxy::new(profile_ghostty(), region);
         let mut direct = vt100::Parser::new(region.rows, region.cols, SCROLLBACK_LINES);
+        let mut direct_graphics = KittyGraphicsScanner::default();
+        let mut direct_graphics_cursor = KittyGraphicsCursorTracker::default();
         let mut host = vt100::Parser::new(region.bottom(), region.cols, SCROLLBACK_LINES);
+        let mut host_graphics = KittyGraphicsScanner::default();
+        let mut host_graphics_cursor = KittyGraphicsCursorTracker::default();
         let top_before = seed_host_top_region(&mut host, region);
 
         for (idx, chunk) in chunks.iter().enumerate() {
-            direct.process(chunk);
+            let expected_graphics = process_terminal_output(
+                &mut direct,
+                &mut direct_graphics,
+                &mut direct_graphics_cursor,
+                true,
+                chunk,
+            );
             let output = proxy.process(region, chunk);
-            host.process(&output.host_bytes);
+            let actual_graphics = process_terminal_output(
+                &mut host,
+                &mut host_graphics,
+                &mut host_graphics_cursor,
+                true,
+                &output.host_bytes,
+            );
 
             let expected = screen_rows(&direct, 0, region.rows, region.cols);
             let actual = screen_rows(&host, region.top - 1, region.rows, region.cols);
@@ -3126,6 +3380,23 @@ mod tests {
                 top_after,
                 top_before,
                 "{name}: top region changed after chunk {idx}; host bytes: {:?}",
+                String::from_utf8_lossy(&output.host_bytes)
+            );
+
+            let expected_graphics = expected_graphics
+                .into_iter()
+                .map(|graphic| PlacedKittyGraphic {
+                    sequence: graphic.sequence,
+                    cursor_position: (
+                        region.top - 1 + graphic.cursor_position.0,
+                        graphic.cursor_position.1,
+                    ),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_graphics,
+                expected_graphics,
+                "{name}: kitty graphics mismatch after chunk {idx}; host bytes: {:?}",
                 String::from_utf8_lossy(&output.host_bytes)
             );
 
@@ -3163,6 +3434,11 @@ mod tests {
         assert_eq!(layout.main_rows, 1);
         assert_eq!(layout.border_row, 2);
         assert_eq!(layout.secondary_rows, 1);
+    }
+
+    #[test]
+    fn layout_clamps_zero_columns() {
+        assert_eq!(Layout::new(32, 0).cols, 1);
     }
 
     #[test]
@@ -3304,11 +3580,13 @@ mod tests {
     fn kitty_graphics_apc_is_placed_at_terminator_cursor() {
         let mut parser = vt100::Parser::new(5, 20, SCROLLBACK_LINES);
         let mut scanner = KittyGraphicsScanner::default();
-        let sequence = b"\x1b_Ga=t,f=24;AAAA\x1b\\";
+        let mut cursor = KittyGraphicsCursorTracker::default();
+        let sequence = b"\x1b_Ga=T,f=24,c=4,r=2;AAAA\x1b\\";
         let mut input = b"\x1b[3;5H".to_vec();
         input.extend_from_slice(sequence);
         input.extend_from_slice(b"\x1b[1;1H");
-        let graphics = process_terminal_output(&mut parser, &mut scanner, true, &input);
+        let graphics =
+            process_terminal_output(&mut parser, &mut scanner, &mut cursor, true, &input);
 
         assert_eq!(
             graphics,
@@ -3324,21 +3602,81 @@ mod tests {
     fn split_kitty_graphics_apc_is_placed_after_terminator() {
         let mut parser = vt100::Parser::new(5, 20, SCROLLBACK_LINES);
         let mut scanner = KittyGraphicsScanner::default();
+        let mut cursor = KittyGraphicsCursorTracker::default();
 
-        let first =
-            process_terminal_output(&mut parser, &mut scanner, true, b"\x1b[2;4H\x1b_Ga=t;");
+        let first = process_terminal_output(
+            &mut parser,
+            &mut scanner,
+            &mut cursor,
+            true,
+            b"\x1b[2;4H\x1b_Ga=T,c=4,r=2;",
+        );
         assert!(first.is_empty());
 
-        let second =
-            process_terminal_output(&mut parser, &mut scanner, true, b"AAAA\x1b\\\x1b[1;1H");
+        let second = process_terminal_output(
+            &mut parser,
+            &mut scanner,
+            &mut cursor,
+            true,
+            b"AAAA\x1b\\\x1b[1;1H",
+        );
         assert_eq!(
             second,
             vec![PlacedKittyGraphic {
-                sequence: b"\x1b_Ga=t;AAAA\x1b\\".to_vec(),
+                sequence: b"\x1b_Ga=T,c=4,r=2;AAAA\x1b\\".to_vec(),
                 cursor_position: (1, 3),
             }]
         );
         assert_eq!(parser.screen().cursor_position(), (0, 0));
+    }
+
+    #[test]
+    fn kitty_graphics_default_cursor_movement_matches_placement_rectangle() {
+        let mut parser = vt100::Parser::new(8, 20, SCROLLBACK_LINES);
+        let mut scanner = KittyGraphicsScanner::default();
+        let mut cursor = KittyGraphicsCursorTracker::default();
+        let graphics = process_terminal_output(
+            &mut parser,
+            &mut scanner,
+            &mut cursor,
+            true,
+            b"\x1b[2;3H\x1b_Ga=T,c=4,r=3;AAAA\x1b\\",
+        );
+
+        assert_eq!(graphics[0].cursor_position, (1, 2));
+        assert_eq!(parser.screen().cursor_position(), (3, 6));
+    }
+
+    #[test]
+    fn kitty_graphics_c1_suppresses_cursor_movement() {
+        let mut parser = vt100::Parser::new(8, 20, SCROLLBACK_LINES);
+        let mut scanner = KittyGraphicsScanner::default();
+        let mut cursor = KittyGraphicsCursorTracker::default();
+        process_terminal_output(
+            &mut parser,
+            &mut scanner,
+            &mut cursor,
+            true,
+            b"\x1b[2;3H\x1b_Ga=T,c=4,r=3,C=1;AAAA\x1b\\",
+        );
+
+        assert_eq!(parser.screen().cursor_position(), (1, 2));
+    }
+
+    #[test]
+    fn kitty_graphics_chunked_transfer_moves_cursor_on_final_chunk() {
+        let mut cursor = KittyGraphicsCursorTracker::default();
+
+        assert_eq!(
+            cursor.complete_command(b"\x1b_Ga=T,c=4,r=3,m=1;AAAA\x1b\\"),
+            None
+        );
+        assert_eq!(
+            cursor.complete_command(b"\x1b_Gm=0;BBBB\x1b\\"),
+            Some(KittyGraphicsPlacement {
+                cursor_movement: Some(KittyGraphicsCursorMovement { rows: 3, cols: 4 }),
+            })
+        );
     }
 
     #[test]
@@ -3351,6 +3689,47 @@ mod tests {
         assert!(!top.features.kitty_keyboard);
         assert!(host.features.kitty_graphics);
         assert!(host.features.kitty_keyboard);
+    }
+
+    #[test]
+    fn non_graphics_pane_profile_strips_rich_terminal_identity_env() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env("TERM_PROGRAM", "ghostty");
+        cmd.env("TERM_PROGRAM_VERSION", "1.3.2");
+        cmd.env("KITTY_WINDOW_ID", "7");
+
+        configure_pane_command_environment(&mut cmd, profile_xterm_direct(), "/bin/sh");
+
+        assert_eq!(
+            cmd.get_env("TERM").and_then(|value| value.to_str()),
+            Some("xterm-direct")
+        );
+        assert!(cmd.get_env("TERM_PROGRAM").is_none());
+        assert!(cmd.get_env("TERM_PROGRAM_VERSION").is_none());
+        assert!(cmd.get_env("KITTY_WINDOW_ID").is_none());
+    }
+
+    #[test]
+    fn graphics_pane_profile_preserves_rich_terminal_identity_env() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env("TERM_PROGRAM", "ghostty");
+        cmd.env("TERM_PROGRAM_VERSION", "1.3.2");
+
+        configure_pane_command_environment(&mut cmd, profile_ghostty(), "/bin/sh");
+
+        assert_eq!(
+            cmd.get_env("TERM").and_then(|value| value.to_str()),
+            Some("xterm-ghostty")
+        );
+        assert_eq!(
+            cmd.get_env("TERM_PROGRAM").and_then(|value| value.to_str()),
+            Some("ghostty")
+        );
+        assert_eq!(
+            cmd.get_env("TERM_PROGRAM_VERSION")
+                .and_then(|value| value.to_str()),
+            Some("1.3.2")
+        );
     }
 
     #[test]
