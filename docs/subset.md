@@ -90,6 +90,10 @@ but is not required for v1.
   available in `auto` mode when the outer terminal advertises their required
   protocols, including synchronized updates, the kitty keyboard protocol, and
   kitty graphics passthrough.
+- `PROFILE-007` EXPERIMENTAL: `--experimental-bottom-primary` may advertise
+  richer host protocols to the secondary pane while downgrading the main pane to
+  a non-graphics xterm-compatible profile. Secondary-pane output is interposed
+  so full-screen commands are localized to the lower pane where practical.
 
 ## Extended Compatibility
 
@@ -100,3 +104,6 @@ but is not required for v1.
   compatibility are not part of v1 required behavior.
 - `EXT-003` EXTENDED: exact outer-terminal private mode and title-protocol parity
   with tmux is not required unless it affects the visible pane behavior above.
+- `EXT-004` EXTENDED: experimental bottom-primary mode does not guarantee image
+  persistence across host-terminal resize; resize behavior is delegated to the
+  host terminal and the pane application.

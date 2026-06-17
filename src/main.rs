@@ -35,6 +35,9 @@ struct Args {
 
     #[arg(long, hide = true)]
     throughput_bench_bytes: Option<usize>,
+
+    #[arg(long, hide = true)]
+    experimental_bottom_primary: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -190,14 +193,6 @@ impl TerminalConfig {
 
         Ok(Self { advertised_profile })
     }
-
-    fn term(&self) -> &'static str {
-        self.advertised_profile.term
-    }
-
-    fn features(&self) -> TerminalFeatures {
-        self.advertised_profile.features
-    }
 }
 
 fn best_implemented_profile(outer: TerminalProfile) -> TerminalProfile {
@@ -216,6 +211,18 @@ fn best_implemented_profile(outer: TerminalProfile) -> TerminalProfile {
         return profile_xterm();
     }
     profile_vt100()
+}
+
+fn non_graphics_profile_for(outer: TerminalProfile) -> TerminalProfile {
+    if outer.features.color >= ColorLevel::Direct {
+        profile_xterm_direct()
+    } else if outer.features.color >= ColorLevel::Color256 {
+        profile_xterm_256color()
+    } else if outer.features.color >= ColorLevel::Color8 {
+        profile_xterm()
+    } else {
+        profile_vt100()
+    }
 }
 
 fn profile_for_term(term: &str) -> Option<TerminalProfile> {
@@ -558,6 +565,48 @@ enum Event {
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderMode {
+    Composed,
+    BottomPrimaryRegionProxy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalRegion {
+    top: u16,
+    rows: u16,
+    cols: u16,
+}
+
+impl TerminalRegion {
+    fn for_pane(layout: Layout, id: PaneId, both_panes_active: bool) -> Self {
+        let top = pane_top(layout, id, both_panes_active);
+        let rows = if both_panes_active {
+            layout.pane_rows(id)
+        } else {
+            layout.rows.max(1)
+        };
+        Self {
+            top,
+            rows: rows.max(1),
+            cols: layout.cols,
+        }
+    }
+
+    fn bottom(self) -> u16 {
+        self.top.saturating_add(self.rows).saturating_sub(1)
+    }
+
+    fn map_row(self, local_row: u16) -> u16 {
+        self.top
+            .saturating_add(local_row.min(self.rows.saturating_sub(1)))
+    }
+
+    fn map_col(self, local_col: u16) -> u16 {
+        local_col.saturating_add(1).min(self.cols.max(1))
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct KittyKeyboardState {
     flags: u16,
@@ -719,7 +768,7 @@ struct TerminalEffects {
     keyboard_flags: Option<u16>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DcsCapture {
     intermediates: Vec<u8>,
     action: char,
@@ -871,6 +920,625 @@ impl Perform for ProtocolResponder {
     }
 }
 
+#[derive(Default, Debug, Eq, PartialEq)]
+struct BottomProxyOutput {
+    host_bytes: Vec<u8>,
+    child_responses: Vec<u8>,
+    keyboard_flags: Option<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BottomRegionState {
+    profile: TerminalProfile,
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    scroll_top: u16,
+    scroll_bottom: u16,
+    origin_mode: bool,
+    saved_cursor: (u16, u16),
+    alternate_screen: bool,
+    mouse_tracking: bool,
+    sgr_mouse: bool,
+    bracketed_paste: bool,
+    dcs_capture: Option<DcsCapture>,
+    keyboard: KittyKeyboardState,
+    keyboard_changed: bool,
+    synchronized_update: bool,
+}
+
+impl BottomRegionState {
+    fn new(profile: TerminalProfile, rows: u16, cols: u16) -> Self {
+        let rows = rows.max(1);
+        Self {
+            profile,
+            rows,
+            cols: cols.max(1),
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
+            origin_mode: false,
+            saved_cursor: (0, 0),
+            alternate_screen: false,
+            mouse_tracking: false,
+            sgr_mouse: false,
+            bracketed_paste: false,
+            dcs_capture: None,
+            keyboard: KittyKeyboardState::default(),
+            keyboard_changed: false,
+            synchronized_update: false,
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.rows = rows.max(1);
+        self.cols = cols.max(1);
+        self.cursor_row = self.cursor_row.min(self.rows - 1);
+        self.cursor_col = self.cursor_col.min(self.cols - 1);
+        self.scroll_top = self.scroll_top.min(self.rows - 1);
+        self.scroll_bottom = self.scroll_bottom.min(self.rows - 1);
+        if self.scroll_bottom < self.scroll_top {
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
+        }
+    }
+
+    fn features(&self) -> TerminalFeatures {
+        self.profile.features
+    }
+
+    fn mouse_mode_enabled(&self) -> bool {
+        self.mouse_tracking
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor_row = self.cursor_row.min(self.rows - 1);
+        self.cursor_col = self.cursor_col.min(self.cols - 1);
+    }
+
+    fn set_cursor(&mut self, row: u16, col: u16) {
+        let base = if self.origin_mode { self.scroll_top } else { 0 };
+        self.cursor_row = base.saturating_add(row).min(self.rows - 1);
+        self.cursor_col = col.min(self.cols - 1);
+    }
+
+    fn linefeed(&mut self) {
+        if self.cursor_row == self.scroll_bottom {
+            return;
+        }
+        self.cursor_row = self.cursor_row.saturating_add(1).min(self.rows - 1);
+    }
+
+    fn reverse_index(&mut self) {
+        if self.cursor_row == self.scroll_top {
+            return;
+        }
+        self.cursor_row = self.cursor_row.saturating_sub(1);
+    }
+
+    fn carriage_return(&mut self) {
+        self.cursor_col = 0;
+    }
+
+    fn put_printed_char(&mut self) {
+        if self.cursor_col + 1 >= self.cols {
+            self.cursor_col = 0;
+            self.linefeed();
+        } else {
+            self.cursor_col += 1;
+        }
+    }
+
+    fn reset_local(&mut self) {
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
+        self.origin_mode = false;
+        self.saved_cursor = (0, 0);
+        self.alternate_screen = false;
+        self.mouse_tracking = false;
+        self.sgr_mouse = false;
+        self.bracketed_paste = false;
+        self.keyboard = KittyKeyboardState::default();
+        self.keyboard_changed = true;
+        self.synchronized_update = false;
+        self.dcs_capture = None;
+    }
+
+    fn input_mode_formatted(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(if self.mouse_tracking {
+            b"\x1b[?1000h"
+        } else {
+            b"\x1b[?1000l"
+        });
+        output.extend_from_slice(if self.sgr_mouse {
+            b"\x1b[?1006h"
+        } else {
+            b"\x1b[?1006l"
+        });
+        output.extend_from_slice(if self.bracketed_paste {
+            b"\x1b[?2004h"
+        } else {
+            b"\x1b[?2004l"
+        });
+        output
+    }
+}
+
+struct BottomRegionProxy {
+    parser: vte::Parser,
+    state: BottomRegionState,
+    kitty_graphics: KittyGraphicsScanner,
+}
+
+impl BottomRegionProxy {
+    fn new(profile: TerminalProfile, region: TerminalRegion) -> Self {
+        Self {
+            parser: vte::Parser::new(),
+            state: BottomRegionState::new(profile, region.rows, region.cols),
+            kitty_graphics: KittyGraphicsScanner::default(),
+        }
+    }
+
+    fn resize(&mut self, region: TerminalRegion) {
+        self.state.resize(region.rows, region.cols);
+    }
+
+    fn mouse_mode_enabled(&self) -> bool {
+        self.state.mouse_mode_enabled()
+    }
+
+    fn keyboard_flags(&self) -> u16 {
+        self.state.keyboard.flags()
+    }
+
+    fn input_mode_formatted(&self) -> Vec<u8> {
+        self.state.input_mode_formatted()
+    }
+
+    fn process(&mut self, region: TerminalRegion, bytes: &[u8]) -> BottomProxyOutput {
+        self.resize(region);
+        let keyboard_before = self.state.keyboard.flags();
+        let initial_cursor = self.state.cursor();
+        let initial_scroll_region = self.state.scroll_region();
+        let mut body = Vec::new();
+        let mut child_responses = Vec::new();
+        let mut segment_start = 0;
+        for (idx, byte) in bytes.iter().enumerate() {
+            let Some(sequence) = self.kitty_graphics.feed(*byte) else {
+                continue;
+            };
+            self.advance_plain(
+                region,
+                &bytes[segment_start..=idx],
+                &mut body,
+                &mut child_responses,
+            );
+            if self.state.features().kitty_graphics {
+                body.extend(sequence);
+            }
+            segment_start = idx + 1;
+        }
+        self.advance_plain(
+            region,
+            &bytes[segment_start..],
+            &mut body,
+            &mut child_responses,
+        );
+
+        BottomProxyOutput {
+            host_bytes: wrap_region_output(region, initial_scroll_region, initial_cursor, body),
+            child_responses,
+            keyboard_flags: if self.state.keyboard_changed
+                && self.state.keyboard.flags() != keyboard_before
+            {
+                self.state.keyboard_changed = false;
+                Some(self.state.keyboard.flags())
+            } else {
+                self.state.keyboard_changed = false;
+                None
+            },
+        }
+    }
+
+    fn advance_plain(
+        &mut self,
+        region: TerminalRegion,
+        bytes: &[u8],
+        body: &mut Vec<u8>,
+        child_responses: &mut Vec<u8>,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut responder = BottomRegionResponder {
+            region,
+            state: self.state.clone(),
+            body: Vec::new(),
+            child_responses: Vec::new(),
+        };
+        self.parser.advance(&mut responder, bytes);
+        self.state = responder.state;
+        body.extend(responder.body);
+        child_responses.extend(responder.child_responses);
+    }
+}
+
+impl BottomRegionState {
+    fn cursor(&self) -> (u16, u16) {
+        (self.cursor_row, self.cursor_col)
+    }
+
+    fn scroll_region(&self) -> (u16, u16) {
+        (self.scroll_top, self.scroll_bottom)
+    }
+}
+
+struct BottomRegionResponder {
+    region: TerminalRegion,
+    state: BottomRegionState,
+    body: Vec<u8>,
+    child_responses: Vec<u8>,
+}
+
+impl BottomRegionResponder {
+    fn emit_cursor(&mut self) {
+        let (row, col) = self.state.cursor();
+        write!(
+            self.body,
+            "\x1b[{};{}H",
+            self.region.map_row(row),
+            self.region.map_col(col)
+        )
+        .expect("write to vec");
+    }
+
+    fn emit_clear_region(&mut self) {
+        for row in self.region.top..=self.region.bottom() {
+            write!(self.body, "\x1b[{row};1H\x1b[K").expect("write to vec");
+        }
+        self.emit_cursor();
+    }
+
+    fn emit_erase_display(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                let start = self.state.cursor_row;
+                self.emit_cursor();
+                self.body.extend_from_slice(b"\x1b[K");
+                for row in start.saturating_add(1)..self.state.rows {
+                    write!(self.body, "\x1b[{};1H\x1b[K", self.region.map_row(row))
+                        .expect("write to vec");
+                }
+                self.emit_cursor();
+            }
+            1 => {
+                for row in 0..self.state.cursor_row {
+                    write!(self.body, "\x1b[{};1H\x1b[K", self.region.map_row(row))
+                        .expect("write to vec");
+                }
+                self.emit_cursor();
+                self.body.extend_from_slice(b"\x1b[1K");
+                self.emit_cursor();
+            }
+            _ => self.emit_clear_region(),
+        }
+    }
+
+    fn emit_scroll_region(&mut self) {
+        let (top, bottom) = self.state.scroll_region();
+        write!(
+            self.body,
+            "\x1b[{};{}r",
+            self.region.map_row(top),
+            self.region.map_row(bottom)
+        )
+        .expect("write to vec");
+        self.emit_cursor();
+    }
+
+    fn set_mode(&mut self, params: &Params, enabled: bool) {
+        for value in param_values(params) {
+            match value {
+                6 => {
+                    self.state.origin_mode = enabled;
+                    self.state.set_cursor(0, 0);
+                    self.emit_cursor();
+                }
+                47 | 1047 | 1049 => {
+                    self.state.alternate_screen = enabled;
+                    self.state.set_cursor(0, 0);
+                    self.emit_clear_region();
+                }
+                1000 | 1002 | 1003 => {
+                    self.state.mouse_tracking = enabled;
+                }
+                1006 => {
+                    self.state.sgr_mouse = enabled;
+                }
+                2004 => {
+                    self.state.bracketed_paste = enabled;
+                }
+                2026 => {
+                    self.state.synchronized_update = enabled;
+                    append_csi_sequence(
+                        &mut self.body,
+                        params,
+                        b"?",
+                        if enabled { 'h' } else { 'l' },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn respond_cursor_position(&mut self, private: bool) {
+        let prefix = if private { "\x1b[?" } else { "\x1b[" };
+        write!(
+            self.child_responses,
+            "{prefix}{};{}R",
+            self.state.cursor_row + 1,
+            self.state.cursor_col + 1
+        )
+        .expect("write to vec");
+    }
+
+    fn query_synchronized_update(&mut self) {
+        let value = if self.state.synchronized_update { 1 } else { 2 };
+        write!(self.child_responses, "\x1b[?2026;{value}$y").expect("write to vec");
+    }
+
+    fn query_keyboard_flags(&mut self) {
+        let flags = if self.state.features().kitty_keyboard {
+            self.state.keyboard.flags()
+        } else {
+            0
+        };
+        write!(self.child_responses, "\x1b[?{flags}u").expect("write to vec");
+    }
+}
+
+impl Perform for BottomRegionResponder {
+    fn print(&mut self, c: char) {
+        let mut buf = [0_u8; 4];
+        self.body
+            .extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        self.state.put_printed_char();
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            b'\x07' => self.body.push(byte),
+            b'\x08' => {
+                self.state.cursor_col = self.state.cursor_col.saturating_sub(1);
+                self.body.push(byte);
+            }
+            b'\x09' => {
+                let next_tab = ((self.state.cursor_col / 8) + 1) * 8;
+                self.state.cursor_col = next_tab.min(self.state.cols - 1);
+                self.body.push(byte);
+            }
+            b'\n' | 0x0b | 0x0c => {
+                self.state.linefeed();
+                self.body.push(byte);
+            }
+            b'\r' => {
+                self.state.carriage_return();
+                self.body.push(byte);
+            }
+            _ => {}
+        }
+    }
+
+    fn hook(&mut self, _params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        if !ignore && self.state.features().xtgetcap && intermediates == b"+" && action == 'q' {
+            self.state.dcs_capture = Some(DcsCapture {
+                intermediates: intermediates.to_vec(),
+                action,
+                payload: Vec::new(),
+            });
+        } else {
+            self.state.dcs_capture = None;
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        if let Some(capture) = &mut self.state.dcs_capture {
+            capture.payload.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        let Some(capture) = self.state.dcs_capture.take() else {
+            return;
+        };
+        if self.state.features().xtgetcap && capture.intermediates == b"+" && capture.action == 'q'
+        {
+            self.child_responses.extend_from_slice(b"\x1bP0+r");
+            self.child_responses.extend_from_slice(&capture.payload);
+            self.child_responses.extend_from_slice(b"\x1b\\");
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        if self.state.features().osc_color_query {
+            append_osc_color_response(params, b"10", b"rgb:cd/d6/f4", &mut self.child_responses);
+            append_osc_color_response(params, b"11", b"rgb:11/11/1b", &mut self.child_responses);
+            append_osc_color_response(params, b"12", b"7", &mut self.child_responses);
+        }
+        if self.state.features().osc52 && matches_osc_command(params, b"52") {
+            append_osc_sequence(&mut self.body, params, bell_terminated);
+        }
+    }
+
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        if ignore || !self.state.features().xterm_protocols {
+            return;
+        }
+
+        match (intermediates, action) {
+            (b"", 'm') => append_csi_sequence(&mut self.body, params, intermediates, action),
+            (b"", 'H' | 'f') => {
+                let row = param_or(params, 0, 1).saturating_sub(1);
+                let col = param_or(params, 1, 1).saturating_sub(1);
+                self.state.set_cursor(row, col);
+                self.emit_cursor();
+            }
+            (b"", 'A') => {
+                let amount = param_or(params, 0, 1);
+                self.state.cursor_row = self.state.cursor_row.saturating_sub(amount);
+                self.emit_cursor();
+            }
+            (b"", 'B') => {
+                let amount = param_or(params, 0, 1);
+                self.state.cursor_row = self
+                    .state
+                    .cursor_row
+                    .saturating_add(amount)
+                    .min(self.state.rows - 1);
+                self.emit_cursor();
+            }
+            (b"", 'C') => {
+                let amount = param_or(params, 0, 1);
+                self.state.cursor_col = self
+                    .state
+                    .cursor_col
+                    .saturating_add(amount)
+                    .min(self.state.cols - 1);
+                self.emit_cursor();
+            }
+            (b"", 'D') => {
+                let amount = param_or(params, 0, 1);
+                self.state.cursor_col = self.state.cursor_col.saturating_sub(amount);
+                self.emit_cursor();
+            }
+            (b"", 'E') => {
+                let amount = param_or(params, 0, 1);
+                self.state.cursor_row = self
+                    .state
+                    .cursor_row
+                    .saturating_add(amount)
+                    .min(self.state.rows - 1);
+                self.state.cursor_col = 0;
+                self.emit_cursor();
+            }
+            (b"", 'F') => {
+                let amount = param_or(params, 0, 1);
+                self.state.cursor_row = self.state.cursor_row.saturating_sub(amount);
+                self.state.cursor_col = 0;
+                self.emit_cursor();
+            }
+            (b"", 'G') => {
+                self.state.cursor_col = param_or(params, 0, 1)
+                    .saturating_sub(1)
+                    .min(self.state.cols - 1);
+                self.emit_cursor();
+            }
+            (b"", 'd') => {
+                self.state.cursor_row = param_or(params, 0, 1)
+                    .saturating_sub(1)
+                    .min(self.state.rows - 1);
+                self.emit_cursor();
+            }
+            (b"", 'J') => self.emit_erase_display(first_param(params)),
+            (b"", 'K') => {
+                self.emit_cursor();
+                append_csi_sequence(&mut self.body, params, intermediates, action);
+                self.emit_cursor();
+            }
+            (b"", 'r') => {
+                let top = param_or(params, 0, 1)
+                    .saturating_sub(1)
+                    .min(self.state.rows - 1);
+                let bottom = param_or(params, 1, self.state.rows)
+                    .saturating_sub(1)
+                    .min(self.state.rows - 1);
+                if top < bottom {
+                    self.state.scroll_top = top;
+                    self.state.scroll_bottom = bottom;
+                } else {
+                    self.state.scroll_top = 0;
+                    self.state.scroll_bottom = self.state.rows - 1;
+                }
+                self.state.set_cursor(0, 0);
+                self.emit_scroll_region();
+            }
+            (b"", 's') => self.state.saved_cursor = self.state.cursor(),
+            (b"", 'u') => {
+                let (row, col) = self.state.saved_cursor;
+                self.state.cursor_row = row;
+                self.state.cursor_col = col;
+                self.state.clamp_cursor();
+                self.emit_cursor();
+            }
+            (b"", 'c') if first_param_is(params, 0) => {
+                self.child_responses.extend_from_slice(b"\x1b[?1;2c");
+            }
+            (b">", 'c') if first_param_is(params, 0) => {
+                self.child_responses.extend_from_slice(b"\x1b[>0;95;0c");
+            }
+            (b"", 'n') if first_param_is(params, 6) => self.respond_cursor_position(false),
+            (b"?", 'n') if first_param_is(params, 6) => self.respond_cursor_position(true),
+            (b"?", 'h') => self.set_mode(params, true),
+            (b"?", 'l') => self.set_mode(params, false),
+            (b"?", 'u') => self.query_keyboard_flags(),
+            (b">", 'u') if self.state.features().kitty_keyboard => {
+                self.state.keyboard.push(first_param(params));
+                self.state.keyboard_changed = true;
+            }
+            (b"<", 'u') if self.state.features().kitty_keyboard => {
+                self.state.keyboard.pop(first_param(params).max(1));
+                self.state.keyboard_changed = true;
+            }
+            (b"?$", 'p') if first_param_is(params, 2026) => self.query_synchronized_update(),
+            (b">", 'q') if self.state.features().xtversion && first_param_is(params, 0) => {
+                self.child_responses
+                    .extend_from_slice(b"\x1bP>|tinymux 0.1.0\x1b\\");
+            }
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if ignore || !intermediates.is_empty() {
+            return;
+        }
+        match byte {
+            b'7' => self.state.saved_cursor = self.state.cursor(),
+            b'8' => {
+                let (row, col) = self.state.saved_cursor;
+                self.state.cursor_row = row;
+                self.state.cursor_col = col;
+                self.state.clamp_cursor();
+                self.emit_cursor();
+            }
+            b'D' => {
+                self.state.linefeed();
+                self.body.extend_from_slice(b"\x1bD");
+            }
+            b'E' => {
+                self.state.linefeed();
+                self.state.carriage_return();
+                self.body.extend_from_slice(b"\x1bE");
+            }
+            b'M' => {
+                self.state.reverse_index();
+                self.body.extend_from_slice(b"\x1bM");
+            }
+            b'c' => {
+                self.state.reset_local();
+                self.emit_clear_region();
+            }
+            _ => {}
+        }
+    }
+}
+
 struct Pane {
     parser: vt100::Parser,
     protocol: ProtocolEngine,
@@ -888,7 +1556,7 @@ impl Pane {
         command: &str,
         layout: Layout,
         tx: Sender<Event>,
-        terminal: &TerminalConfig,
+        profile: TerminalProfile,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let rows = layout.pane_rows(id);
@@ -905,7 +1573,7 @@ impl Pane {
         let mut cmd = CommandBuilder::new(&shell);
         cmd.arg("-lc");
         cmd.arg(command);
-        cmd.env("TERM", terminal.term());
+        cmd.env("TERM", profile.term);
         cmd.env("SHELL", &shell);
         if let Ok(home) = env::var("HOME") {
             cmd.env("HOME", home);
@@ -921,7 +1589,7 @@ impl Pane {
         }
         if let Ok(colorterm) = env::var("COLORTERM") {
             cmd.env("COLORTERM", colorterm);
-        } else if terminal.features().color >= ColorLevel::Direct {
+        } else if profile.features.color >= ColorLevel::Direct {
             cmd.env("COLORTERM", "truecolor");
         }
 
@@ -970,7 +1638,7 @@ impl Pane {
 
         Ok(Self {
             parser: vt100::Parser::new(rows, layout.cols, SCROLLBACK_LINES),
-            protocol: ProtocolEngine::new(terminal.advertised_profile),
+            protocol: ProtocolEngine::new(profile),
             writer,
             master: pair.master,
             reader_eof: false,
@@ -1053,8 +1721,10 @@ impl Drop for TerminalGuard {
 }
 
 struct App {
+    render_mode: RenderMode,
     layout: Layout,
     panes: [Option<Pane>; 2],
+    bottom_proxy: Option<BottomRegionProxy>,
     focus: PaneId,
     prefix: PrefixState,
     scroll_mode: bool,
@@ -1076,16 +1746,44 @@ impl App {
         let (cols, rows) = terminal_size().unwrap_or((100, 32));
         let layout = Layout::new(rows, cols);
         let terminal = TerminalConfig::detect(&args.terminal_profile)?;
-        let main = Pane::spawn(PaneId::Main, &args.main, layout, tx.clone(), &terminal)?;
-        let secondary = Pane::spawn(PaneId::Secondary, &args.secondary, layout, tx, &terminal)?;
-        let outer_keyboard_layer_active = terminal.features().kitty_keyboard;
+        let render_mode = if args.experimental_bottom_primary {
+            RenderMode::BottomPrimaryRegionProxy
+        } else {
+            RenderMode::Composed
+        };
+        let main_profile = match render_mode {
+            RenderMode::Composed => terminal.advertised_profile,
+            RenderMode::BottomPrimaryRegionProxy => {
+                non_graphics_profile_for(terminal.advertised_profile)
+            }
+        };
+        let secondary_profile = terminal.advertised_profile;
+        let main = Pane::spawn(PaneId::Main, &args.main, layout, tx.clone(), main_profile)?;
+        let secondary = Pane::spawn(
+            PaneId::Secondary,
+            &args.secondary,
+            layout,
+            tx,
+            secondary_profile,
+        )?;
+        let bottom_proxy = match render_mode {
+            RenderMode::Composed => None,
+            RenderMode::BottomPrimaryRegionProxy => Some(BottomRegionProxy::new(
+                secondary_profile,
+                TerminalRegion::for_pane(layout, PaneId::Secondary, true),
+            )),
+        };
+        let outer_keyboard_layer_active =
+            main_profile.features.kitty_keyboard || secondary_profile.features.kitty_keyboard;
         let mut outer_passthrough = Vec::new();
         if outer_keyboard_layer_active {
             outer_passthrough.extend_from_slice(b"\x1b[>0u");
         }
         Ok(Self {
+            render_mode,
             layout,
             panes: [Some(main), Some(secondary)],
+            bottom_proxy,
             focus: PaneId::Main,
             prefix: PrefixState::Idle,
             scroll_mode: false,
@@ -1131,9 +1829,22 @@ impl App {
     }
 
     fn focused_keyboard_flags(&self) -> u16 {
+        if self.render_mode == RenderMode::BottomPrimaryRegionProxy
+            && self.focus == PaneId::Secondary
+        {
+            return self
+                .bottom_proxy
+                .as_ref()
+                .map(BottomRegionProxy::keyboard_flags)
+                .unwrap_or(0);
+        }
         self.focused_pane()
             .map(|(_, pane)| pane.protocol.kitty_keyboard_flags())
             .unwrap_or(0)
+    }
+
+    fn region_for_pane(&self, id: PaneId) -> TerminalRegion {
+        TerminalRegion::for_pane(self.layout, id, self.both_panes_active())
     }
 
     fn pane_at_row(&self, row: u16) -> Option<PaneId> {
@@ -1216,6 +1927,9 @@ impl App {
     fn close_pane(&mut self, id: PaneId) -> Result<bool> {
         self.close_after_render[id.index()] = false;
         if self.panes[id.index()].take().is_some() {
+            if id == PaneId::Secondary {
+                self.bottom_proxy = None;
+            }
             self.focus_live_pane();
             if !self.any_panes_active() {
                 self.reset_outer_keyboard();
@@ -1280,6 +1994,10 @@ impl App {
                 }
             }
         }
+        let secondary_region = self.region_for_pane(PaneId::Secondary);
+        if let Some(proxy) = &mut self.bottom_proxy {
+            proxy.resize(secondary_region);
+        }
         Ok(())
     }
 
@@ -1287,6 +2005,12 @@ impl App {
         match event {
             Event::PaneOutput(id, bytes) => {
                 if self.pane(id).is_none() {
+                    return Ok(true);
+                }
+                if self.render_mode == RenderMode::BottomPrimaryRegionProxy
+                    && id == PaneId::Secondary
+                {
+                    self.handle_bottom_primary_output(&bytes)?;
                     return Ok(true);
                 }
                 self.pending_bytes += bytes.len();
@@ -1359,6 +2083,32 @@ impl App {
             Event::Shutdown => return Ok(false),
         }
         Ok(true)
+    }
+
+    fn handle_bottom_primary_output(&mut self, bytes: &[u8]) -> Result<()> {
+        self.pending_bytes += bytes.len();
+        if let Some(pane) = self.pane_mut(PaneId::Secondary) {
+            pane.parser.process(bytes);
+        }
+        let region = self.region_for_pane(PaneId::Secondary);
+        let Some(proxy) = &mut self.bottom_proxy else {
+            return Ok(());
+        };
+        let output = proxy.process(region, bytes);
+        if !output.child_responses.is_empty() {
+            let pane = self
+                .pane_mut(PaneId::Secondary)
+                .expect("secondary pane checked above");
+            pane.writer.write_all(&output.child_responses)?;
+            pane.writer.flush()?;
+        }
+        self.outer_passthrough.extend(output.host_bytes);
+        if self.focus == PaneId::Secondary {
+            if let Some(flags) = output.keyboard_flags {
+                self.sync_outer_keyboard(flags);
+            }
+        }
+        Ok(())
     }
 
     fn handle_input(&mut self, bytes: &[u8]) -> Result<()> {
@@ -1439,11 +2189,30 @@ impl App {
         if !event.pressed {
             return Ok(false);
         }
-        let Some(direction) = event.wheel_direction() else {
-            return Ok(false);
-        };
         let Some(id) = self.pane_at_row(event.row) else {
             return Ok(true);
+        };
+        if self.render_mode == RenderMode::BottomPrimaryRegionProxy
+            && id == PaneId::Secondary
+            && self
+                .bottom_proxy
+                .as_ref()
+                .map(BottomRegionProxy::mouse_mode_enabled)
+                .unwrap_or(false)
+        {
+            let region = self.region_for_pane(PaneId::Secondary);
+            let local_row = event.row.saturating_sub(region.top).saturating_add(1);
+            let local_event = SgrMouseEvent {
+                row: local_row.min(region.rows),
+                ..event
+            };
+            if let Some(pane) = self.pane_mut(PaneId::Secondary) {
+                pane.writer.write_all(&encode_sgr_mouse(local_event))?;
+            }
+            return Ok(true);
+        }
+        let Some(direction) = event.wheel_direction() else {
+            return Ok(false);
         };
         if self
             .pane(id)
@@ -1529,23 +2298,34 @@ impl App {
             return Ok(());
         }
         let had_dirty = self.dirty;
+        let had_passthrough = !self.outer_passthrough.is_empty();
         let had_post_render = !self.outer_post_render.is_empty();
         if !self.outer_passthrough.is_empty() {
             out.write_all(&self.outer_passthrough)?;
             self.outer_passthrough.clear();
         }
-        if had_dirty && !self.rendered_once {
+        let bottom_primary_active = self.render_mode == RenderMode::BottomPrimaryRegionProxy
+            && self.pane(PaneId::Secondary).is_some();
+        if had_dirty && !self.rendered_once && !bottom_primary_active {
             out.write_all(b"\x1b[H\x1b[2J")?;
             self.rendered_once = true;
             self.last_rows.clear();
         }
         if had_dirty {
-            let rows = compose_rows(
-                self.layout,
-                self.pane(PaneId::Main),
-                self.pane(PaneId::Secondary),
-                self.focus,
-            );
+            if !self.rendered_once {
+                self.rendered_once = true;
+                self.last_rows.clear();
+            }
+            let rows = if bottom_primary_active {
+                compose_top_region_rows(self.layout, self.pane(PaneId::Main), self.focus)
+            } else {
+                compose_rows(
+                    self.layout,
+                    self.pane(PaneId::Main),
+                    self.pane(PaneId::Secondary),
+                    self.focus,
+                )
+            };
             for (idx, row) in rows.iter().enumerate() {
                 let changed = self
                     .last_rows
@@ -1569,15 +2349,28 @@ impl App {
             out.write_all(&self.outer_post_render)?;
             self.outer_post_render.clear();
         }
-        if had_dirty || had_post_render {
+        if had_dirty || had_passthrough || had_post_render {
             if let Some((id, pane)) = self.focused_pane() {
-                render_focused_cursor(
-                    out,
-                    self.layout,
-                    pane,
-                    pane_top(self.layout, id, self.both_panes_active()),
-                )?;
-                render_input_modes(out, pane)?;
+                if self.render_mode == RenderMode::BottomPrimaryRegionProxy
+                    && id == PaneId::Secondary
+                {
+                    if let Some(proxy) = &self.bottom_proxy {
+                        render_bottom_proxy_cursor(
+                            out,
+                            self.region_for_pane(PaneId::Secondary),
+                            proxy,
+                        )?;
+                        out.write_all(&proxy.input_mode_formatted())?;
+                    }
+                } else {
+                    render_focused_cursor(
+                        out,
+                        self.layout,
+                        pane,
+                        pane_top(self.layout, id, self.both_panes_active()),
+                    )?;
+                    render_input_modes(out, pane)?;
+                }
             }
         }
         out.flush()?;
@@ -1722,6 +2515,17 @@ fn parse_sgr_mouse_body(body: &[u8]) -> Option<(u16, u16, u16)> {
     Some((button, col, row))
 }
 
+fn encode_sgr_mouse(event: SgrMouseEvent) -> Vec<u8> {
+    format!(
+        "\x1b[<{};{};{}{}",
+        event.button,
+        event.col,
+        event.row,
+        if event.pressed { 'M' } else { 'm' }
+    )
+    .into_bytes()
+}
+
 fn parse_u16_ascii(bytes: &[u8]) -> Option<u16> {
     if bytes.is_empty() {
         return None;
@@ -1784,6 +2588,18 @@ fn compose_rows(
         (None, None) => {}
     }
     rows.truncate(layout.rows as usize);
+    rows
+}
+
+fn compose_top_region_rows(layout: Layout, main: Option<&Pane>, focus: PaneId) -> Vec<Vec<u8>> {
+    let mut rows = Vec::with_capacity(layout.border_row as usize);
+    if let Some(main) = main {
+        append_pane_rows(&mut rows, layout.main_rows, layout.cols, main);
+        if layout.rows >= 2 {
+            rows.push(border_row_body(layout, focus));
+        }
+    }
+    rows.truncate(layout.border_row as usize);
     rows
 }
 
@@ -1862,6 +2678,16 @@ fn render_input_modes<W: Write>(out: &mut W, pane: &Pane) -> Result<()> {
     Ok(())
 }
 
+fn render_bottom_proxy_cursor<W: Write>(
+    out: &mut W,
+    region: TerminalRegion,
+    proxy: &BottomRegionProxy,
+) -> Result<()> {
+    let (row, col) = proxy.state.cursor();
+    write!(out, "\x1b[{};{}H", region.map_row(row), region.map_col(col))?;
+    Ok(())
+}
+
 fn process_terminal_output(
     parser: &mut vt100::Parser,
     graphics_scanner: &mut KittyGraphicsScanner,
@@ -1901,8 +2727,69 @@ fn first_param(params: &Params) -> u16 {
         .unwrap_or(0)
 }
 
+fn param_or(params: &Params, index: usize, default: u16) -> u16 {
+    params
+        .iter()
+        .nth(index)
+        .and_then(|param| param.first())
+        .copied()
+        .filter(|value| *value != 0)
+        .unwrap_or(default)
+}
+
+fn param_values(params: &Params) -> Vec<u16> {
+    params
+        .iter()
+        .filter_map(|param| param.first().copied())
+        .collect()
+}
+
 fn first_param_is(params: &Params, expected: u16) -> bool {
     first_param(params) == expected
+}
+
+fn append_csi_sequence(output: &mut Vec<u8>, params: &Params, intermediates: &[u8], action: char) {
+    output.extend_from_slice(b"\x1b[");
+    for (param_index, param) in params.iter().enumerate() {
+        if param_index > 0 {
+            output.push(b';');
+        }
+        for (sub_index, value) in param.iter().enumerate() {
+            if sub_index > 0 {
+                output.push(b':');
+            }
+            write!(output, "{value}").expect("write to vec");
+        }
+    }
+    output.extend_from_slice(intermediates);
+    let mut buf = [0_u8; 4];
+    output.extend_from_slice(action.encode_utf8(&mut buf).as_bytes());
+}
+
+fn wrap_region_output(
+    region: TerminalRegion,
+    scroll_region: (u16, u16),
+    cursor: (u16, u16),
+    body: Vec<u8>,
+) -> Vec<u8> {
+    if body.is_empty() {
+        return body;
+    }
+    let mut output = Vec::with_capacity(body.len() + 64);
+    let (scroll_top, scroll_bottom) = scroll_region;
+    let (cursor_row, cursor_col) = cursor;
+    write!(
+        output,
+        "\x1b[{};{}r\x1b[{};{}H",
+        region.map_row(scroll_top),
+        region.map_row(scroll_bottom),
+        region.map_row(cursor_row),
+        region.map_col(cursor_col)
+    )
+    .expect("write to vec");
+    output.extend(body);
+    output.extend_from_slice(b"\x1b[r");
+    output
 }
 
 fn matches_osc_command(params: &[&[u8]], command: &[u8]) -> bool {
@@ -2108,6 +2995,21 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn selected_term(requested: &str, host: &str) -> &'static str {
+        TerminalConfig::select(requested, host)
+            .unwrap()
+            .advertised_profile
+            .term
+    }
+
+    fn test_bottom_region() -> TerminalRegion {
+        TerminalRegion {
+            top: 24,
+            rows: 9,
+            cols: 80,
+        }
+    }
+
     #[test]
     fn layout_defaults_to_nine_secondary_rows() {
         let layout = Layout::new(32, 100);
@@ -2309,49 +3211,124 @@ mod tests {
     }
 
     #[test]
+    fn bottom_primary_downgrades_top_profile_only() {
+        let host = profile_ghostty();
+        let top = non_graphics_profile_for(host);
+
+        assert_eq!(top.term, "xterm-direct");
+        assert!(!top.features.kitty_graphics);
+        assert!(!top.features.kitty_keyboard);
+        assert!(host.features.kitty_graphics);
+        assert!(host.features.kitty_keyboard);
+    }
+
+    #[test]
+    fn bottom_region_proxy_localizes_clear_and_reset() {
+        let region = test_bottom_region();
+        let mut proxy = BottomRegionProxy::new(profile_ghostty(), region);
+        let output = proxy.process(region, b"abc\x1b[2J\x1bc");
+
+        assert!(!output
+            .host_bytes
+            .windows(b"\x1b[2J".len())
+            .any(|w| w == b"\x1b[2J"));
+        assert!(!output
+            .host_bytes
+            .windows(b"\x1bc".len())
+            .any(|w| w == b"\x1bc"));
+        assert!(output
+            .host_bytes
+            .windows(b"\x1b[24;1H\x1b[K".len())
+            .any(|w| w == b"\x1b[24;1H\x1b[K"));
+        assert!(output
+            .host_bytes
+            .windows(b"\x1b[32;1H\x1b[K".len())
+            .any(|w| w == b"\x1b[32;1H\x1b[K"));
+    }
+
+    #[test]
+    fn bottom_region_proxy_maps_cursor_and_scroll_region() {
+        let region = test_bottom_region();
+        let mut proxy = BottomRegionProxy::new(profile_ghostty(), region);
+        let output = proxy.process(region, b"\x1b[2;3H!\x1b[3;7rX");
+
+        assert!(output
+            .host_bytes
+            .windows(b"\x1b[25;3H!".len())
+            .any(|w| w == b"\x1b[25;3H!"));
+        assert!(output
+            .host_bytes
+            .windows(b"\x1b[26;30r".len())
+            .any(|w| w == b"\x1b[26;30r"));
+    }
+
+    #[test]
+    fn bottom_region_proxy_answers_queries_and_passes_rich_bottom_protocols() {
+        let region = test_bottom_region();
+        let mut proxy = BottomRegionProxy::new(profile_ghostty(), region);
+        let output = proxy.process(
+            region,
+            b"\x1b[6n\x1b]52;c;SGVsbG8=\x1b\\\x1b_Ga=t,f=24;AAAA\x1b\\",
+        );
+
+        assert_eq!(output.child_responses, b"\x1b[1;1R");
+        assert!(output
+            .host_bytes
+            .windows(b"\x1b]52;c;SGVsbG8=\x1b\\".len())
+            .any(|w| w == b"\x1b]52;c;SGVsbG8=\x1b\\"));
+        assert!(output
+            .host_bytes
+            .windows(b"\x1b_Ga=t,f=24;AAAA\x1b\\".len())
+            .any(|w| w == b"\x1b_Ga=t,f=24;AAAA\x1b\\"));
+    }
+
+    #[test]
+    fn bottom_region_proxy_handles_split_kitty_graphics() {
+        let region = test_bottom_region();
+        let mut proxy = BottomRegionProxy::new(profile_ghostty(), region);
+
+        let first = proxy.process(region, b"\x1b_Ga=t;");
+        assert!(first.host_bytes.is_empty());
+
+        let second = proxy.process(region, b"AAAA\x1b\\");
+        assert!(second
+            .host_bytes
+            .windows(b"\x1b_Ga=t;AAAA\x1b\\".len())
+            .any(|w| w == b"\x1b_Ga=t;AAAA\x1b\\"));
+
+        let third = proxy.process(region, b"Z");
+        assert!(third.host_bytes.ends_with(b"Z\x1b[r"));
+    }
+
+    #[test]
+    fn bottom_region_proxy_tracks_mouse_and_keyboard_modes() {
+        let region = test_bottom_region();
+        let mut proxy = BottomRegionProxy::new(profile_ghostty(), region);
+        let output = proxy.process(region, b"\x1b[?1000h\x1b[?1006h\x1b[>1u\x1b[?u");
+
+        assert!(proxy.mouse_mode_enabled());
+        assert_eq!(output.keyboard_flags, Some(1));
+        assert_eq!(output.child_responses, b"\x1b[?1u");
+        assert_eq!(proxy.keyboard_flags(), 1);
+    }
+
+    #[test]
     fn auto_keeps_implemented_common_profiles() {
-        assert_eq!(
-            TerminalConfig::select("auto", "xterm-256color")
-                .unwrap()
-                .term(),
-            "xterm-256color"
-        );
-        assert_eq!(
-            TerminalConfig::select("auto", "foot-direct")
-                .unwrap()
-                .term(),
-            "foot-direct"
-        );
-        assert_eq!(
-            TerminalConfig::select("auto", "tmux-256color")
-                .unwrap()
-                .term(),
-            "tmux-256color"
-        );
+        assert_eq!(selected_term("auto", "xterm-256color"), "xterm-256color");
+        assert_eq!(selected_term("auto", "foot-direct"), "foot-direct");
+        assert_eq!(selected_term("auto", "tmux-256color"), "tmux-256color");
     }
 
     #[test]
     fn auto_keeps_implemented_fancy_profiles() {
-        assert_eq!(
-            TerminalConfig::select("auto", "xterm-ghostty")
-                .unwrap()
-                .term(),
-            "xterm-ghostty"
-        );
-        assert_eq!(
-            TerminalConfig::select("auto", "xterm-kitty")
-                .unwrap()
-                .term(),
-            "xterm-kitty"
-        );
+        assert_eq!(selected_term("auto", "xterm-ghostty"), "xterm-ghostty");
+        assert_eq!(selected_term("auto", "xterm-kitty"), "xterm-kitty");
     }
 
     #[test]
     fn forced_profiles_require_outer_support() {
         assert_eq!(
-            TerminalConfig::select("xterm-ghostty", "xterm-ghostty")
-                .unwrap()
-                .term(),
+            selected_term("xterm-ghostty", "xterm-ghostty"),
             "xterm-ghostty"
         );
 
