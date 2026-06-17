@@ -3,3 +3,4 @@
 /result-*
 /parity-artifacts*/
 /screenshots/
+__pycache__/
