@@ -11,6 +11,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_si
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use signal_hook::consts::signal::SIGWINCH;
 use signal_hook::iterator::Signals;
+use unicode_width::UnicodeWidthChar as _;
 use vte::{Params, Perform};
 
 const SECONDARY_ROWS: u16 = 9;
@@ -934,6 +935,7 @@ struct BottomRegionState {
     cols: u16,
     cursor_row: u16,
     cursor_col: u16,
+    pending_wrap: bool,
     scroll_top: u16,
     scroll_bottom: u16,
     origin_mode: bool,
@@ -957,6 +959,7 @@ impl BottomRegionState {
             cols: cols.max(1),
             cursor_row: 0,
             cursor_col: 0,
+            pending_wrap: false,
             scroll_top: 0,
             scroll_bottom: rows - 1,
             origin_mode: false,
@@ -999,12 +1002,14 @@ impl BottomRegionState {
     }
 
     fn set_cursor(&mut self, row: u16, col: u16) {
+        self.pending_wrap = false;
         let base = if self.origin_mode { self.scroll_top } else { 0 };
         self.cursor_row = base.saturating_add(row).min(self.rows - 1);
         self.cursor_col = col.min(self.cols - 1);
     }
 
     fn linefeed(&mut self) {
+        self.pending_wrap = false;
         if self.cursor_row == self.scroll_bottom {
             return;
         }
@@ -1012,6 +1017,7 @@ impl BottomRegionState {
     }
 
     fn reverse_index(&mut self) {
+        self.pending_wrap = false;
         if self.cursor_row == self.scroll_top {
             return;
         }
@@ -1019,21 +1025,32 @@ impl BottomRegionState {
     }
 
     fn carriage_return(&mut self) {
+        self.pending_wrap = false;
         self.cursor_col = 0;
     }
 
-    fn put_printed_char(&mut self) {
-        if self.cursor_col + 1 >= self.cols {
+    fn put_printed_char(&mut self, c: char) {
+        let width = c.width().unwrap_or(0) as u16;
+        if width == 0 {
+            return;
+        }
+        if self.pending_wrap {
             self.cursor_col = 0;
             self.linefeed();
+        }
+        if self.cursor_col.saturating_add(width) >= self.cols {
+            self.cursor_col = self.cols - 1;
+            self.pending_wrap = true;
         } else {
-            self.cursor_col += 1;
+            self.cursor_col += width;
+            self.pending_wrap = false;
         }
     }
 
     fn reset_local(&mut self) {
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.pending_wrap = false;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
         self.origin_mode = false;
@@ -1071,6 +1088,7 @@ impl BottomRegionState {
 
 struct BottomRegionProxy {
     parser: vte::Parser,
+    model: vt100::Parser,
     state: BottomRegionState,
     kitty_graphics: KittyGraphicsScanner,
 }
@@ -1079,6 +1097,7 @@ impl BottomRegionProxy {
     fn new(profile: TerminalProfile, region: TerminalRegion) -> Self {
         Self {
             parser: vte::Parser::new(),
+            model: vt100::Parser::new(region.rows, region.cols, SCROLLBACK_LINES),
             state: BottomRegionState::new(profile, region.rows, region.cols),
             kitty_graphics: KittyGraphicsScanner::default(),
         }
@@ -1086,6 +1105,7 @@ impl BottomRegionProxy {
 
     fn resize(&mut self, region: TerminalRegion) {
         self.state.resize(region.rows, region.cols);
+        self.model.screen_mut().set_size(region.rows, region.cols);
     }
 
     fn mouse_mode_enabled(&self) -> bool {
@@ -1105,6 +1125,8 @@ impl BottomRegionProxy {
         let keyboard_before = self.state.keyboard.flags();
         let initial_cursor = self.state.cursor();
         let initial_scroll_region = self.state.scroll_region();
+        let was_alternate_screen = self.model.screen().alternate_screen();
+        self.model.process(bytes);
         let mut body = Vec::new();
         let mut child_responses = Vec::new();
         let mut segment_start = 0;
@@ -1129,9 +1151,18 @@ impl BottomRegionProxy {
             &mut body,
             &mut child_responses,
         );
+        if was_alternate_screen && !self.model.screen().alternate_screen() {
+            render_model_region(region, &self.model, &mut body);
+        }
 
         BottomProxyOutput {
-            host_bytes: wrap_region_output(region, initial_scroll_region, initial_cursor, body),
+            host_bytes: wrap_region_output(
+                region,
+                initial_scroll_region,
+                initial_cursor,
+                self.state.cursor(),
+                body,
+            ),
             child_responses,
             keyboard_flags: if self.state.keyboard_changed
                 && self.state.keyboard.flags() != keyboard_before
@@ -1308,17 +1339,19 @@ impl Perform for BottomRegionResponder {
         let mut buf = [0_u8; 4];
         self.body
             .extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        self.state.put_printed_char();
+        self.state.put_printed_char(c);
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\x07' => self.body.push(byte),
             b'\x08' => {
+                self.state.pending_wrap = false;
                 self.state.cursor_col = self.state.cursor_col.saturating_sub(1);
                 self.body.push(byte);
             }
             b'\x09' => {
+                self.state.pending_wrap = false;
                 let next_tab = ((self.state.cursor_col / 8) + 1) * 8;
                 self.state.cursor_col = next_tab.min(self.state.cols - 1);
                 self.body.push(byte);
@@ -1391,11 +1424,13 @@ impl Perform for BottomRegionResponder {
             }
             (b"", 'A') => {
                 let amount = param_or(params, 0, 1);
+                self.state.pending_wrap = false;
                 self.state.cursor_row = self.state.cursor_row.saturating_sub(amount);
                 self.emit_cursor();
             }
             (b"", 'B') => {
                 let amount = param_or(params, 0, 1);
+                self.state.pending_wrap = false;
                 self.state.cursor_row = self
                     .state
                     .cursor_row
@@ -1405,6 +1440,7 @@ impl Perform for BottomRegionResponder {
             }
             (b"", 'C') => {
                 let amount = param_or(params, 0, 1);
+                self.state.pending_wrap = false;
                 self.state.cursor_col = self
                     .state
                     .cursor_col
@@ -1414,11 +1450,13 @@ impl Perform for BottomRegionResponder {
             }
             (b"", 'D') => {
                 let amount = param_or(params, 0, 1);
+                self.state.pending_wrap = false;
                 self.state.cursor_col = self.state.cursor_col.saturating_sub(amount);
                 self.emit_cursor();
             }
             (b"", 'E') => {
                 let amount = param_or(params, 0, 1);
+                self.state.pending_wrap = false;
                 self.state.cursor_row = self
                     .state
                     .cursor_row
@@ -1429,17 +1467,20 @@ impl Perform for BottomRegionResponder {
             }
             (b"", 'F') => {
                 let amount = param_or(params, 0, 1);
+                self.state.pending_wrap = false;
                 self.state.cursor_row = self.state.cursor_row.saturating_sub(amount);
                 self.state.cursor_col = 0;
                 self.emit_cursor();
             }
             (b"", 'G') => {
+                self.state.pending_wrap = false;
                 self.state.cursor_col = param_or(params, 0, 1)
                     .saturating_sub(1)
                     .min(self.state.cols - 1);
                 self.emit_cursor();
             }
             (b"", 'd') => {
+                self.state.pending_wrap = false;
                 self.state.cursor_row = param_or(params, 0, 1)
                     .saturating_sub(1)
                     .min(self.state.rows - 1);
@@ -1473,6 +1514,7 @@ impl Perform for BottomRegionResponder {
                 let (row, col) = self.state.saved_cursor;
                 self.state.cursor_row = row;
                 self.state.cursor_col = col;
+                self.state.pending_wrap = false;
                 self.state.clamp_cursor();
                 self.emit_cursor();
             }
@@ -1514,6 +1556,7 @@ impl Perform for BottomRegionResponder {
                 let (row, col) = self.state.saved_cursor;
                 self.state.cursor_row = row;
                 self.state.cursor_col = col;
+                self.state.pending_wrap = false;
                 self.state.clamp_cursor();
                 self.emit_cursor();
             }
@@ -2688,6 +2731,27 @@ fn render_bottom_proxy_cursor<W: Write>(
     Ok(())
 }
 
+fn render_model_region(region: TerminalRegion, parser: &vt100::Parser, output: &mut Vec<u8>) {
+    for (idx, row) in parser
+        .screen()
+        .rows_formatted(0, region.cols)
+        .take(region.rows as usize)
+        .enumerate()
+    {
+        write!(output, "\x1b[{};1H", region.map_row(idx as u16)).expect("write to vec");
+        output.extend(row);
+        output.extend_from_slice(b"\x1b[m\x1b[K");
+    }
+    let (row, col) = parser.screen().cursor_position();
+    write!(
+        output,
+        "\x1b[{};{}H",
+        region.map_row(row),
+        region.map_col(col)
+    )
+    .expect("write to vec");
+}
+
 fn process_terminal_output(
     parser: &mut vt100::Parser,
     graphics_scanner: &mut KittyGraphicsScanner,
@@ -2770,6 +2834,7 @@ fn wrap_region_output(
     region: TerminalRegion,
     scroll_region: (u16, u16),
     cursor: (u16, u16),
+    final_cursor: (u16, u16),
     body: Vec<u8>,
 ) -> Vec<u8> {
     if body.is_empty() {
@@ -2788,7 +2853,14 @@ fn wrap_region_output(
     )
     .expect("write to vec");
     output.extend(body);
-    output.extend_from_slice(b"\x1b[r");
+    let (final_row, final_col) = final_cursor;
+    write!(
+        output,
+        "\x1b[r\x1b[{};{}H",
+        region.map_row(final_row),
+        region.map_col(final_col)
+    )
+    .expect("write to vec");
     output
 }
 
@@ -3007,6 +3079,65 @@ mod tests {
             top: 24,
             rows: 9,
             cols: 80,
+        }
+    }
+
+    fn screen_rows(parser: &vt100::Parser, start: u16, rows: u16, cols: u16) -> Vec<String> {
+        parser
+            .screen()
+            .rows(0, cols)
+            .skip(start as usize)
+            .take(rows as usize)
+            .collect()
+    }
+
+    fn seed_host_top_region(host: &mut vt100::Parser, region: TerminalRegion) -> Vec<String> {
+        let mut bytes = Vec::new();
+        for row in 1..region.top {
+            write!(bytes, "\x1b[{row};1HTOP-SENTINEL-{row:02}").expect("write to vec");
+        }
+        host.process(&bytes);
+        screen_rows(host, 0, region.top.saturating_sub(1), region.cols)
+    }
+
+    fn assert_bottom_proxy_matches_direct_terminal(name: &str, chunks: &[&[u8]]) {
+        let region = test_bottom_region();
+        let mut proxy = BottomRegionProxy::new(profile_ghostty(), region);
+        let mut direct = vt100::Parser::new(region.rows, region.cols, SCROLLBACK_LINES);
+        let mut host = vt100::Parser::new(region.bottom(), region.cols, SCROLLBACK_LINES);
+        let top_before = seed_host_top_region(&mut host, region);
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            direct.process(chunk);
+            let output = proxy.process(region, chunk);
+            host.process(&output.host_bytes);
+
+            let expected = screen_rows(&direct, 0, region.rows, region.cols);
+            let actual = screen_rows(&host, region.top - 1, region.rows, region.cols);
+            assert_eq!(
+                actual,
+                expected,
+                "{name}: bottom-region mismatch after chunk {idx}; host bytes: {:?}",
+                String::from_utf8_lossy(&output.host_bytes)
+            );
+
+            let top_after = screen_rows(&host, 0, region.top - 1, region.cols);
+            assert_eq!(
+                top_after,
+                top_before,
+                "{name}: top region changed after chunk {idx}; host bytes: {:?}",
+                String::from_utf8_lossy(&output.host_bytes)
+            );
+
+            if !output.host_bytes.is_empty() {
+                let (direct_row, direct_col) = direct.screen().cursor_position();
+                let (host_row, host_col) = host.screen().cursor_position();
+                assert_eq!(
+                    (host_row, host_col),
+                    (region.top - 1 + direct_row, direct_col),
+                    "{name}: cursor mismatch after chunk {idx}"
+                );
+            }
         }
     }
 
@@ -3297,7 +3428,93 @@ mod tests {
             .any(|w| w == b"\x1b_Ga=t;AAAA\x1b\\"));
 
         let third = proxy.process(region, b"Z");
-        assert!(third.host_bytes.ends_with(b"Z\x1b[r"));
+        assert!(third
+            .host_bytes
+            .windows(b"Z\x1b[r".len())
+            .any(|w| w == b"Z\x1b[r"));
+    }
+
+    #[test]
+    fn bottom_region_proxy_matches_direct_terminal_for_scrolling_text() {
+        assert_bottom_proxy_matches_direct_terminal(
+            "scrolling-text",
+            &[
+                b"line 00\r\nline 01\r\nline 02\r\nline 03\r\n",
+                b"line 04\r\nline 05\r\nline 06\r\n",
+                b"line 07\r\nline 08\r\nline 09\r\nline 10\r\nline 11\r\n",
+            ],
+        );
+    }
+
+    #[test]
+    fn bottom_region_proxy_matches_direct_terminal_for_cursor_and_erases() {
+        assert_bottom_proxy_matches_direct_terminal(
+            "cursor-and-erases",
+            &[
+                b"\x1b[2J\x1b[Halpha\r\nbeta\r\ngamma",
+                b"\x1b[2;10Hright\x1b[1;1Htop",
+                b"\x1b[3;1H\x1b[Kcleared",
+                b"\x1b[1;1H\x1b[Jtail",
+                b"\x1b[2J\x1b[Hagain",
+            ],
+        );
+    }
+
+    #[test]
+    fn bottom_region_proxy_matches_direct_terminal_for_scroll_margins() {
+        assert_bottom_proxy_matches_direct_terminal(
+            "scroll-margins",
+            &[
+                b"\x1b[2J\x1b[Hheader\r\none\r\ntwo\r\nthree\r\nfour",
+                b"\x1b[2;8r\x1b[8;1Hmargin-0\r\nmargin-1\r\nmargin-2",
+                b"\x1b[r\x1b[9;1Hfooter",
+            ],
+        );
+    }
+
+    #[test]
+    fn bottom_region_proxy_matches_direct_terminal_for_wrapping_and_wide_text() {
+        let ascii = "ascii ".repeat(15);
+        let wrap = "wrap ".repeat(30);
+        assert_bottom_proxy_matches_direct_terminal(
+            "wrapping-and-wide-text",
+            &[
+                b"\x1b[2J\x1b[H",
+                ascii.as_bytes(),
+                b"\r\nwide: \xe7\x95\x8c\xe7\x95\x8c emoji: \xf0\x9f\x9a\x80\r\n",
+                wrap.as_bytes(),
+                b"\x1b[2;12Hafter-wide",
+            ],
+        );
+    }
+
+    #[test]
+    fn bottom_region_proxy_matches_direct_terminal_for_alternate_screen() {
+        assert_bottom_proxy_matches_direct_terminal(
+            "alternate-screen",
+            &[
+                b"normal\r\ncontent",
+                b"\x1b[?1049h\x1b[Halt-one\r\nalt-two",
+                b"\x1b[2;5Hinside",
+                b"\x1b[?1049l\x1b[Hnormal-again",
+            ],
+        );
+    }
+
+    #[test]
+    fn bottom_region_proxy_matches_direct_terminal_for_fastfetch_shaped_output() {
+        let fastfetch_like = b"\x1b[m\r\n\
+            \x1b[2C\x1b_Ga=T,f=100,t=f,c=10,r=5;L25peC9mYXN0ZmV0Y2gtbG9nby5wbmc=\x1b\\\r\n\
+            \x1b[6A\x1b[13C\r\n\
+            \x1b[13C\x1b[m\x1b[1m\x1b[31mOS  \x1b[m\x1b[m \xe2\x80\xba  \x1b[mNixOS 26.11 x86_64\r\n\
+            \x1b[13C\x1b[m\x1b[1m\x1b[32mKER \x1b[m\x1b[m \xe2\x80\xba  \x1b[mLinux 7.0.10\r\n\
+            \x1b[13C\x1b[m\x1b[1m\x1b[34mSH  \x1b[m\x1b[m \xe2\x80\xba  \x1b[mfish 4.7.1\r\n\
+            \x1b[13C\x1b[m\x1b[1m\x1b[35mTER \x1b[m\x1b[m \xe2\x80\xba  \x1b[mtinymux\r\n\
+            \x1b[13C\x1b[m\x1b[1m\x1b[36mWM  \x1b[m\x1b[m \xe2\x80\xba  \x1b[mHyprland\r\n";
+        assert_bottom_proxy_matches_direct_terminal(
+            "fastfetch-shaped-repeat",
+            &[fastfetch_like, fastfetch_like, fastfetch_like],
+        );
     }
 
     #[test]

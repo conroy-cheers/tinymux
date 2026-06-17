@@ -12,6 +12,7 @@ crossbeam-channel = "0.5"
 crossterm = "0.28"
 portable-pty = "0.9"
 signal-hook = "0.3"
+unicode-width = "0.2"
 vte = "0.15"
 vt100 = "0.16"
 

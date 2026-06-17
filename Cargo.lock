@@ -590,6 +590,7 @@ dependencies = [
  "crossterm",
  "portable-pty",
  "signal-hook",
+ "unicode-width",
  "vt100",
  "vte",
 ]
