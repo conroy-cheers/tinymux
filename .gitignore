@@ -1,4 +1,6 @@
 /target/
+/.zig-cache/
+/zig-out/
 /result
 /result-*
 /parity-artifacts*/

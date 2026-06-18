@@ -1,5 +1,5 @@
 {
-  description = "tinymux: a high-performance terminal multiplexer with one fixed two-pane split";
+  description = "tinymux: a tiny Boo-style split terminal multiplexer";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -16,6 +16,7 @@
       ];
 
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      ghosttyRev = "69095e298ab88bb0eb5ba541f4c505f2c22d07f5";
     in
     {
       packages = forAllSystems (
@@ -23,113 +24,96 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           lib = pkgs.lib;
-
-          sourceHasCargoLock =
-            builtins.pathExists ./Cargo.toml
-            && builtins.pathExists ./Cargo.lock;
-
-          parityPython = pkgs.python3.withPackages (pythonPackages: with pythonPackages; [
-            pyte
-          ]);
-          xtermJs = pkgs.fetchurl {
-            url = "https://registry.npmjs.org/@xterm/xterm/-/xterm-5.5.0.tgz";
-            hash = "sha256-vZVPpyGHIXAYjMXX6D6I2zyDyaGKTo0kwng9JkkfWdI=";
+          ghosttySrc = pkgs.fetchzip {
+            url = "https://github.com/ghostty-org/ghostty/archive/${ghosttyRev}.tar.gz";
+            hash = "sha256-XH2zydfK97HYkW7Ra5I3nrL8hlZRDEMzXW+9OH+ryvU=";
           };
-
-          libvtermEnv = ''
-            for candidate in \
-              "${pkgs.libvterm-neovim}/lib/libvterm.so" \
-              "${pkgs.libvterm-neovim}"/lib/libvterm.so.* \
-              "${pkgs.libvterm-neovim}"/lib/libvterm.*.dylib \
-              "${pkgs.libvterm-neovim}/lib/libvterm.dylib"; do
-              if [ -e "$candidate" ]; then
-                export TINYMUX_LIBVTERM="$candidate"
-                break
-              fi
-            done
-          '';
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          buildInputs =
-            with pkgs;
-            [
-              libevent
-              ncurses
-              utf8proc
-            ];
-
-          meta = with lib; {
-            description = "High-performance terminal multiplexer with a main pane above one secondary pane";
-            homepage = "https://github.com/conroy/tinymux";
-            mainProgram = "tinymux";
-            platforms = platforms.unix;
+          uucodeSrc = pkgs.fetchzip {
+            url = "https://deps.files.ghostty.org/uucode-0.2.0-ZZjBPqZVVABQepOqZHR7vV_NcaN-wats0IB6o-Exj6m9.tar.gz";
+            hash = "sha256-jLrhrmCXQ1T+LQP1JTBBB3Jn+1hCZfODbC4SdlfNdKg=";
           };
         in
         rec {
-          tinymux =
-            if sourceHasCargoLock then
-              pkgs.rustPlatform.buildRustPackage
-                {
-                  pname = "tinymux";
-                  version = "0.1.0";
+          tinymux = pkgs.stdenv.mkDerivation {
+            pname = "tinymux";
+            version = "0.1.0";
 
-                  src = lib.cleanSource ./.;
-                  cargoLock.lockFile = ./Cargo.lock;
+            src = lib.cleanSource ./.;
 
-                  inherit nativeBuildInputs buildInputs meta;
-                }
-            else
-              pkgs.stdenvNoCC.mkDerivation {
-                pname = "tinymux";
-                version = "0.1.0";
+            nativeBuildInputs = [
+              pkgs.zig_0_15
+              pkgs.python3
+            ];
 
-                dontUnpack = true;
+            patchPhase = ''
+              runHook prePatch
+              cp -R ${ghosttySrc} .nix-ghostty
+              cp -R ${uucodeSrc} .nix-uucode
+              chmod -R u+w .nix-ghostty
+              chmod -R u+w .nix-uucode
+              cp -R ${uucodeSrc} .nix-ghostty/.nix-uucode
+              chmod -R u+w .nix-ghostty/.nix-uucode
+              python3 - <<'PY'
+              from pathlib import Path
 
-                installPhase = ''
-                                    runHook preInstall
+              def replace_dependency(path: Path, name: str, replacement: str) -> None:
+                  text = path.read_text()
+                  start = text.index(f".{name} = .{{")
+                  end = text.index("        },", start) + len("        },")
+                  path.write_text(text[:start] + replacement + text[end:])
 
-                                    mkdir -p "$out/bin"
-                                    cat > "$out/bin/tinymux" <<'EOF'
-                  #!/usr/bin/env sh
-                  cat <<'MESSAGE'
-                  tinymux package scaffold
+              replace_dependency(
+                  Path("build.zig.zon"),
+                  "ghostty",
+                  '.ghostty = .{ .path = "./.nix-ghostty", .lazy = true },',
+              )
+              replace_dependency(
+                  Path("build.zig.zon"),
+                  "uucode",
+                  '.uucode = .{ .path = "./.nix-uucode", .lazy = true },',
+              )
+              replace_dependency(
+                  Path(".nix-ghostty/build.zig.zon"),
+                  "uucode",
+                  '.uucode = .{ .path = "./.nix-uucode" },',
+              )
+              PY
+              runHook postPatch
+            '';
 
-                  This flake is ready for the tinymux source tree. Once Cargo.toml and
-                  Cargo.lock exist, packages.tinymux will build the Rust crate directly.
+            buildPhase = ''
+              runHook preBuild
+              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+              export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+              zig build -Doptimize=ReleaseSafe -Dghostty-src=.nix-ghostty --summary all --prefix "$out"
+              runHook postBuild
+            '';
 
-                  Feature scope: one fixed two-pane split, with the main pane above and a
-                  secondary pane below.
-                  MESSAGE
-                  EOF
-                                    chmod +x "$out/bin/tinymux"
+            checkPhase = ''
+              runHook preCheck
+              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+              export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+              zig build test -Dghostty-src=.nix-ghostty --summary all
+              python3 ${./tests/spec/tinymux_contract.py} --tinymux "$out/bin/tinymux"
+              runHook postCheck
+            '';
 
-                                    runHook postInstall
-                '';
+            installPhase = ''
+              runHook preInstall
+              runHook postInstall
+            '';
 
-                inherit meta;
-              };
+            doCheck = true;
+
+            meta = with lib; {
+              description = "Tiny Boo-style split terminal multiplexer";
+              homepage = "https://github.com/conroy/tinymux";
+              mainProgram = "tinymux";
+              platforms = platforms.unix;
+            };
+          };
 
           default = tinymux;
-
-          "tmux-parity-runner" = pkgs.writeShellApplication {
-            name = "tinymux-tmux-parity";
-            runtimeInputs = [
-              pkgs.libvterm-neovim
-              parityPython
-              pkgs.tmux
-            ];
-            text = ''
-              ${libvtermEnv}
-              exec ${parityPython}/bin/python ${./tests/parity/tmux_snapshot_parity.py} \
-                --tinymux ${tinymux}/bin/tinymux \
-                --tmux ${pkgs.tmux}/bin/tmux \
-                --shell ${pkgs.runtimeShell} \
-                "$@"
-            '';
-          };
         }
       );
 
@@ -147,6 +131,10 @@
         }
       );
 
+      checks = forAllSystems (system: {
+        package = self.packages.${system}.tinymux;
+      });
+
       devShells = forAllSystems (
         system:
         let
@@ -154,209 +142,19 @@
         in
         {
           default = pkgs.mkShell {
-            packages =
-              with pkgs;
-              [
-                cargo
-                clang
-                clippy
-                cmake
-                expect
-                gnumake
-                lldb
-                ninja
-                libvterm-neovim
-                nixpkgs-fmt
-                nodejs
-                pkg-config
-                playwright
-                playwright-driver
-                tmux
-                rust-analyzer
-                rustc
-                rustfmt
-              ]
-              ++ [
-                (python3.withPackages (pythonPackages: with pythonPackages; [
-                  pyte
-                ]))
-              ]
-              ++ [
-                pkgs.libevent
-                pkgs.ncurses
-                pkgs.utf8proc
-              ];
+            packages = [
+              pkgs.zig_0_15
+              pkgs.python3
+              pkgs.nixpkgs-fmt
+            ];
 
-            RUST_BACKTRACE = "1";
-            TINYMUX_FEATURE_SCOPE = "fixed-two-pane-main-above-secondary-below";
+            TINYMUX_FEATURE_SCOPE = "boo-style-raw-main-with-output-only-bottom-split";
 
             shellHook = ''
               echo "tinymux dev shell"
-              echo "scope: main pane above one secondary pane"
+              echo "scope: Boo-style raw main plus output-only split"
             '';
           };
-        }
-      );
-
-      checks = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          sourceHasCargoLock =
-            builtins.pathExists ./Cargo.toml
-            && builtins.pathExists ./Cargo.lock;
-          parityPython = pkgs.python3.withPackages (pythonPackages: with pythonPackages; [
-            pyte
-          ]);
-          xtermJs = pkgs.fetchurl {
-            url = "https://registry.npmjs.org/@xterm/xterm/-/xterm-5.5.0.tgz";
-            hash = "sha256-vZVPpyGHIXAYjMXX6D6I2zyDyaGKTo0kwng9JkkfWdI=";
-          };
-          libvtermEnv = ''
-            for candidate in \
-              "${pkgs.libvterm-neovim}/lib/libvterm.so" \
-              "${pkgs.libvterm-neovim}"/lib/libvterm.so.* \
-              "${pkgs.libvterm-neovim}"/lib/libvterm.*.dylib \
-              "${pkgs.libvterm-neovim}/lib/libvterm.dylib"; do
-              if [ -e "$candidate" ]; then
-                export TINYMUX_LIBVTERM="$candidate"
-                break
-              fi
-            done
-          '';
-        in
-        {
-          package = self.packages.${system}.tinymux;
-
-          "tmux-parity-suite" = pkgs.runCommand "tinymux-tmux-parity-suite"
-            {
-              nativeBuildInputs = [
-                parityPython
-              ];
-            }
-            ''
-              cp ${./tests/parity/tmux_snapshot_parity.py} tmux_snapshot_parity.py
-              cp ${./tests/parity/browser_xterm_required_check.mjs} browser_xterm_required_check.mjs
-              cp ${./docs/subset.md} subset.md
-              ${parityPython}/bin/python -m py_compile tmux_snapshot_parity.py
-              ${parityPython}/bin/python - <<'PY'
-              import importlib.util
-              import pathlib
-              import re
-              import sys
-
-              spec = pathlib.Path("subset.md").read_text()
-              defined = set(re.findall(r"`([A-Z]+-\d{3})`", spec))
-              module_spec = importlib.util.spec_from_file_location("parity", "tmux_snapshot_parity.py")
-              parity = importlib.util.module_from_spec(module_spec)
-              sys.modules[module_spec.name] = parity
-              module_spec.loader.exec_module(parity)
-              used = {spec_id for scenario in parity.scenarios() for spec_id in scenario.spec_ids}
-              missing = sorted(used - defined)
-              if missing:
-                  raise SystemExit(f"scenario spec IDs missing from docs/subset.md: {missing}")
-              PY
-              ${pkgs.nodejs}/bin/node --check browser_xterm_required_check.mjs
-
-              mkdir -p "$out/bin" "$out/share/tinymux/tests/parity"
-              cp tmux_snapshot_parity.py "$out/share/tinymux/tests/parity/"
-              cp browser_xterm_required_check.mjs "$out/share/tinymux/tests/parity/"
-              cat > "$out/bin/tinymux-tmux-parity" <<EOF
-              #!${pkgs.runtimeShell}
-              exec ${parityPython}/bin/python "$out/share/tinymux/tests/parity/tmux_snapshot_parity.py" "\$@"
-              EOF
-              chmod +x "$out/bin/tinymux-tmux-parity"
-            '';
-
-          "tmux-parity-required" =
-            if sourceHasCargoLock then
-              pkgs.runCommand "tinymux-tmux-parity"
-                {
-                  nativeBuildInputs = [
-                    pkgs.nodejs
-                    pkgs.libvterm-neovim
-                    parityPython
-                    pkgs.playwright
-                    pkgs.playwright-driver
-                    pkgs.tmux
-                    self.packages.${system}.tinymux
-                  ];
-                }
-                ''
-                  mkdir -p artifacts "$out"
-                  ${libvtermEnv}
-                  ${parityPython}/bin/python ${./tests/parity/tmux_snapshot_parity.py} \
-                    --tinymux ${self.packages.${system}.tinymux}/bin/tinymux \
-                    --tmux ${pkgs.tmux}/bin/tmux \
-                    --shell ${pkgs.runtimeShell} \
-                    --tier required \
-                    --emulator-backend pyte+vterm \
-                    --hz 60 \
-                    --deadline-tolerance-ms 1000 \
-                    --latency-slack-ms 1000 \
-                    --artifacts artifacts
-                  mkdir -p node_modules xterm screenshots
-                  ln -s ${pkgs.playwright} node_modules/playwright-core
-                  tar -xzf ${xtermJs} -C xterm
-                  PLAYWRIGHT_CORE_PATH=${pkgs.playwright} \
-                    PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers} \
-                    ${pkgs.nodejs}/bin/node ${./tests/parity/browser_xterm_required_check.mjs} \
-                      --artifacts artifacts \
-                      --xterm-js "$PWD/xterm/package/lib/xterm.js" \
-                      --xterm-css "$PWD/xterm/package/css/xterm.css" \
-                      --screenshots screenshots
-                  cp -R artifacts "$out/"
-                  cp -R screenshots "$out/"
-                ''
-            else
-              pkgs.runCommand "tinymux-tmux-parity-skipped" { } ''
-                mkdir -p "$out"
-                cat > "$out/README" <<'EOF'
-                tmux parity execution skipped.
-
-                The full 60 Hz snapshot comparison runs automatically once
-                Cargo.toml and Cargo.lock exist and packages.tinymux builds the
-                real implementation instead of the scaffold executable.
-                EOF
-              '';
-
-          "tmux-parity" = self.checks.${system}."tmux-parity-required";
-
-          "throughput-100mbps" =
-            if sourceHasCargoLock then
-              pkgs.runCommand "tinymux-throughput-100mbps"
-                {
-                  nativeBuildInputs = [
-                    self.packages.${system}.tinymux
-                  ];
-                }
-                ''
-                  tinymux --main true --secondary true \
-                    --throughput-bench-bytes $((128 * 1024 * 1024)) > throughput.txt
-                  cp throughput.txt "$out"
-                ''
-            else
-              pkgs.runCommand "tinymux-throughput-100mbps-skipped" { } ''
-                echo "throughput check skipped until Cargo.toml and Cargo.lock exist" > "$out"
-              '';
-
-          "tmux-parity-extended-suite" = pkgs.runCommand "tinymux-tmux-parity-extended-suite"
-            {
-              nativeBuildInputs = [
-                parityPython
-              ];
-            }
-            ''
-              cp ${./tests/parity/tmux_snapshot_parity.py} tmux_snapshot_parity.py
-              cp ${./tests/parity/browser_xterm_required_check.mjs} browser_xterm_required_check.mjs
-              ${pkgs.nodejs}/bin/node --check browser_xterm_required_check.mjs
-              ${parityPython}/bin/python tmux_snapshot_parity.py \
-                --tinymux /bin/false \
-                --tmux /bin/false \
-                --tier extended \
-                --scenario extended-copy-mode-scrollback \
-                --help > "$out"
-            '';
         }
       );
 
