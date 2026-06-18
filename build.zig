@@ -13,11 +13,13 @@ pub fn build(b: *std.Build) void {
     });
 
     if (ghostty_src) |src| {
-        if (directGhosttyVt(b, target, optimize, src)) |mod| {
+        if (directGhosttyVt(b, target, optimize, .{ .cwd = src })) |mod| {
             exe_mod.addImport("ghostty-vt", mod);
         }
     } else if (b.lazyDependency("ghostty", .{ .target = target, .optimize = optimize })) |dep| {
-        exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        if (directGhosttyVt(b, target, optimize, .{ .dep = dep })) |mod| {
+            exe_mod.addImport("ghostty-vt", mod);
+        }
     }
 
     const exe = b.addExecutable(.{
@@ -38,17 +40,29 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 }
 
+const GhosttySource = union(enum) {
+    cwd: []const u8,
+    dep: *std.Build.Dependency,
+
+    fn path(self: GhosttySource, b: *std.Build, sub_path: []const u8) std.Build.LazyPath {
+        return switch (self) {
+            .cwd => |root| .{ .cwd_relative = cwdPath(b, &.{ root, sub_path }) },
+            .dep => |dep| dep.path(sub_path),
+        };
+    }
+};
+
 fn directGhosttyVt(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    ghostty_src: []const u8,
+    ghostty_src: GhosttySource,
 ) ?*std.Build.Module {
-    const lib_vt_path = cwdPath(b, &.{ ghostty_src, "src/lib_vt.zig" });
     const vt = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = lib_vt_path },
+        .root_source_file = ghostty_src.path(b, "src/lib_vt.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const general_options = b.addOptions();
@@ -61,14 +75,15 @@ fn directGhosttyVt(
     general_options.addOption(bool, "i18n", false);
     vt.addOptions("build_options", general_options);
 
+    const wuffs = wuffsModule(b, target, optimize, ghostty_src);
     const Artifact = enum { ghostty, lib };
     const terminal_options = b.addOptions();
-    terminal_options.addOption(Artifact, "artifact", .lib);
+    terminal_options.addOption(Artifact, "artifact", if (wuffs != null) .ghostty else .lib);
     terminal_options.addOption(bool, "c_abi", false);
     terminal_options.addOption(bool, "oniguruma", false);
     terminal_options.addOption(bool, "simd", false);
     terminal_options.addOption(bool, "slow_runtime_safety", optimize == .Debug);
-    terminal_options.addOption(bool, "kitty_graphics", false);
+    terminal_options.addOption(bool, "kitty_graphics", true);
     terminal_options.addOption(bool, "tmux_control_mode", false);
     terminal_options.addOption([]const u8, "version_string", versionString());
     terminal_options.addOption(usize, "version_major", 0);
@@ -78,22 +93,59 @@ fn directGhosttyVt(
     terminal_options.addOption(?[]const u8, "version_build", null);
     vt.addOptions("terminal_options", terminal_options);
 
-    const uucode_config_path = cwdPath(b, &.{ ghostty_src, "src/build/uucode_config.zig" });
     const uucode = b.lazyDependency("uucode", .{
         .target = target,
         .optimize = optimize,
-        .build_config_path = std.Build.LazyPath{ .cwd_relative = uucode_config_path },
+        .build_config_path = ghostty_src.path(b, "src/build/uucode_config.zig"),
     }) orelse return null;
 
     const uucode_tables = uucode.namedLazyPath("tables.zig");
     addUnicodeTables(b, ghostty_src, uucode.module("uucode"), uucode_tables, vt);
     vt.addImport("uucode", uucode.module("uucode"));
+    if (wuffs) |mod| vt.addImport("wuffs", mod);
     return vt;
+}
+
+fn wuffsModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ghostty_src: GhosttySource,
+) ?*std.Build.Module {
+    const core = b.lazyDependency("wuffs_core", .{}) orelse return null;
+    const module = b.createModule(.{
+        .root_source_file = ghostty_src.path(b, "pkg/wuffs/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    module.addIncludePath(core.path("release/c"));
+    module.addCSourceFile(.{
+        .file = core.path("release/c/wuffs-v0.4.c"),
+        .flags = wuffsCFlags(),
+    });
+    return module;
+}
+
+fn wuffsCFlags() []const []const u8 {
+    return &.{
+        "-DWUFFS_IMPLEMENTATION",
+        "-DWUFFS_CONFIG__MODULES",
+        "-DWUFFS_CONFIG__MODULE__AUX__BASE",
+        "-DWUFFS_CONFIG__MODULE__AUX__IMAGE",
+        "-DWUFFS_CONFIG__MODULE__BASE",
+        "-DWUFFS_CONFIG__MODULE__ADLER32",
+        "-DWUFFS_CONFIG__MODULE__CRC32",
+        "-DWUFFS_CONFIG__MODULE__DEFLATE",
+        "-DWUFFS_CONFIG__MODULE__JPEG",
+        "-DWUFFS_CONFIG__MODULE__PNG",
+        "-DWUFFS_CONFIG__MODULE__ZLIB",
+    };
 }
 
 fn addUnicodeTables(
     b: *std.Build,
-    ghostty_src: []const u8,
+    ghostty_src: GhosttySource,
     uucode_mod: *std.Build.Module,
     uucode_tables: std.Build.LazyPath,
     vt_mod: *std.Build.Module,
@@ -101,7 +153,7 @@ fn addUnicodeTables(
     const props_exe = b.addExecutable(.{
         .name = "tinymux-props-unigen",
         .root_module = b.createModule(.{
-            .root_source_file = .{ .cwd_relative = cwdPath(b, &.{ ghostty_src, "src/unicode/props_uucode.zig" }) },
+            .root_source_file = ghostty_src.path(b, "src/unicode/props_uucode.zig"),
             .target = b.graph.host,
             .strip = false,
             .omit_frame_pointer = false,
@@ -112,7 +164,7 @@ fn addUnicodeTables(
     const symbols_exe = b.addExecutable(.{
         .name = "tinymux-symbols-unigen",
         .root_module = b.createModule(.{
-            .root_source_file = .{ .cwd_relative = cwdPath(b, &.{ ghostty_src, "src/unicode/symbols_uucode.zig" }) },
+            .root_source_file = ghostty_src.path(b, "src/unicode/symbols_uucode.zig"),
             .target = b.graph.host,
             .strip = false,
             .omit_frame_pointer = false,

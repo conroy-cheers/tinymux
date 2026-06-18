@@ -32,6 +32,10 @@
             url = "https://deps.files.ghostty.org/uucode-0.2.0-ZZjBPqZVVABQepOqZHR7vV_NcaN-wats0IB6o-Exj6m9.tar.gz";
             hash = "sha256-jLrhrmCXQ1T+LQP1JTBBB3Jn+1hCZfODbC4SdlfNdKg=";
           };
+          wuffsCoreSrc = pkgs.fetchzip {
+            url = "https://deps.files.ghostty.org/wuffs-122037b39d577ec2db3fd7b2130e7b69ef6cc1807d68607a7c232c958315d381b5cd.tar.gz";
+            hash = "sha256-XbupK4QYnPudUlO5tRWrQRncGHITzJL//Yk/E7WNxYk=";
+          };
         in
         rec {
           tinymux = pkgs.stdenv.mkDerivation {
@@ -49,8 +53,10 @@
               runHook prePatch
               cp -R ${ghosttySrc} .nix-ghostty
               cp -R ${uucodeSrc} .nix-uucode
+              cp -R ${wuffsCoreSrc} .nix-wuffs-core
               chmod -R u+w .nix-ghostty
               chmod -R u+w .nix-uucode
+              chmod -R u+w .nix-wuffs-core
               cp -R ${uucodeSrc} .nix-ghostty/.nix-uucode
               chmod -R u+w .nix-ghostty/.nix-uucode
               python3 - <<'PY'
@@ -71,6 +77,11 @@
                   Path("build.zig.zon"),
                   "uucode",
                   '.uucode = .{ .path = "./.nix-uucode", .lazy = true },',
+              )
+              replace_dependency(
+                  Path("build.zig.zon"),
+                  "wuffs_core",
+                  '.wuffs_core = .{ .path = "./.nix-wuffs-core", .lazy = true },',
               )
               replace_dependency(
                   Path(".nix-ghostty/build.zig.zon"),

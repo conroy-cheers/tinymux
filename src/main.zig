@@ -11,14 +11,23 @@ const stdout_fd: posix.fd_t = 1;
 
 const default_split_rows: u16 = 9;
 const repaint_interval_ms: i64 = 16;
+const exit_drain_ms: i64 = 50;
+const raw_transition_drain_ms: i64 = 120;
+const raw_transition_idle_ms: i32 = 10;
 const scrollback_bytes: usize = 512 * 1024;
+const kitty_image_storage_limit: usize = 320 * 1024 * 1024;
+const kitty_upload_chunk_bytes: usize = 3000;
+const outer_image_id_start: u32 = 0x70000000;
+const default_cell_width: u32 = 8;
+const default_cell_height: u32 = 16;
+const kitty_graphics_enabled = @hasField(vt.Screen, "kitty_images");
 
 const sgr_reset = "\x1b[0m";
 const style_dim = "\x1b[2m";
 const synchronized_update_begin = "\x1b[?2026h";
 const synchronized_update_end = "\x1b[?2026l";
 const enter_canvas = "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J";
-const leave_canvas = "\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2026l\x1b[?1049l";
+const leave_canvas = restore_terminal_sequence ++ "\x1b[?1049l";
 
 extern "c" fn cfmakeraw(termios_p: *posix.termios) void;
 
@@ -46,7 +55,7 @@ fn printUsage(err: anyerror) !void {
         \\tinymux: {s}
         \\
         \\usage:
-        \\  tinymux --split <split-cmd> [--split-rows <n>] [--split-term auto|xterm-256color|xterm-direct] -- <main-argv...>
+        \\  tinymux --split <split-cmd> [--split-rows <n>] [--split-term auto|xterm-256color|xterm-direct|xterm-kitty|xterm-ghostty] -- <main-argv...>
         \\  tinymux -- <main-argv...>
         \\
     , .{@errorName(err)});
@@ -56,11 +65,15 @@ const TermChoice = enum {
     auto,
     xterm_256color,
     xterm_direct,
+    xterm_kitty,
+    xterm_ghostty,
 
     fn parse(value: []const u8) !TermChoice {
         if (std.mem.eql(u8, value, "auto")) return .auto;
         if (std.mem.eql(u8, value, "xterm-256color")) return .xterm_256color;
         if (std.mem.eql(u8, value, "xterm-direct")) return .xterm_direct;
+        if (std.mem.eql(u8, value, "xterm-kitty")) return .xterm_kitty;
+        if (std.mem.eql(u8, value, "xterm-ghostty")) return .xterm_ghostty;
         return error.UnsupportedTerm;
     }
 };
@@ -69,11 +82,22 @@ fn selectTerm(choice: TermChoice, outer_term: ?[]const u8, colorterm: ?[]const u
     return switch (choice) {
         .xterm_256color => "xterm-256color",
         .xterm_direct => "xterm-direct",
-        .auto => if (outerHasTruecolor(outer_term, colorterm))
+        .xterm_kitty => "xterm-kitty",
+        .xterm_ghostty => "xterm-ghostty",
+        .auto => if (outerSupportsKittyGraphics(outer_term))
+            outer_term.?
+        else if (outerHasTruecolor(outer_term, colorterm))
             "xterm-direct"
         else
             "xterm-256color",
     };
+}
+
+fn outerSupportsKittyGraphics(outer_term: ?[]const u8) bool {
+    if (outer_term) |term| {
+        return containsIgnoreCase(term, "kitty") or containsIgnoreCase(term, "ghostty");
+    }
+    return false;
 }
 
 fn outerHasTruecolor(outer_term: ?[]const u8, colorterm: ?[]const u8) bool {
@@ -207,6 +231,41 @@ const RawTerminal = struct {
     }
 };
 
+const CellSize = struct {
+    width: u32 = default_cell_width,
+    height: u32 = default_cell_height,
+
+    fn fromWinsize(size: ptypkg.Winsize) CellSize {
+        if (size.col == 0 or size.row == 0 or size.xpixel == 0 or size.ypixel == 0) return .{};
+        return .{
+            .width = @max(@as(u32, size.xpixel) / @as(u32, size.col), 1),
+            .height = @max(@as(u32, size.ypixel) / @as(u32, size.row), 1),
+        };
+    }
+
+    fn makeWinsize(self: CellSize, rows: u16, cols: u16) ptypkg.Winsize {
+        return .{
+            .row = rows,
+            .col = cols,
+            .xpixel = saturatingU16(@as(u64, self.width) * cols),
+            .ypixel = saturatingU16(@as(u64, self.height) * rows),
+        };
+    }
+
+    fn applyToTerm(self: CellSize, term: *vt.Terminal) void {
+        term.width_px = saturatingU32(@as(u64, self.width) * term.cols);
+        term.height_px = saturatingU32(@as(u64, self.height) * term.rows);
+    }
+};
+
+fn saturatingU16(value: u64) u16 {
+    return if (value > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(value);
+}
+
+fn saturatingU32(value: u64) u32 {
+    return if (value > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(value);
+}
+
 const Pane = struct {
     alloc: std.mem.Allocator,
     pty_fd: posix.fd_t,
@@ -216,6 +275,7 @@ const Pane = struct {
     command_title: []const u8,
     passthrough: bool = false,
     feeding_discarded: bool = false,
+    cell_size: CellSize,
     term: vt.Terminal,
     stream: Stream,
 
@@ -227,6 +287,7 @@ const Pane = struct {
         env: *std.process.EnvMap,
         rows: u16,
         cols: u16,
+        cell_size: CellSize,
         cwd: ?[]const u8,
     ) !*Pane {
         const self = try alloc.create(Pane);
@@ -235,7 +296,7 @@ const Pane = struct {
         const spawned = try ptypkg.spawnInPty(alloc, .{
             .argv = argv,
             .env = env,
-            .size = ptypkg.makeWinsize(rows, cols),
+            .size = cell_size.makeWinsize(rows, cols),
             .cwd = cwd,
         });
         errdefer posix.close(spawned.master);
@@ -245,17 +306,28 @@ const Pane = struct {
             .pty_fd = spawned.master,
             .child_pid = spawned.pid,
             .command_title = try alloc.dupe(u8, argv[0]),
+            .cell_size = cell_size,
             .term = undefined,
             .stream = undefined,
         };
         errdefer alloc.free(self.command_title);
 
-        self.term = try vt.Terminal.init(alloc, .{
-            .cols = cols,
-            .rows = rows,
-            .max_scrollback = scrollback_bytes,
-        });
+        self.term = if (comptime kitty_graphics_enabled)
+            try vt.Terminal.init(alloc, .{
+                .cols = cols,
+                .rows = rows,
+                .max_scrollback = scrollback_bytes,
+                .kitty_image_storage_limit = kitty_image_storage_limit,
+                .kitty_image_loading_limits = .all,
+            })
+        else
+            try vt.Terminal.init(alloc, .{
+                .cols = cols,
+                .rows = rows,
+                .max_scrollback = scrollback_bytes,
+            });
         errdefer self.term.deinit(alloc);
+        self.cell_size.applyToTerm(&self.term);
 
         var handler: Stream.Handler = .init(&self.term);
         handler.effects = .{
@@ -315,8 +387,8 @@ const Pane = struct {
         return .{
             .rows = self.term.rows,
             .columns = self.term.cols,
-            .cell_width = 8,
-            .cell_height = 16,
+            .cell_width = self.cell_size.width,
+            .cell_height = self.cell_size.height,
         };
     }
 
@@ -334,10 +406,12 @@ const Pane = struct {
         try protocol.writeAll(self.pty_fd, bytes);
     }
 
-    fn resize(self: *Pane, rows: u16, cols: u16) !void {
+    fn resize(self: *Pane, rows: u16, cols: u16, cell_size: CellSize) !void {
+        self.cell_size = cell_size;
         try self.term.resize(self.alloc, cols, rows);
+        self.cell_size.applyToTerm(&self.term);
         if (self.pty_fd >= 0) {
-            try ptypkg.Pty.setSize(self.pty_fd, ptypkg.makeWinsize(rows, cols));
+            try ptypkg.Pty.setSize(self.pty_fd, self.cell_size.makeWinsize(rows, cols));
         }
     }
 
@@ -455,6 +529,7 @@ const reset_state_sequence = "\x0f\x1b(B" ++
     "\x1b[4l\x1b[r\x1b[?69l\x1b[?25h" ++
     "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l" ++
     "\x1b[?2004l\x1b[?1004l\x1b[>4;0m\x1b[=0;1u";
+const restore_terminal_sequence = reset_state_sequence ++ "\x1b[?2026l\x1b[?2031l";
 const sanitize_sequence = reset_state_sequence ++ "\x1b[H\x1b[2J";
 
 const ViewportRow = struct {
@@ -547,11 +622,329 @@ const PaneRowCache = struct {
     }
 };
 
+const PaneId = enum(u1) {
+    main = 0,
+    split = 1,
+};
+
+const GraphicsState = struct {
+    uploaded: std.AutoHashMapUnmanaged(u64, UploadedImage) = .{},
+    next_outer_id: u32 = outer_image_id_start,
+
+    const UploadedImage = struct {
+        outer_id: u32,
+        len: usize,
+        width: u32,
+        height: u32,
+        format_code: u32,
+    };
+
+    fn deinit(self: *GraphicsState, alloc: std.mem.Allocator) void {
+        self.uploaded.deinit(alloc);
+    }
+
+    fn deleteAll(self: *GraphicsState, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        if (comptime !kitty_graphics_enabled) {
+            return;
+        }
+
+        var iter = self.uploaded.iterator();
+        while (iter.next()) |entry| {
+            try emitDeleteImage(alloc, out, entry.value_ptr.outer_id);
+        }
+        self.uploaded.clearRetainingCapacity();
+    }
+
+    fn needsReset(_: *GraphicsState, main_pane: *Pane, split_pane: ?*Pane) bool {
+        if (comptime !kitty_graphics_enabled) return false;
+        if (main_pane.term.screens.active.kitty_images.dirty) return true;
+        if (split_pane) |pane| {
+            if (pane.term.screens.active.kitty_images.dirty) return true;
+        }
+        return false;
+    }
+
+    fn render(
+        self: *GraphicsState,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        layout: Layout,
+        main_pane: *Pane,
+        split_pane: ?*Pane,
+        force: bool,
+    ) !void {
+        if (comptime !kitty_graphics_enabled) {
+            return;
+        }
+
+        const reset = force or self.needsReset(main_pane, split_pane);
+        if (!reset) return;
+
+        try self.deleteAll(alloc, out);
+        try self.renderPane(alloc, out, .main, main_pane, 0);
+        main_pane.term.screens.active.kitty_images.dirty = false;
+        if (layout.split_visible) {
+            if (split_pane) |pane| {
+                try self.renderPane(alloc, out, .split, pane, layout.splitTop());
+                pane.term.screens.active.kitty_images.dirty = false;
+            }
+        }
+    }
+
+    fn renderPane(
+        self: *GraphicsState,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        pane_id: PaneId,
+        pane: *Pane,
+        origin_row: u16,
+    ) !void {
+        const storage = &pane.term.screens.active.kitty_images;
+        const screen = pane.term.screens.active;
+        const viewport_tl_pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }) orelse return;
+        const viewport_tl = (screen.pages.pointFromPin(.screen, viewport_tl_pin) orelse return).screen;
+
+        var placement_seq: u32 = 1;
+        var iter = storage.placements.iterator();
+        while (iter.next()) |entry| : (placement_seq +%= 1) {
+            const image = storage.images.get(entry.key_ptr.image_id) orelse continue;
+            const outer_id = try self.ensureImage(alloc, out, pane_id, image) orelse continue;
+            const request = placementRequest(pane, image, entry.value_ptr.*, viewport_tl, origin_row, placement_seq) orelse continue;
+            try emitPlacement(alloc, out, outer_id, request);
+        }
+    }
+
+    fn ensureImage(
+        self: *GraphicsState,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        pane_id: PaneId,
+        image: anytype,
+    ) !?u32 {
+        const format_code = imageFormatCode(image) orelse return null;
+        const key = imageMapKey(pane_id, image.id);
+        const existing = self.uploaded.getPtr(key);
+        if (existing) |entry| {
+            if (entry.len == image.data.len and
+                entry.width == image.width and
+                entry.height == image.height and
+                entry.format_code == format_code)
+            {
+                return entry.outer_id;
+            }
+            try emitDeleteImage(alloc, out, entry.outer_id);
+            try emitImageUpload(alloc, out, entry.outer_id, image, format_code);
+            entry.* = .{
+                .outer_id = entry.outer_id,
+                .len = image.data.len,
+                .width = image.width,
+                .height = image.height,
+                .format_code = format_code,
+            };
+            return entry.outer_id;
+        }
+
+        const outer_id = self.next_outer_id;
+        self.next_outer_id +%= 1;
+        if (self.next_outer_id == 0) self.next_outer_id = outer_image_id_start;
+        try emitImageUpload(alloc, out, outer_id, image, format_code);
+        try self.uploaded.put(alloc, key, .{
+            .outer_id = outer_id,
+            .len = image.data.len,
+            .width = image.width,
+            .height = image.height,
+            .format_code = format_code,
+        });
+        return outer_id;
+    }
+};
+
+const PlacementRequest = struct {
+    row: u32,
+    col: u32,
+    placement_id: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    x_offset: u32,
+    y_offset: u32,
+    columns: u32,
+    rows: u32,
+    z: i32,
+};
+
+fn imageMapKey(pane_id: PaneId, image_id: u32) u64 {
+    return (@as(u64, @intFromEnum(pane_id)) << 32) | image_id;
+}
+
+fn imageFormatCode(image: anytype) ?u32 {
+    return switch (image.format) {
+        .rgb => 24,
+        .rgba => 32,
+        else => null,
+    };
+}
+
+fn placementRequest(
+    pane: *Pane,
+    image: anytype,
+    placement: anytype,
+    viewport_tl: anytype,
+    origin_row: u16,
+    placement_id: u32,
+) ?PlacementRequest {
+    const rect = placement.rect(image, &pane.term) orelse return null;
+    const rect_tl = (pane.term.screens.active.pages.pointFromPin(.screen, rect.top_left) orelse return null).screen;
+    const pixel_size = placement.pixelSize(image, &pane.term);
+    const grid_size = placement.gridSize(image, &pane.term);
+    if (pixel_size.width == 0 or pixel_size.height == 0 or grid_size.cols == 0 or grid_size.rows == 0) return null;
+
+    var row: i64 = @as(i64, rect_tl.y) - @as(i64, viewport_tl.y);
+    var col: i64 = @as(i64, rect_tl.x) - @as(i64, viewport_tl.x);
+    var rows: u32 = grid_size.rows;
+    var cols: u32 = grid_size.cols;
+    var source_x = @min(placement.source_x, image.width);
+    var source_y = @min(placement.source_y, image.height);
+    var source_width = if (placement.source_width > 0)
+        @min(placement.source_width, image.width - source_x)
+    else
+        image.width - source_x;
+    var source_height = if (placement.source_height > 0)
+        @min(placement.source_height, image.height - source_y)
+    else
+        image.height - source_y;
+    if (source_width == 0 or source_height == 0) return null;
+
+    if (row < 0) {
+        const skipped: u32 = @intCast(@min(@as(i64, rows), -row));
+        const skipped_px = skipped * pane.cell_size.height;
+        const skipped_source = scaledSourceDelta(skipped_px, pixel_size.height, source_height);
+        source_y += skipped_source;
+        source_height -|= skipped_source;
+        rows -= skipped;
+        row = 0;
+    }
+    if (col < 0) {
+        const skipped: u32 = @intCast(@min(@as(i64, cols), -col));
+        const skipped_px = skipped * pane.cell_size.width;
+        const skipped_source = scaledSourceDelta(skipped_px, pixel_size.width, source_width);
+        source_x += skipped_source;
+        source_width -|= skipped_source;
+        cols -= skipped;
+        col = 0;
+    }
+    if (row >= pane.term.rows or col >= pane.term.cols or rows == 0 or cols == 0) return null;
+
+    const visible_rows = @as(u32, pane.term.rows) - @as(u32, @intCast(row));
+    const visible_cols = @as(u32, pane.term.cols) - @as(u32, @intCast(col));
+    if (rows > visible_rows) {
+        const clipped_rows = rows - visible_rows;
+        const clipped_px = clipped_rows * pane.cell_size.height;
+        source_height -|= scaledSourceDelta(clipped_px, pixel_size.height, source_height);
+        rows = visible_rows;
+    }
+    if (cols > visible_cols) {
+        const clipped_cols = cols - visible_cols;
+        const clipped_px = clipped_cols * pane.cell_size.width;
+        source_width -|= scaledSourceDelta(clipped_px, pixel_size.width, source_width);
+        cols = visible_cols;
+    }
+    if (source_width == 0 or source_height == 0 or rows == 0 or cols == 0) return null;
+
+    return .{
+        .row = @as(u32, origin_row) + @as(u32, @intCast(row)),
+        .col = @intCast(col),
+        .placement_id = if (placement_id == 0) 1 else placement_id,
+        .source_x = source_x,
+        .source_y = source_y,
+        .source_width = source_width,
+        .source_height = source_height,
+        .x_offset = placement.x_offset,
+        .y_offset = placement.y_offset,
+        .columns = cols,
+        .rows = rows,
+        .z = placement.z,
+    };
+}
+
+fn scaledSourceDelta(pixel_delta: u32, total_pixels: u32, source_length: u32) u32 {
+    if (pixel_delta == 0 or total_pixels == 0 or source_length == 0) return 0;
+    return @min(@as(u32, @intCast((@as(u64, pixel_delta) * source_length) / total_pixels)), source_length);
+}
+
+fn emitImageUpload(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outer_id: u32, image: anytype, format_code: u32) !void {
+    if (image.data.len == 0) return;
+    var offset: usize = 0;
+    while (offset < image.data.len) {
+        const remaining = image.data.len - offset;
+        const chunk_len = @min(kitty_upload_chunk_bytes, remaining);
+        const end = offset + chunk_len;
+        const more = end < image.data.len;
+        const chunk = image.data[offset..end];
+        const encoded_len = std.base64.standard.Encoder.calcSize(chunk.len);
+        const encoded = try alloc.alloc(u8, encoded_len);
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, chunk);
+
+        if (offset == 0) {
+            if (more) {
+                try out.print(
+                    alloc,
+                    "\x1b_Ga=t,t=d,f={d},s={d},v={d},i={d},m=1,q=2;{s}\x1b\\",
+                    .{ format_code, image.width, image.height, outer_id, encoded },
+                );
+            } else {
+                try out.print(
+                    alloc,
+                    "\x1b_Ga=t,t=d,f={d},s={d},v={d},i={d},q=2;{s}\x1b\\",
+                    .{ format_code, image.width, image.height, outer_id, encoded },
+                );
+            }
+        } else {
+            try out.print(
+                alloc,
+                "\x1b_Gm={d},q=2;{s}\x1b\\",
+                .{ @intFromBool(more), encoded },
+            );
+        }
+
+        offset = end;
+    }
+}
+
+fn emitPlacement(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outer_id: u32, request: PlacementRequest) !void {
+    try out.print(
+        alloc,
+        "\x1b[{d};{d}H\x1b_Ga=p,i={d},p={d},x={d},y={d},w={d},h={d},X={d},Y={d},c={d},r={d},z={d},C=1,q=2;\x1b\\",
+        .{
+            request.row + 1,
+            request.col + 1,
+            outer_id,
+            request.placement_id,
+            request.source_x,
+            request.source_y,
+            request.source_width,
+            request.source_height,
+            request.x_offset,
+            request.y_offset,
+            request.columns,
+            request.rows,
+            request.z,
+        },
+    );
+}
+
+fn emitDeleteImage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outer_id: u32) !void {
+    try out.print(alloc, "\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{outer_id});
+}
+
 const Compositor = struct {
     alloc: std.mem.Allocator,
     row_cache: std.ArrayList(std.ArrayList(u8)) = .empty,
     main_rows: PaneRowCache = .{},
     split_rows: PaneRowCache = .{},
+    graphics: GraphicsState = .{},
     full_render: bool = true,
 
     fn deinit(self: *Compositor) void {
@@ -559,6 +952,7 @@ const Compositor = struct {
         self.row_cache.deinit(self.alloc);
         self.main_rows.deinit(self.alloc);
         self.split_rows.deinit(self.alloc);
+        self.graphics.deinit(self.alloc);
     }
 
     fn invalidate(self: *Compositor) void {
@@ -602,6 +996,14 @@ const Compositor = struct {
             try frame.appendSlice(self.alloc, synchronized_update_begin);
             try frame.appendSlice(self.alloc, "\x1b[?25l");
             try frame.appendSlice(self.alloc, body.items);
+            try self.graphics.render(
+                self.alloc,
+                &frame,
+                layout,
+                main_pane,
+                split_pane,
+                self.full_render,
+            );
             try frame.appendSlice(self.alloc, cursor);
             try frame.appendSlice(self.alloc, "\x1b[?25h");
             try frame.appendSlice(self.alloc, synchronized_update_end);
@@ -705,11 +1107,12 @@ const App = struct {
     compositor: Compositor,
     prefix: PrefixParser = .{},
     composed: bool,
-    canvas_active: bool = false,
     last_size: ptypkg.Winsize,
+    cell_size: CellSize,
 
     fn init(alloc: std.mem.Allocator, config: Config) !App {
         const outer_size = ptypkg.getSize(stdout_fd) catch ptypkg.makeWinsize(24, 80);
+        const cell_size = CellSize.fromWinsize(outer_size);
         const split_visible = config.split_cmd != null;
         const layout = Layout.compute(outer_size.row, outer_size.col, split_visible, config.split_rows);
         const cwd = std.fs.cwd().realpathAlloc(alloc, ".") catch null;
@@ -729,6 +1132,7 @@ const App = struct {
             &main_env,
             layout.main_rows,
             layout.cols,
+            cell_size,
             cwd,
         );
         errdefer main_pane.destroy();
@@ -747,6 +1151,7 @@ const App = struct {
                 &split_env,
                 @max(layout.split_rows, 1),
                 layout.cols,
+                cell_size,
                 cwd,
             );
         }
@@ -764,11 +1169,12 @@ const App = struct {
             .compositor = .{ .alloc = alloc },
             .composed = split_visible,
             .last_size = outer_size,
+            .cell_size = cell_size,
         };
     }
 
     fn deinit(self: *App) void {
-        if (self.canvas_active) protocol.writeAll(stdout_fd, leave_canvas) catch {};
+        self.restoreOuterTerminal();
         self.raw_terminal.restore();
         if (self.split_pane) |pane| pane.destroy();
         self.main_pane.destroy();
@@ -779,7 +1185,6 @@ const App = struct {
         self.main_pane.passthrough = !self.composed;
         if (self.composed) {
             try protocol.writeAll(stdout_fd, enter_canvas);
-            self.canvas_active = true;
             self.compositor.invalidate();
         }
 
@@ -787,7 +1192,10 @@ const App = struct {
         var running = true;
         while (running) {
             self.main_pane.reapIfExited();
-            if (!self.main_pane.alive and self.main_pane.pty_fd < 0) break;
+            if (!self.main_pane.alive) {
+                try self.drainMainForExit();
+                break;
+            }
             if (self.split_pane) |pane| pane.reapIfExited();
 
             try self.checkResize();
@@ -846,6 +1254,14 @@ const App = struct {
         }
     }
 
+    fn restoreOuterTerminal(self: *App) void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.alloc);
+        self.compositor.graphics.deleteAll(self.alloc, &out) catch {};
+        out.appendSlice(self.alloc, leave_canvas) catch {};
+        protocol.writeAll(stdout_fd, out.items) catch {};
+    }
+
     fn readInput(self: *App, running: *bool) !void {
         var buf: [8192]u8 = undefined;
         const n = posix.read(stdin_fd, &buf) catch |err| switch (err) {
@@ -899,25 +1315,96 @@ const App = struct {
         pane.terminate();
         pane.destroy();
         self.split_pane = null;
+        self.layout = Layout.compute(self.last_size.row, self.last_size.col, false, self.config.split_rows);
+        try self.main_pane.resize(self.layout.main_rows, self.layout.cols, self.cell_size);
+        try self.drainMainForRawTransition();
         self.composed = false;
         self.main_pane.passthrough = true;
-        self.canvas_active = false;
-        try protocol.writeAll(stdout_fd, leave_canvas);
-        self.layout = Layout.compute(self.last_size.row, self.last_size.col, false, self.config.split_rows);
-        try self.main_pane.resize(self.layout.main_rows, self.layout.cols);
+        var leave: std.ArrayList(u8) = .empty;
+        defer leave.deinit(self.alloc);
+        try self.compositor.graphics.deleteAll(self.alloc, &leave);
+        try leave.appendSlice(self.alloc, leave_canvas);
+        try protocol.writeAll(stdout_fd, leave.items);
         const repaint = try self.main_pane.repaint(self.alloc);
         defer self.alloc.free(repaint);
-        try protocol.writeAll(stdout_fd, repaint);
+        var raw_repaint: std.ArrayList(u8) = .empty;
+        defer raw_repaint.deinit(self.alloc);
+        try raw_repaint.appendSlice(self.alloc, repaint);
+        try self.compositor.graphics.render(
+            self.alloc,
+            &raw_repaint,
+            self.layout,
+            self.main_pane,
+            null,
+            true,
+        );
+        var cursor_buf: [64]u8 = undefined;
+        var cursor_writer = std.Io.Writer.fixed(&cursor_buf);
+        try self.main_pane.writeCursorPos(&cursor_writer);
+        try raw_repaint.appendSlice(self.alloc, cursor_writer.buffered());
+        try protocol.writeAll(stdout_fd, raw_repaint.items);
+    }
+
+    fn drainMainForRawTransition(self: *App) !void {
+        const deadline = std.time.milliTimestamp() + raw_transition_drain_ms;
+        while (self.main_pane.pty_fd >= 0 and std.time.milliTimestamp() < deadline) {
+            var fds = [_]posix.pollfd{.{
+                .fd = self.main_pane.pty_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = try posix.poll(&fds, raw_transition_idle_ms);
+            if (ready == 0) break;
+            if (fds[0].revents == 0) continue;
+
+            var buf: [64 * 1024]u8 = undefined;
+            const n = posix.read(self.main_pane.pty_fd, &buf) catch {
+                self.main_pane.markDead();
+                return;
+            };
+            if (n == 0) {
+                self.main_pane.markDead();
+                return;
+            }
+            self.main_pane.feed(buf[0..n]);
+        }
+    }
+
+    fn drainMainForExit(self: *App) !void {
+        const deadline = std.time.milliTimestamp() + exit_drain_ms;
+        while (self.main_pane.pty_fd >= 0 and std.time.milliTimestamp() < deadline) {
+            var fds = [_]posix.pollfd{.{
+                .fd = self.main_pane.pty_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = try posix.poll(&fds, raw_transition_idle_ms);
+            if (ready == 0) break;
+            if (fds[0].revents == 0) continue;
+
+            var buf: [64 * 1024]u8 = undefined;
+            const n = posix.read(self.main_pane.pty_fd, &buf) catch break;
+            if (n == 0) break;
+
+            const bytes = buf[0..n];
+            self.main_pane.feed(bytes);
+            if (!self.composed) {
+                try protocol.writeAll(stdout_fd, bytes);
+            }
+        }
+        self.main_pane.closePty();
     }
 
     fn checkResize(self: *App) !void {
         const size = ptypkg.getSize(stdout_fd) catch return;
-        if (size.row == self.last_size.row and size.col == self.last_size.col) return;
+        if (size.row == self.last_size.row and size.col == self.last_size.col and
+            size.xpixel == self.last_size.xpixel and size.ypixel == self.last_size.ypixel) return;
         self.last_size = size;
+        self.cell_size = CellSize.fromWinsize(size);
         self.layout = Layout.compute(size.row, size.col, self.composed, self.config.split_rows);
-        try self.main_pane.resize(self.layout.main_rows, self.layout.cols);
+        try self.main_pane.resize(self.layout.main_rows, self.layout.cols, self.cell_size);
         if (self.split_pane) |pane| {
-            try pane.resize(@max(self.layout.split_rows, 1), self.layout.cols);
+            try pane.resize(@max(self.layout.split_rows, 1), self.layout.cols, self.cell_size);
         }
         self.compositor.invalidate();
     }
@@ -989,12 +1476,55 @@ test "prefix parser forwards unknown bindings unchanged" {
     try std.testing.expectEqualStrings("a\x02zb", result.forwarded.items);
 }
 
-test "term selection auto prefers direct color only when detected" {
-    try std.testing.expectEqualStrings("xterm-direct", selectTerm(.auto, "xterm-ghostty", null));
+test "term selection preserves graphics-capable outer terminals" {
+    try std.testing.expectEqualStrings("xterm-ghostty", selectTerm(.auto, "xterm-ghostty", null));
+    try std.testing.expectEqualStrings("xterm-kitty", selectTerm(.auto, "xterm-kitty", null));
     try std.testing.expectEqualStrings("xterm-direct", selectTerm(.auto, "xterm-256color", "truecolor"));
     try std.testing.expectEqualStrings("xterm-256color", selectTerm(.auto, "xterm-256color", null));
     try std.testing.expectEqualStrings("xterm-direct", selectTerm(.xterm_direct, null, null));
     try std.testing.expectEqualStrings("xterm-256color", selectTerm(.xterm_256color, null, null));
+    try std.testing.expectEqualStrings("xterm-ghostty", selectTerm(.xterm_ghostty, null, null));
+    try std.testing.expectEqualStrings("xterm-kitty", selectTerm(.xterm_kitty, null, null));
+}
+
+test "graphics replay emits outer image upload and placement" {
+    if (comptime !kitty_graphics_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{
+            .cols = 10,
+            .rows = 5,
+            .max_scrollback = scrollback_bytes,
+            .kitty_image_storage_limit = kitty_image_storage_limit,
+            .kitty_image_loading_limits = .all,
+        }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+    pane.cell_size.applyToTerm(&pane.term);
+
+    var stream = pane.term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b_Ga=T,f=24,t=d,i=1,s=1,v=1,c=1,r=1,q=2;////\x1b\\");
+
+    var graphics: GraphicsState = .{};
+    defer graphics.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const layout = Layout.compute(5, 10, false, 0);
+    try graphics.render(alloc, &out, layout, &pane, null, true);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "f=24,s=1,v=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1;1H\x1b_Ga=p") != null);
+    try std.testing.expect(!pane.term.screens.active.kitty_images.dirty);
 }
 
 test "viewport row cache invalidates clean rows that scrolled" {
