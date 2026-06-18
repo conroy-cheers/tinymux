@@ -10,10 +10,20 @@ const stdin_fd: posix.fd_t = 0;
 const stdout_fd: posix.fd_t = 1;
 
 const default_split_rows: u16 = 9;
-const repaint_interval_ms: i64 = 16;
 const exit_drain_ms: i64 = 50;
 const raw_transition_drain_ms: i64 = 120;
 const raw_transition_idle_ms: i32 = 10;
+const composed_idle_poll_ms: i32 = 50;
+const composed_frame_interval_ns: i128 = 4 * std.time.ns_per_ms;
+const bulk_frame_interval_ns: i128 = 8 * std.time.ns_per_ms;
+const bulk_sticky_window_ns: i128 = 120 * std.time.ns_per_ms;
+const interactive_input_window_ns: i128 = 50 * std.time.ns_per_ms;
+const interactive_pty_drain_budget_ns: i128 = 1 * std.time.ns_per_ms;
+const bulk_pty_drain_budget_ns: i128 = 6 * std.time.ns_per_ms;
+const pty_drain_max_reads: usize = 128;
+const pty_drain_max_bytes: usize = 8 * 1024 * 1024;
+const bulk_damage_bytes: usize = 16 * 1024;
+const bulk_damage_reads: usize = 2;
 const scrollback_bytes: usize = 512 * 1024;
 const kitty_image_storage_limit: usize = 320 * 1024 * 1024;
 const kitty_upload_chunk_bytes: usize = 3000;
@@ -30,6 +40,114 @@ const enter_canvas = "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J";
 const leave_canvas = restore_terminal_sequence ++ "\x1b[?1049l";
 
 extern "c" fn cfmakeraw(termios_p: *posix.termios) void;
+
+const RenderScheduler = struct {
+    const DirtyKind = enum { normal, urgent, bulk };
+
+    dirty: bool = false,
+    urgent: bool = false,
+    bulk: bool = false,
+    last_render_ns: ?i128 = null,
+    last_input_ns: ?i128 = null,
+    bulk_until_ns: ?i128 = null,
+
+    fn markDirty(self: *RenderScheduler, kind: DirtyKind) void {
+        self.dirty = true;
+        switch (kind) {
+            .normal => self.bulk = false,
+            .urgent => {
+                self.bulk = false;
+                self.urgent = true;
+            },
+            .bulk => {
+                self.bulk = true;
+                self.urgent = false;
+            },
+        }
+    }
+
+    fn noteInput(self: *RenderScheduler, now_ns: i128) void {
+        self.last_input_ns = now_ns;
+    }
+
+    fn recentlyInput(self: *const RenderScheduler, now_ns: i128) bool {
+        const last = self.last_input_ns orelse return false;
+        return now_ns >= last and now_ns - last <= interactive_input_window_ns;
+    }
+
+    fn ptyDrainBudget(self: *const RenderScheduler, now_ns: i128, first_read: DrainStats) i128 {
+        if (first_read.bulkish() or self.bulkActive(now_ns)) return bulk_pty_drain_budget_ns;
+        return if (self.recentlyInput(now_ns))
+            interactive_pty_drain_budget_ns
+        else
+            bulk_pty_drain_budget_ns;
+    }
+
+    fn noteBulk(self: *RenderScheduler, now_ns: i128) void {
+        self.bulk_until_ns = now_ns + bulk_sticky_window_ns;
+    }
+
+    fn bulkActive(self: *const RenderScheduler, now_ns: i128) bool {
+        const until = self.bulk_until_ns orelse return false;
+        return now_ns < until;
+    }
+
+    fn shouldRender(self: *const RenderScheduler, now_ns: i128) bool {
+        if (!self.dirty) return false;
+        if (self.urgent) return true;
+        const last = self.last_render_ns orelse return true;
+        return now_ns >= last + self.frameIntervalNs();
+    }
+
+    fn pollTimeoutMs(self: *const RenderScheduler, now_ns: i128) i32 {
+        if (!self.dirty) return composed_idle_poll_ms;
+        if (self.shouldRender(now_ns)) return 0;
+
+        const last = self.last_render_ns orelse return 0;
+        const due_ns = last + self.frameIntervalNs();
+        if (now_ns >= due_ns) return 0;
+        return nsToPollMs(due_ns - now_ns);
+    }
+
+    fn rendered(self: *RenderScheduler, now_ns: i128) void {
+        self.dirty = false;
+        self.urgent = false;
+        self.bulk = false;
+        self.last_render_ns = now_ns;
+    }
+
+    fn frameIntervalNs(self: *const RenderScheduler) i128 {
+        return if (self.bulk) bulk_frame_interval_ns else composed_frame_interval_ns;
+    }
+
+    fn nsToPollMs(ns: i128) i32 {
+        if (ns <= 0) return 0;
+        const ms = @divFloor(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+        return @intCast(@min(ms, @as(i128, std.math.maxInt(i32))));
+    }
+};
+
+const DrainStats = struct {
+    reads: usize = 0,
+    bytes: usize = 0,
+    saturated: bool = false,
+
+    fn record(self: *DrainStats, n: usize) void {
+        if (n == 0) return;
+        self.reads += 1;
+        self.bytes += n;
+    }
+
+    fn merge(self: *DrainStats, other: DrainStats) void {
+        self.reads += other.reads;
+        self.bytes += other.bytes;
+        self.saturated = self.saturated or other.saturated;
+    }
+
+    fn bulkish(self: DrainStats) bool {
+        return self.saturated or self.bytes >= bulk_damage_bytes or self.reads >= bulk_damage_reads;
+    }
+};
 
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -278,8 +396,80 @@ const Pane = struct {
     cell_size: CellSize,
     term: vt.Terminal,
     stream: Stream,
+    pending_scroll_up: usize = 0,
 
-    pub const Stream = vt.TerminalStream;
+    pub const TerminalHandler = vt.TerminalStream.Handler;
+    pub const Stream = vt.Stream(StreamHandler);
+
+    const StreamHandler = struct {
+        const Action = @import("ghostty-vt").StreamAction;
+        const Terminal = @import("ghostty-vt").Terminal;
+
+        terminal_handler: TerminalHandler,
+        pane: *Pane,
+
+        fn init(pane: *Pane) StreamHandler {
+            var handler: TerminalHandler = .init(&pane.term);
+            handler.effects = .{
+                .write_pty = effectWritePty,
+                .bell = null,
+                .color_scheme = null,
+                .device_attributes = effectDeviceAttributes,
+                .enquiry = null,
+                .size = effectSize,
+                .title_changed = null,
+                .pwd_changed = null,
+                .xtversion = effectXtversion,
+            };
+            return .{
+                .terminal_handler = handler,
+                .pane = pane,
+            };
+        }
+
+        pub fn deinit(self: *StreamHandler) void {
+            self.terminal_handler.deinit();
+        }
+
+        pub fn vt(
+            self: *StreamHandler,
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            const scroll_up = self.fullPaneScrollUp(action, value);
+            self.terminal_handler.vt(action, value);
+            if (scroll_up > 0) self.pane.noteScrollUp(scroll_up);
+        }
+
+        fn fullPaneScrollUp(
+            self: *StreamHandler,
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) usize {
+            const term = self.terminal_handler.terminal;
+            if (!fullPaneScrollRegion(term)) return 0;
+            return switch (action) {
+                .linefeed, .index, .next_line => if (cursorWillScrollUp(term)) 1 else 0,
+                .scroll_up => @min(value, term.rows),
+                else => 0,
+            };
+        }
+
+        fn fullPaneScrollRegion(term: *const Terminal) bool {
+            return term.rows > 0 and term.cols > 0 and
+                term.scrolling_region.top == 0 and
+                term.scrolling_region.bottom == term.rows - 1 and
+                term.scrolling_region.left == 0 and
+                term.scrolling_region.right == term.cols - 1;
+        }
+
+        fn cursorWillScrollUp(term: *const Terminal) bool {
+            const cursor = term.screens.active.cursor;
+            return cursor.y == term.scrolling_region.bottom and
+                cursor.x >= term.scrolling_region.left and
+                cursor.x <= term.scrolling_region.right;
+        }
+    };
 
     fn create(
         alloc: std.mem.Allocator,
@@ -329,18 +519,7 @@ const Pane = struct {
         errdefer self.term.deinit(alloc);
         self.cell_size.applyToTerm(&self.term);
 
-        var handler: Stream.Handler = .init(&self.term);
-        handler.effects = .{
-            .write_pty = effectWritePty,
-            .bell = null,
-            .color_scheme = null,
-            .device_attributes = effectDeviceAttributes,
-            .enquiry = null,
-            .size = effectSize,
-            .title_changed = null,
-            .pwd_changed = null,
-            .xtversion = effectXtversion,
-        };
+        const handler = StreamHandler.init(self);
         self.stream = .initAlloc(alloc, handler);
         return self;
     }
@@ -353,15 +532,15 @@ const Pane = struct {
         self.alloc.destroy(self);
     }
 
-    fn fromHandler(handler: *Stream.Handler) *Pane {
-        const stream: *Stream = @alignCast(@fieldParentPtr("handler", handler));
-        return @alignCast(@fieldParentPtr("stream", stream));
+    fn fromHandler(handler: *TerminalHandler) *Pane {
+        const stream_handler: *StreamHandler = @alignCast(@fieldParentPtr("terminal_handler", handler));
+        return stream_handler.pane;
     }
 
     const DeviceAttributes = EffectReturn("device_attributes");
 
     fn EffectReturn(comptime field_name: []const u8) type {
-        const Effects = Stream.Handler.Effects;
+        const Effects = TerminalHandler.Effects;
         const field = std.meta.fieldInfo(
             Effects,
             @field(std.meta.FieldEnum(Effects), field_name),
@@ -370,19 +549,19 @@ const Pane = struct {
         return @typeInfo(@typeInfo(Fn).pointer.child).@"fn".return_type.?;
     }
 
-    fn effectWritePty(handler: *Stream.Handler, data: [:0]const u8) void {
+    fn effectWritePty(handler: *TerminalHandler, data: [:0]const u8) void {
         const self = fromHandler(handler);
         if (self.passthrough and !self.feeding_discarded) return;
         if (self.pty_fd < 0) return;
         protocol.writeAll(self.pty_fd, data) catch {};
     }
 
-    fn effectDeviceAttributes(handler: *Stream.Handler) DeviceAttributes {
+    fn effectDeviceAttributes(handler: *TerminalHandler) DeviceAttributes {
         _ = handler;
         return .{};
     }
 
-    fn effectSize(handler: *Stream.Handler) ?vt.size_report.Size {
+    fn effectSize(handler: *TerminalHandler) ?vt.size_report.Size {
         const self = fromHandler(handler);
         return .{
             .rows = self.term.rows,
@@ -392,13 +571,23 @@ const Pane = struct {
         };
     }
 
-    fn effectXtversion(handler: *Stream.Handler) []const u8 {
+    fn effectXtversion(handler: *TerminalHandler) []const u8 {
         _ = handler;
         return "tinymux " ++ version;
     }
 
     fn feed(self: *Pane, bytes: []const u8) void {
         self.stream.nextSlice(bytes);
+    }
+
+    fn noteScrollUp(self: *Pane, count: usize) void {
+        self.pending_scroll_up = std.math.add(usize, self.pending_scroll_up, count) catch std.math.maxInt(usize);
+    }
+
+    fn takePendingScrollUp(self: *Pane) usize {
+        const count = self.pending_scroll_up;
+        self.pending_scroll_up = 0;
+        return count;
     }
 
     fn writeInput(self: *Pane, bytes: []const u8) !void {
@@ -541,13 +730,51 @@ const ViewportRow = struct {
     fn deinit(self: *ViewportRow, alloc: std.mem.Allocator) void {
         self.bytes.deinit(alloc);
     }
+
+    fn capturePin(self: *ViewportRow, pin: vt.Pin) void {
+        self.node = @ptrCast(pin.node);
+        self.offset = pin.y;
+        self.valid = true;
+    }
+
+    fn matchesPin(self: *const ViewportRow, pin: vt.Pin) bool {
+        if (!self.valid) return false;
+        if (self.node != @as(*const anyopaque, @ptrCast(pin.node))) return false;
+        return self.offset == pin.y;
+    }
 };
 
 fn viewportRowReusable(entry: *const ViewportRow, pin: vt.Pin, full_render: bool) bool {
     if (full_render or !entry.valid) return false;
-    if (entry.node != @as(*const anyopaque, @ptrCast(pin.node))) return false;
-    if (entry.offset != pin.y) return false;
+    if (!entry.matchesPin(pin)) return false;
     return !pin.isDirty();
+}
+
+fn viewportPin(term: *vt.Terminal, y: u16) ?vt.Pin {
+    if (term.cols == 0 or y >= term.rows) return null;
+    return term.screens.active.pages.pin(.{ .viewport = .{ .x = 0, .y = y } });
+}
+
+fn reverseSlice(comptime T: type, items: []T) void {
+    if (items.len < 2) return;
+    var left: usize = 0;
+    var right: usize = items.len - 1;
+    while (left < right) {
+        const tmp = items[left];
+        items[left] = items[right];
+        items[right] = tmp;
+        left += 1;
+        right -= 1;
+    }
+}
+
+fn rotateLeft(comptime T: type, items: []T, amount: usize) void {
+    if (items.len < 2) return;
+    const shift = amount % items.len;
+    if (shift == 0) return;
+    reverseSlice(T, items[0..shift]);
+    reverseSlice(T, items[shift..]);
+    reverseSlice(T, items);
 }
 
 fn appendTermRow(
@@ -558,7 +785,7 @@ fn appendTermRow(
 ) !void {
     const screen = term.screens.active;
     if (term.cols == 0 or y >= term.rows) return;
-    const start = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse return;
+    const start = viewportPin(term, y) orelse return;
     const end = screen.pages.pin(.{ .viewport = .{
         .x = term.cols - 1,
         .y = y,
@@ -594,6 +821,44 @@ const PaneRowCache = struct {
         }
     }
 
+    fn detectScrollUp(self: *PaneRowCache, term: *vt.Terminal, visible_rows: u16, full_render: bool) u16 {
+        if (full_render) return 0;
+        const row_count: usize = @intCast(@min(visible_rows, term.rows));
+        if (row_count < 3 or self.rows.items.len < row_count) return 0;
+
+        var best_delta: usize = 0;
+        var best_overlap: usize = 0;
+        var delta: usize = 1;
+        while (delta < row_count) : (delta += 1) {
+            const overlap = row_count - delta;
+            if (overlap < 2 or overlap < row_count / 3) break;
+
+            var y: usize = 0;
+            while (y < overlap) : (y += 1) {
+                const pin = viewportPin(term, @intCast(y)) orelse break;
+                if (!self.rows.items[y + delta].matchesPin(pin)) break;
+            }
+
+            if (y == overlap and overlap > best_overlap) {
+                best_delta = delta;
+                best_overlap = overlap;
+            }
+        }
+
+        return @intCast(best_delta);
+    }
+
+    fn rotateScrollUp(self: *PaneRowCache, visible_rows: u16, delta: u16) void {
+        const row_count: usize = @min(@as(usize, @intCast(visible_rows)), self.rows.items.len);
+        const shift: usize = @intCast(delta);
+        if (shift == 0 or shift >= row_count) return;
+
+        rotateLeft(ViewportRow, self.rows.items[0..row_count], shift);
+        for (self.rows.items[row_count - shift .. row_count]) |*row| {
+            row.valid = false;
+        }
+    }
+
     fn appendRow(
         self: *PaneRowCache,
         alloc: std.mem.Allocator,
@@ -603,7 +868,7 @@ const PaneRowCache = struct {
         out: *std.ArrayList(u8),
     ) !void {
         try self.ensure(alloc, term.rows);
-        const pin = term.screens.active.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse {
+        const pin = viewportPin(term, y) orelse {
             if (y < self.rows.items.len) self.rows.items[y].valid = false;
             return;
         };
@@ -615,9 +880,7 @@ const PaneRowCache = struct {
 
         entry.bytes.clearRetainingCapacity();
         try appendTermRow(alloc, term, y, &entry.bytes);
-        entry.node = @ptrCast(pin.node);
-        entry.offset = pin.y;
-        entry.valid = true;
+        entry.capturePin(pin);
         try out.appendSlice(alloc, entry.bytes.items);
     }
 };
@@ -655,13 +918,19 @@ const GraphicsState = struct {
         self.uploaded.clearRetainingCapacity();
     }
 
-    fn needsReset(_: *GraphicsState, main_pane: *Pane, split_pane: ?*Pane) bool {
+    fn needsReset(self: *GraphicsState, main_pane: *Pane, split_pane: ?*Pane) bool {
         if (comptime !kitty_graphics_enabled) return false;
-        if (main_pane.term.screens.active.kitty_images.dirty) return true;
+        if (self.paneNeedsReset(main_pane)) return true;
         if (split_pane) |pane| {
-            if (pane.term.screens.active.kitty_images.dirty) return true;
+            if (self.paneNeedsReset(pane)) return true;
         }
         return false;
+    }
+
+    fn paneNeedsReset(self: *GraphicsState, pane: *Pane) bool {
+        const storage = &pane.term.screens.active.kitty_images;
+        if (!storage.dirty) return false;
+        return self.uploaded.count() != 0 or storage.placements.count() != 0;
     }
 
     fn render(
@@ -945,6 +1214,12 @@ const Compositor = struct {
     main_rows: PaneRowCache = .{},
     split_rows: PaneRowCache = .{},
     graphics: GraphicsState = .{},
+    body: std.ArrayList(u8) = .empty,
+    scratch: std.ArrayList(u8) = .empty,
+    frame: std.ArrayList(u8) = .empty,
+    cursor_valid: bool = false,
+    cursor_row: u16 = 0,
+    cursor_col: u16 = 0,
     full_render: bool = true,
 
     fn deinit(self: *Compositor) void {
@@ -953,10 +1228,14 @@ const Compositor = struct {
         self.main_rows.deinit(self.alloc);
         self.split_rows.deinit(self.alloc);
         self.graphics.deinit(self.alloc);
+        self.body.deinit(self.alloc);
+        self.scratch.deinit(self.alloc);
+        self.frame.deinit(self.alloc);
     }
 
     fn invalidate(self: *Compositor) void {
         self.full_render = true;
+        self.cursor_valid = false;
         for (self.main_rows.rows.items) |*row| row.valid = false;
         for (self.split_rows.rows.items) |*row| row.valid = false;
     }
@@ -969,50 +1248,100 @@ const Compositor = struct {
             row.deinit(self.alloc);
         }
 
-        var body: std.ArrayList(u8) = .empty;
-        defer body.deinit(self.alloc);
-        var scratch: std.ArrayList(u8) = .empty;
-        defer scratch.deinit(self.alloc);
+        self.body.clearRetainingCapacity();
+        self.scratch.clearRetainingCapacity();
+
+        const cursor_pos = composedCursorPos(layout, main_pane);
+        const cursor_changed = !self.cursor_valid or
+            self.cursor_row != cursor_pos.row or
+            self.cursor_col != cursor_pos.col;
+        const graphics_dirty = self.full_render or self.graphics.needsReset(main_pane, split_pane);
+
+        const pending_scroll_up = main_pane.takePendingScrollUp();
+        try self.main_rows.ensure(self.alloc, main_pane.term.rows);
+        const scroll_delta = if (self.canMainScrollFastPath(layout, graphics_dirty))
+            self.mainScrollDelta(layout, main_pane, pending_scroll_up)
+        else
+            0;
+        if (scroll_delta > 0) {
+            try self.emitMainScrollUp(layout, scroll_delta);
+            self.rotateOuterRowsForMainScroll(layout.main_rows, scroll_delta);
+            self.main_rows.rotateScrollUp(layout.main_rows, scroll_delta);
+        }
 
         for (0..layout.rows) |row_index| {
-            scratch.clearRetainingCapacity();
-            try self.composeRow(layout, main_pane, split_pane, @intCast(row_index), &scratch);
+            self.scratch.clearRetainingCapacity();
+            try self.composeRow(layout, main_pane, split_pane, @intCast(row_index), &self.scratch);
             const cache = &self.row_cache.items[row_index];
-            if (!self.full_render and std.mem.eql(u8, cache.items, scratch.items)) continue;
+            if (!self.full_render and std.mem.eql(u8, cache.items, self.scratch.items)) continue;
             cache.clearRetainingCapacity();
-            try cache.appendSlice(self.alloc, scratch.items);
-            try body.print(self.alloc, "\x1b[{d};1H", .{row_index + 1});
-            try body.appendSlice(self.alloc, scratch.items);
+            try cache.appendSlice(self.alloc, self.scratch.items);
+            try self.body.print(self.alloc, "\x1b[{d};1H", .{row_index + 1});
+            try self.body.appendSlice(self.alloc, self.scratch.items);
         }
 
         var cursor_buf: [64]u8 = undefined;
         var cursor_writer = std.Io.Writer.fixed(&cursor_buf);
-        try writeComposedCursor(&cursor_writer, layout, main_pane);
+        try writeComposedCursor(&cursor_writer, cursor_pos);
         const cursor = cursor_writer.buffered();
 
-        if (body.items.len > 0 or !self.full_render) {
-            var frame: std.ArrayList(u8) = .empty;
-            defer frame.deinit(self.alloc);
-            try frame.appendSlice(self.alloc, synchronized_update_begin);
-            try frame.appendSlice(self.alloc, "\x1b[?25l");
-            try frame.appendSlice(self.alloc, body.items);
+        if (self.body.items.len > 0 or cursor_changed or graphics_dirty) {
+            self.frame.clearRetainingCapacity();
+            try self.frame.appendSlice(self.alloc, synchronized_update_begin);
+            try self.frame.appendSlice(self.alloc, "\x1b[?25l");
+            try self.frame.appendSlice(self.alloc, self.body.items);
             try self.graphics.render(
                 self.alloc,
-                &frame,
+                &self.frame,
                 layout,
                 main_pane,
                 split_pane,
                 self.full_render,
             );
-            try frame.appendSlice(self.alloc, cursor);
-            try frame.appendSlice(self.alloc, "\x1b[?25h");
-            try frame.appendSlice(self.alloc, synchronized_update_end);
-            try protocol.writeAll(stdout_fd, frame.items);
+            try self.frame.appendSlice(self.alloc, cursor);
+            try self.frame.appendSlice(self.alloc, "\x1b[?25h");
+            try self.frame.appendSlice(self.alloc, synchronized_update_end);
+            try protocol.writeAll(stdout_fd, self.frame.items);
         }
 
+        self.cursor_valid = true;
+        self.cursor_row = cursor_pos.row;
+        self.cursor_col = cursor_pos.col;
         main_pane.term.screens.active.pages.clearDirty();
         if (split_pane) |pane| pane.term.screens.active.pages.clearDirty();
         self.full_render = false;
+    }
+
+    fn canMainScrollFastPath(self: *Compositor, layout: Layout, graphics_dirty: bool) bool {
+        if (self.full_render or graphics_dirty) return false;
+        if (self.graphics.uploaded.count() != 0) return false;
+        if (layout.main_rows < 3) return false;
+        return true;
+    }
+
+    fn mainScrollDelta(self: *Compositor, layout: Layout, main_pane: *Pane, pending_scroll_up: usize) u16 {
+        const max_delta = layout.main_rows - 1;
+        if (pending_scroll_up > 0) return @intCast(@min(pending_scroll_up, max_delta));
+        return self.main_rows.detectScrollUp(&main_pane.term, layout.main_rows, self.full_render);
+    }
+
+    fn emitMainScrollUp(self: *Compositor, layout: Layout, delta: u16) !void {
+        try self.body.print(
+            self.alloc,
+            "\x1b[1;{d}r\x1b[{d}S\x1b[r",
+            .{ layout.main_rows, delta },
+        );
+    }
+
+    fn rotateOuterRowsForMainScroll(self: *Compositor, main_rows: u16, delta: u16) void {
+        const row_count: usize = @min(@as(usize, @intCast(main_rows)), self.row_cache.items.len);
+        const shift: usize = @intCast(delta);
+        if (shift == 0 or shift >= row_count) return;
+
+        rotateLeft(std.ArrayList(u8), self.row_cache.items[0..row_count], shift);
+        for (self.row_cache.items[row_count - shift .. row_count]) |*row| {
+            row.clearRetainingCapacity();
+        }
     }
 
     fn composeRow(
@@ -1041,11 +1370,20 @@ const Compositor = struct {
     }
 };
 
-fn writeComposedCursor(writer: *std.Io.Writer, layout: Layout, pane: *Pane) !void {
+const CursorPos = struct {
+    row: u16,
+    col: u16,
+};
+
+fn composedCursorPos(layout: Layout, pane: *Pane) CursorPos {
     const cursor = &pane.term.screens.active.cursor;
     const row = @min(@as(u16, @intCast(cursor.y)), layout.main_rows - 1);
     const col = @min(@as(u16, @intCast(cursor.x)), layout.cols - 1);
-    try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+    return .{ .row = row, .col = col };
+}
+
+fn writeComposedCursor(writer: *std.Io.Writer, cursor: CursorPos) !void {
+    try writer.print("\x1b[{d};{d}H", .{ cursor.row + 1, cursor.col + 1 });
 }
 
 const PrefixParser = struct {
@@ -1105,6 +1443,7 @@ const App = struct {
     split_pane: ?*Pane,
     raw_terminal: RawTerminal,
     compositor: Compositor,
+    render_scheduler: RenderScheduler = .{},
     prefix: PrefixParser = .{},
     composed: bool,
     last_size: ptypkg.Winsize,
@@ -1167,6 +1506,7 @@ const App = struct {
             .split_pane = split_pane,
             .raw_terminal = raw_terminal,
             .compositor = .{ .alloc = alloc },
+            .render_scheduler = .{},
             .composed = split_visible,
             .last_size = outer_size,
             .cell_size = cell_size,
@@ -1186,9 +1526,9 @@ const App = struct {
         if (self.composed) {
             try protocol.writeAll(stdout_fd, enter_canvas);
             self.compositor.invalidate();
+            self.render_scheduler.markDirty(.urgent);
         }
 
-        var next_repaint = std.time.milliTimestamp();
         var running = true;
         while (running) {
             self.main_pane.reapIfExited();
@@ -1199,6 +1539,7 @@ const App = struct {
             if (self.split_pane) |pane| pane.reapIfExited();
 
             try self.checkResize();
+            try self.renderIfDue();
 
             var fds_storage: [3]posix.pollfd = undefined;
             var count: usize = 0;
@@ -1222,36 +1563,62 @@ const App = struct {
                 }
             }
 
-            const now = std.time.milliTimestamp();
+            const now = std.time.nanoTimestamp();
             const timeout: i32 = if (self.composed)
-                @intCast(@max(@as(i64, 0), @min(@as(i64, repaint_interval_ms), next_repaint - now)))
+                self.render_scheduler.pollTimeoutMs(now)
             else
                 50;
             _ = try posix.poll(fds_storage[0..count], timeout);
 
             if (fds_storage[stdin_index].revents != 0) {
-                try self.readInput(&running);
+                if (try self.readInput(&running)) {
+                    self.render_scheduler.noteInput(std.time.nanoTimestamp());
+                }
             }
 
+            var pane_stats: DrainStats = .{};
             if (main_index) |index| {
                 if (fds_storage[index].revents != 0) {
-                    try self.readPane(self.main_pane, .main);
+                    pane_stats.record(try self.readPane(self.main_pane, .main));
                 }
             }
 
             if (split_index) |index| {
                 if (self.split_pane) |pane| {
                     if (fds_storage[index].revents != 0) {
-                        try self.readPane(pane, .split);
+                        pane_stats.record(try self.readPane(pane, .split));
                     }
                 }
             }
+            if (pane_stats.bytes > 0) {
+                const drain_now = std.time.nanoTimestamp();
+                pane_stats.merge(try self.drainReadyPanes(self.render_scheduler.ptyDrainBudget(drain_now, pane_stats)));
+                if (self.composed) {
+                    const damage_now = std.time.nanoTimestamp();
+                    if (pane_stats.bulkish()) self.render_scheduler.noteBulk(damage_now);
+                    const kind: RenderScheduler.DirtyKind = if (pane_stats.bulkish() or
+                        self.render_scheduler.bulkActive(damage_now))
+                        .bulk
+                    else if (self.render_scheduler.recentlyInput(damage_now))
+                        .urgent
+                    else
+                        .normal;
+                    self.render_scheduler.markDirty(kind);
+                }
+            }
 
-            if (self.composed and std.time.milliTimestamp() >= next_repaint) {
-                try self.compositor.render(self.layout, self.main_pane, self.split_pane);
-                next_repaint = std.time.milliTimestamp() + repaint_interval_ms;
+            if (self.composed) {
+                try self.renderIfDue();
             }
         }
+    }
+
+    fn renderIfDue(self: *App) !void {
+        if (!self.composed) return;
+        const render_now = std.time.nanoTimestamp();
+        if (!self.render_scheduler.shouldRender(render_now)) return;
+        try self.compositor.render(self.layout, self.main_pane, self.split_pane);
+        self.render_scheduler.rendered(std.time.nanoTimestamp());
     }
 
     fn restoreOuterTerminal(self: *App) void {
@@ -1262,22 +1629,22 @@ const App = struct {
         protocol.writeAll(stdout_fd, out.items) catch {};
     }
 
-    fn readInput(self: *App, running: *bool) !void {
+    fn readInput(self: *App, running: *bool) !bool {
         var buf: [8192]u8 = undefined;
         const n = posix.read(stdin_fd, &buf) catch |err| switch (err) {
             error.InputOutput => {
                 running.* = false;
-                return;
+                return false;
             },
             else => return err,
         };
         if (n == 0) {
             running.* = false;
-            return;
+            return false;
         }
         if (!self.composed and self.split_pane == null) {
             try self.main_pane.writeInput(buf[0..n]);
-            return;
+            return true;
         }
         var result = try self.prefix.feed(self.alloc, buf[0..n]);
         defer result.deinit(self.alloc);
@@ -1287,27 +1654,102 @@ const App = struct {
         if (result.forwarded.items.len > 0) {
             try self.main_pane.writeInput(result.forwarded.items);
         }
+        return true;
     }
 
     const WhichPane = enum { main, split };
 
-    fn readPane(self: *App, pane: *Pane, which: WhichPane) !void {
+    fn readPane(self: *App, pane: *Pane, which: WhichPane) !usize {
         var buf: [64 * 1024]u8 = undefined;
-        const n = posix.read(pane.pty_fd, &buf) catch {
+        return try self.readPaneInto(pane, which, &buf);
+    }
+
+    fn readPaneInto(self: *App, pane: *Pane, which: WhichPane, buf: *[64 * 1024]u8) !usize {
+        const n = posix.read(pane.pty_fd, buf) catch {
             pane.markDead();
-            return;
+            return 0;
         };
         if (n == 0) {
             pane.markDead();
-            return;
+            return 0;
         }
         const bytes = buf[0..n];
-        pane.feed(bytes);
         if (!self.composed and which == .main) {
             try protocol.writeAll(stdout_fd, bytes);
         } else {
-            self.compositor.full_render = self.compositor.full_render or which == .split;
+            pane.feed(bytes);
         }
+        return n;
+    }
+
+    fn drainReadyPanes(self: *App, budget_ns: i128) !DrainStats {
+        const deadline = std.time.nanoTimestamp() + budget_ns;
+        var stats: DrainStats = .{};
+        var buf: [64 * 1024]u8 = undefined;
+
+        while (true) {
+            if (stats.reads >= pty_drain_max_reads or
+                stats.bytes >= pty_drain_max_bytes or
+                std.time.nanoTimestamp() >= deadline)
+            {
+                stats.saturated = try self.panesReady();
+                return stats;
+            }
+
+            var fds_storage: [2]posix.pollfd = undefined;
+            var which_storage: [2]WhichPane = undefined;
+            var count: usize = 0;
+
+            if (self.main_pane.pty_fd >= 0) {
+                fds_storage[count] = .{ .fd = self.main_pane.pty_fd, .events = posix.POLL.IN, .revents = 0 };
+                which_storage[count] = .main;
+                count += 1;
+            }
+            if (self.split_pane) |pane| {
+                if (pane.pty_fd >= 0) {
+                    fds_storage[count] = .{ .fd = pane.pty_fd, .events = posix.POLL.IN, .revents = 0 };
+                    which_storage[count] = .split;
+                    count += 1;
+                }
+            }
+            if (count == 0) return stats;
+
+            const ready = try posix.poll(fds_storage[0..count], 0);
+            if (ready == 0) return stats;
+
+            for (fds_storage[0..count], which_storage[0..count]) |fd, which| {
+                if (fd.revents == 0) continue;
+                const pane = switch (which) {
+                    .main => self.main_pane,
+                    .split => self.split_pane orelse continue,
+                };
+                const n = try self.readPaneInto(pane, which, &buf);
+                if (n == 0) continue;
+                stats.record(n);
+                if (stats.reads >= pty_drain_max_reads or stats.bytes >= pty_drain_max_bytes) {
+                    stats.saturated = try self.panesReady();
+                    return stats;
+                }
+            }
+        }
+    }
+
+    fn panesReady(self: *App) !bool {
+        var fds_storage: [2]posix.pollfd = undefined;
+        var count: usize = 0;
+
+        if (self.main_pane.pty_fd >= 0) {
+            fds_storage[count] = .{ .fd = self.main_pane.pty_fd, .events = posix.POLL.IN, .revents = 0 };
+            count += 1;
+        }
+        if (self.split_pane) |pane| {
+            if (pane.pty_fd >= 0) {
+                fds_storage[count] = .{ .fd = pane.pty_fd, .events = posix.POLL.IN, .revents = 0 };
+                count += 1;
+            }
+        }
+        if (count == 0) return false;
+        return try posix.poll(fds_storage[0..count], 0) > 0;
     }
 
     fn closeSplit(self: *App) !void {
@@ -1387,9 +1829,10 @@ const App = struct {
             if (n == 0) break;
 
             const bytes = buf[0..n];
-            self.main_pane.feed(bytes);
             if (!self.composed) {
                 try protocol.writeAll(stdout_fd, bytes);
+            } else {
+                self.main_pane.feed(bytes);
             }
         }
         self.main_pane.closePty();
@@ -1407,6 +1850,7 @@ const App = struct {
             try pane.resize(@max(self.layout.split_rows, 1), self.layout.cols, self.cell_size);
         }
         self.compositor.invalidate();
+        self.render_scheduler.markDirty(.urgent);
     }
 };
 
@@ -1474,6 +1918,230 @@ test "prefix parser forwards unknown bindings unchanged" {
     var result = try parser.feed(alloc, "a\x02zb");
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("a\x02zb", result.forwarded.items);
+}
+
+test "render scheduler renders first dirty frame immediately" {
+    var scheduler: RenderScheduler = .{};
+    const now: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.markDirty(.normal);
+
+    try std.testing.expect(scheduler.shouldRender(now));
+    try std.testing.expectEqual(@as(i32, 0), scheduler.pollTimeoutMs(now));
+}
+
+test "render scheduler spaces sustained normal damage" {
+    var scheduler: RenderScheduler = .{};
+    const rendered_at: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.rendered(rendered_at);
+    scheduler.markDirty(.normal);
+
+    try std.testing.expect(!scheduler.shouldRender(rendered_at + 3 * std.time.ns_per_ms));
+    try std.testing.expectEqual(
+        @as(i32, 1),
+        scheduler.pollTimeoutMs(rendered_at + 3 * std.time.ns_per_ms),
+    );
+    try std.testing.expect(scheduler.shouldRender(rendered_at + composed_frame_interval_ns));
+}
+
+test "render scheduler urgent damage bypasses frame spacing" {
+    var scheduler: RenderScheduler = .{};
+    const rendered_at: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.rendered(rendered_at);
+    scheduler.markDirty(.urgent);
+
+    try std.testing.expect(scheduler.shouldRender(rendered_at + std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(i32, 0), scheduler.pollTimeoutMs(rendered_at + std.time.ns_per_ms));
+}
+
+test "render scheduler bulk damage uses bulk frame spacing" {
+    var scheduler: RenderScheduler = .{};
+    const rendered_at: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.rendered(rendered_at);
+    scheduler.markDirty(.urgent);
+    scheduler.markDirty(.bulk);
+
+    try std.testing.expect(!scheduler.shouldRender(rendered_at + composed_frame_interval_ns));
+    try std.testing.expect(scheduler.shouldRender(rendered_at + bulk_frame_interval_ns));
+}
+
+test "render scheduler keeps bulk mode sticky briefly" {
+    var scheduler: RenderScheduler = .{};
+    const bulk_at: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.noteBulk(bulk_at);
+
+    try std.testing.expect(scheduler.bulkActive(bulk_at + bulk_sticky_window_ns - 1));
+    try std.testing.expect(!scheduler.bulkActive(bulk_at + bulk_sticky_window_ns));
+}
+
+test "render scheduler normal damage clears bulk pacing" {
+    var scheduler: RenderScheduler = .{};
+    const rendered_at: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.rendered(rendered_at);
+    scheduler.markDirty(.bulk);
+    scheduler.markDirty(.normal);
+
+    try std.testing.expect(scheduler.shouldRender(rendered_at + composed_frame_interval_ns));
+}
+
+test "render scheduler clean state idles without rendering" {
+    const scheduler: RenderScheduler = .{};
+
+    try std.testing.expect(!scheduler.shouldRender(0));
+    try std.testing.expectEqual(@as(i32, composed_idle_poll_ms), scheduler.pollTimeoutMs(0));
+}
+
+test "render scheduler recent input lowers drain budget" {
+    var scheduler: RenderScheduler = .{};
+    const input_at: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.noteInput(input_at);
+
+    var small: DrainStats = .{};
+    small.record(1);
+
+    try std.testing.expectEqual(
+        @as(i128, interactive_pty_drain_budget_ns),
+        scheduler.ptyDrainBudget(input_at + interactive_input_window_ns, small),
+    );
+    try std.testing.expectEqual(
+        @as(i128, bulk_pty_drain_budget_ns),
+        scheduler.ptyDrainBudget(input_at + interactive_input_window_ns + 1, small),
+    );
+}
+
+test "render scheduler bulk first read overrides recent input drain budget" {
+    var scheduler: RenderScheduler = .{};
+    const input_at: i128 = 1_000 * std.time.ns_per_ms;
+    scheduler.noteInput(input_at);
+
+    var bulk: DrainStats = .{};
+    bulk.record(bulk_damage_bytes);
+
+    try std.testing.expectEqual(
+        @as(i128, bulk_pty_drain_budget_ns),
+        scheduler.ptyDrainBudget(input_at + std.time.ns_per_ms, bulk),
+    );
+}
+
+test "drain stats classify sustained output as bulk" {
+    var by_bytes: DrainStats = .{};
+    by_bytes.record(bulk_damage_bytes);
+    try std.testing.expect(by_bytes.bulkish());
+
+    var by_reads: DrainStats = .{};
+    for (0..bulk_damage_reads) |_| by_reads.record(1);
+    try std.testing.expect(by_reads.bulkish());
+
+    var small: DrainStats = .{};
+    small.record(1);
+    try std.testing.expect(!small.bulkish());
+}
+
+test "pane stream handler records full-pane upward scrolls" {
+    const alloc = std.testing.allocator;
+
+    var pane: Pane = undefined;
+    pane.alloc = alloc;
+    pane.pty_fd = -1;
+    pane.child_pid = 0;
+    pane.alive = false;
+    pane.reaped = true;
+    pane.command_title = "test";
+    pane.passthrough = false;
+    pane.feeding_discarded = false;
+    pane.cell_size = .{};
+    pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    defer pane.term.deinit(alloc);
+    pane.pending_scroll_up = 0;
+    pane.stream = .initAlloc(alloc, Pane.StreamHandler.init(&pane));
+    defer pane.stream.deinit();
+
+    pane.feed("one\r\ntwo\r\nthree\r\nfour\r\n");
+
+    try std.testing.expectEqual(@as(usize, 2), pane.takePendingScrollUp());
+}
+
+test "graphics reset ignores text-only scroll dirty without placements" {
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{
+            .cols = 10,
+            .rows = 3,
+            .max_scrollback = scrollback_bytes,
+            .kitty_image_storage_limit = kitty_image_storage_limit,
+            .kitty_image_loading_limits = .all,
+        }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+
+    pane.term.screens.active.kitty_images.dirty = true;
+    var graphics: GraphicsState = .{};
+    defer graphics.deinit(alloc);
+
+    try std.testing.expect(!graphics.needsReset(&pane, null));
+}
+
+test "pane row cache detects upward viewport scroll" {
+    const alloc = std.testing.allocator;
+
+    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b[HAAA\r\nBBB\r\nCCC\r\nDDD");
+
+    var cache: PaneRowCache = .{};
+    defer cache.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (0..4) |y| {
+        out.clearRetainingCapacity();
+        try cache.appendRow(alloc, &term, @intCast(y), false, &out);
+    }
+    term.screens.active.pages.clearDirty();
+
+    stream.nextSlice("\r\nEEE");
+
+    try std.testing.expectEqual(@as(u16, 1), cache.detectScrollUp(&term, 4, false));
+    cache.rotateScrollUp(4, 1);
+
+    for (0..3) |y| {
+        const pin = viewportPin(&term, @intCast(y)).?;
+        try std.testing.expect(cache.rows.items[y].matchesPin(pin));
+    }
+    try std.testing.expect(!cache.rows.items[3].valid);
+}
+
+test "outer row cache rotation clears newly exposed rows" {
+    const alloc = std.testing.allocator;
+
+    var compositor: Compositor = .{ .alloc = alloc };
+    defer compositor.deinit();
+
+    while (compositor.row_cache.items.len < 4) try compositor.row_cache.append(alloc, .empty);
+    for (compositor.row_cache.items, 0..) |*row, i| {
+        try row.print(alloc, "row{d}", .{i});
+    }
+
+    compositor.rotateOuterRowsForMainScroll(4, 1);
+
+    try std.testing.expectEqualStrings("row1", compositor.row_cache.items[0].items);
+    try std.testing.expectEqualStrings("row2", compositor.row_cache.items[1].items);
+    try std.testing.expectEqualStrings("row3", compositor.row_cache.items[2].items);
+    try std.testing.expectEqual(@as(usize, 0), compositor.row_cache.items[3].items.len);
 }
 
 test "term selection preserves graphics-capable outer terminals" {
