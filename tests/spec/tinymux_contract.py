@@ -570,6 +570,121 @@ def test_raw_only_does_not_parse_prefix(tinymux: str) -> None:
         session.close()
 
 
+def test_tmux_compat_env_and_private_shim(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--",
+            "/bin/sh",
+            "-lc",
+            (
+                "tmux_path=$(command -v tmux || true); "
+                "printf 'TMUX_ENV|%s|%s|%s|%s\\n' "
+                "\"$TINYMUX\" \"$TMUX_PANE\" \"${TMUX:+set}\" \"$tmux_path\"; "
+                "cat"
+            ),
+        ]
+    )
+    try:
+        session.wait_for(b"TMUX_ENV|1|%0|set|")
+        line = next(
+            part for part in session.output.splitlines() if part.startswith(b"TMUX_ENV|")
+        )
+        assert b"/tinymux-" in line and line.rstrip().endswith(b"/tmux"), (
+            "tmux command did not resolve to tinymux's private shim; "
+            f"line={line!r}"
+        )
+    finally:
+        session.close()
+
+
+def test_tmux_split_window_opens_split_and_keeps_main_focus(tinymux: str) -> None:
+    session = Session([tinymux, "--", "/bin/sh", "-lc", "printf 'MAIN_READY\\n'; /bin/sh"])
+    try:
+        session.wait_for(b"MAIN_READY")
+        session.write(b"stty -echo\n")
+        session.drain_until_idle()
+        session.write(
+            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_SPLIT_READY; sleep 5'\n"
+        )
+        session.wait_for(b"TMUX_SPLIT_READY")
+        assert b"\xe2\x94\x80" in session.output, "tmux-created split border was not rendered"
+
+        session.write(b"printf MAIN_AFTER_TMUX\\n\n")
+        session.wait_for(b"MAIN_AFTER_TMUX")
+    finally:
+        session.close()
+
+
+def test_tmux_kill_pane_closes_split(tinymux: str) -> None:
+    session = Session([tinymux, "--", "/bin/sh", "-lc", "printf 'MAIN_READY\\n'; /bin/sh"])
+    try:
+        session.wait_for(b"MAIN_READY")
+        session.write(b"stty -echo\n")
+        session.drain_until_idle()
+        session.write(
+            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_KILL_READY; sleep 5'\n"
+        )
+        session.wait_for(b"TMUX_KILL_READY")
+        close_start = len(session.output)
+        session.write(b"tmux kill-pane\n")
+        session.wait_for_after(b"\x1b[?1049l", close_start)
+        session.drain_until_idle()
+
+        session.write(b"printf AFTER_TMUX_KILL\\n\n")
+        session.wait_for(b"AFTER_TMUX_KILL")
+    finally:
+        session.close()
+
+
+def test_tmux_split_window_auto_closes_after_child_exit(tinymux: str) -> None:
+    session = Session([tinymux, "--", "/bin/sh", "-lc", "printf 'MAIN_READY\\n'; /bin/sh"])
+    try:
+        session.wait_for(b"MAIN_READY")
+        session.write(b"stty -echo\n")
+        session.drain_until_idle()
+        session.write(
+            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_AUTO_CLOSE_ONE; sleep 0.5'\n"
+        )
+        session.wait_for(b"TMUX_AUTO_CLOSE_ONE")
+        close_start = len(session.output)
+        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=5.0)
+        session.drain_until_idle()
+
+        reopen_start = len(session.output)
+        session.write(
+            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_AUTO_CLOSE_TWO; sleep 0.5'\n"
+        )
+        session.wait_for_after(b"TMUX_AUTO_CLOSE_TWO", reopen_start)
+        assert b"tmux: SplitAlreadyOpen" not in session.output[reopen_start:], (
+            "exited tmux-created split stayed open and blocked a new split"
+        )
+    finally:
+        session.close()
+
+
+def test_tmux_split_window_fails_when_split_already_open(tinymux: str) -> None:
+    session = Session([tinymux, "--", "/bin/sh", "-lc", "printf 'MAIN_READY\\n'; /bin/sh"])
+    try:
+        session.wait_for(b"MAIN_READY")
+        session.write(b"stty -echo\n")
+        session.drain_until_idle()
+        session.write(
+            b"tmux split-window -d -l 5 /bin/sh -lc 'printf FIRST_TMUX_SPLIT; sleep 5'\n"
+        )
+        session.wait_for(b"FIRST_TMUX_SPLIT")
+        second_start = len(session.output)
+        session.write(
+            b"tmux split-window -d -l 5 /bin/sh -lc 'printf SHOULD_NOT_APPEAR; sleep 1'\n"
+        )
+        session.wait_for_after(b"tmux: SplitAlreadyOpen", second_start)
+        assert b"SHOULD_NOT_APPEAR" not in session.output[second_start:], (
+            "busy split request replaced or started a second split"
+        )
+    finally:
+        session.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tinymux", required=True)
@@ -589,6 +704,11 @@ def main() -> int:
         test_split_close_replays_history_beyond_old_small_scrollback_cap,
         test_raw_output_is_tracked_for_reopened_split,
         test_csi_u_prefix_reopens_split_after_raw_mode,
+        test_tmux_compat_env_and_private_shim,
+        test_tmux_split_window_opens_split_and_keeps_main_focus,
+        test_tmux_kill_pane_closes_split,
+        test_tmux_split_window_auto_closes_after_child_exit,
+        test_tmux_split_window_fails_when_split_already_open,
     ]
     for test in tests:
         test(args.tinymux)
