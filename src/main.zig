@@ -17,6 +17,7 @@ const composed_idle_poll_ms: i32 = 50;
 const composed_frame_interval_ns: i128 = 4 * std.time.ns_per_ms;
 const bulk_frame_interval_ns: i128 = 8 * std.time.ns_per_ms;
 const bulk_sticky_window_ns: i128 = 120 * std.time.ns_per_ms;
+const resize_quiet_ns: i128 = 80 * std.time.ns_per_ms;
 const interactive_input_window_ns: i128 = 50 * std.time.ns_per_ms;
 const interactive_pty_drain_budget_ns: i128 = 1 * std.time.ns_per_ms;
 const bulk_pty_drain_budget_ns: i128 = 6 * std.time.ns_per_ms;
@@ -24,7 +25,8 @@ const pty_drain_max_reads: usize = 128;
 const pty_drain_max_bytes: usize = 8 * 1024 * 1024;
 const bulk_damage_bytes: usize = 16 * 1024;
 const bulk_damage_reads: usize = 2;
-const scrollback_bytes: usize = 512 * 1024;
+const max_pending_scrolls: usize = 8;
+const scrollback_bytes: usize = 256 * 1024 * 1024;
 const kitty_image_storage_limit: usize = 320 * 1024 * 1024;
 const kitty_upload_chunk_bytes: usize = 3000;
 const outer_image_id_start: u32 = 0x70000000;
@@ -325,6 +327,22 @@ const Layout = struct {
     }
 };
 
+const PendingScrollUp = struct {
+    top: u16,
+    bottom: u16,
+    count: usize,
+
+    fn height(self: PendingScrollUp) u16 {
+        return self.bottom - self.top + 1;
+    }
+};
+
+const PendingScrollBatch = struct {
+    items: [max_pending_scrolls]PendingScrollUp = undefined,
+    len: usize = 0,
+    overflow: bool = false,
+};
+
 const RawTerminal = struct {
     fd: posix.fd_t,
     original: posix.termios,
@@ -384,6 +402,10 @@ fn saturatingU32(value: u64) u32 {
     return if (value > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(value);
 }
 
+fn sameGridSize(a: ptypkg.Winsize, b: ptypkg.Winsize) bool {
+    return a.row == b.row and a.col == b.col;
+}
+
 const Pane = struct {
     alloc: std.mem.Allocator,
     pty_fd: posix.fd_t,
@@ -396,7 +418,9 @@ const Pane = struct {
     cell_size: CellSize,
     term: vt.Terminal,
     stream: Stream,
-    pending_scroll_up: usize = 0,
+    pending_scrolls: [max_pending_scrolls]PendingScrollUp = undefined,
+    pending_scroll_count: usize = 0,
+    pending_scroll_overflow: bool = false,
 
     pub const TerminalHandler = vt.TerminalStream.Handler;
     pub const Stream = vt.Stream(StreamHandler);
@@ -436,31 +460,33 @@ const Pane = struct {
             comptime action: Action.Tag,
             value: Action.Value(action),
         ) void {
-            const scroll_up = self.fullPaneScrollUp(action, value);
+            const scroll_up = self.scrollUp(action, value);
             self.terminal_handler.vt(action, value);
-            if (scroll_up > 0) self.pane.noteScrollUp(scroll_up);
+            if (scroll_up) |scroll| self.pane.noteScrollUp(scroll);
         }
 
-        fn fullPaneScrollUp(
+        fn scrollUp(
             self: *StreamHandler,
             comptime action: Action.Tag,
             value: Action.Value(action),
-        ) usize {
+        ) ?PendingScrollUp {
             const term = self.terminal_handler.terminal;
-            if (!fullPaneScrollRegion(term)) return 0;
-            return switch (action) {
-                .linefeed, .index, .next_line => if (cursorWillScrollUp(term)) 1 else 0,
-                .scroll_up => @min(value, term.rows),
-                else => 0,
+            const count: usize = switch (action) {
+                .linefeed, .index, .next_line => if (cursorWillScrollUp(term)) 1 else return null,
+                .scroll_up => @min(value, scrollRegionHeight(term)),
+                else => return null,
+            };
+            if (count == 0) return null;
+            return .{
+                .top = term.scrolling_region.top,
+                .bottom = term.scrolling_region.bottom,
+                .count = count,
             };
         }
 
-        fn fullPaneScrollRegion(term: *const Terminal) bool {
-            return term.rows > 0 and term.cols > 0 and
-                term.scrolling_region.top == 0 and
-                term.scrolling_region.bottom == term.rows - 1 and
-                term.scrolling_region.left == 0 and
-                term.scrolling_region.right == term.cols - 1;
+        fn scrollRegionHeight(term: *const Terminal) u16 {
+            if (term.rows == 0 or term.scrolling_region.bottom < term.scrolling_region.top) return 0;
+            return term.scrolling_region.bottom - term.scrolling_region.top + 1;
         }
 
         fn cursorWillScrollUp(term: *const Terminal) bool {
@@ -580,14 +606,36 @@ const Pane = struct {
         self.stream.nextSlice(bytes);
     }
 
-    fn noteScrollUp(self: *Pane, count: usize) void {
-        self.pending_scroll_up = std.math.add(usize, self.pending_scroll_up, count) catch std.math.maxInt(usize);
+    fn noteScrollUp(self: *Pane, scroll: PendingScrollUp) void {
+        if (scroll.count == 0 or scroll.bottom < scroll.top) return;
+        if (self.pending_scroll_overflow) return;
+
+        for (self.pending_scrolls[0..self.pending_scroll_count]) |*pending| {
+            if (pending.top == scroll.top and pending.bottom == scroll.bottom) {
+                pending.count = std.math.add(usize, pending.count, scroll.count) catch std.math.maxInt(usize);
+                return;
+            }
+        }
+
+        if (self.pending_scroll_count >= max_pending_scrolls) {
+            self.pending_scroll_count = 0;
+            self.pending_scroll_overflow = true;
+            return;
+        }
+
+        self.pending_scrolls[self.pending_scroll_count] = scroll;
+        self.pending_scroll_count += 1;
     }
 
-    fn takePendingScrollUp(self: *Pane) usize {
-        const count = self.pending_scroll_up;
-        self.pending_scroll_up = 0;
-        return count;
+    fn takePendingScrolls(self: *Pane) PendingScrollBatch {
+        var batch: PendingScrollBatch = .{
+            .len = self.pending_scroll_count,
+            .overflow = self.pending_scroll_overflow,
+        };
+        @memcpy(batch.items[0..self.pending_scroll_count], self.pending_scrolls[0..self.pending_scroll_count]);
+        self.pending_scroll_count = 0;
+        self.pending_scroll_overflow = false;
+        return batch;
     }
 
     fn writeInput(self: *Pane, bytes: []const u8) !void {
@@ -691,6 +739,16 @@ const Pane = struct {
         return alloc.dupe(u8, out.writer.buffered());
     }
 
+    fn replayHistory(self: *Pane, alloc: std.mem.Allocator, selection: vt.Selection) ![]u8 {
+        var raw: std.Io.Writer.Allocating = .init(alloc);
+        defer raw.deinit();
+        var formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
+        formatter.content = .{ .selection = selection };
+        formatter.extra = .styles;
+        try raw.writer.print("{f}", .{formatter});
+        return alloc.dupe(u8, raw.writer.buffered());
+    }
+
     fn screenSelection(self: *Pane) ?vt.Selection {
         const pages = &self.term.screens.active.pages;
         const tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return null;
@@ -709,7 +767,7 @@ const Pane = struct {
             row -|= self.term.scrolling_region.top;
             col -|= self.term.scrolling_region.left;
         }
-        try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+        try writePaneCursorState(writer, &self.term, row, col);
     }
 };
 
@@ -848,13 +906,16 @@ const PaneRowCache = struct {
         return @intCast(best_delta);
     }
 
-    fn rotateScrollUp(self: *PaneRowCache, visible_rows: u16, delta: u16) void {
-        const row_count: usize = @min(@as(usize, @intCast(visible_rows)), self.rows.items.len);
+    fn rotateRegionScrollUp(self: *PaneRowCache, top: u16, visible_rows: u16, delta: u16) void {
+        const start: usize = @min(@as(usize, @intCast(top)), self.rows.items.len);
+        const available = self.rows.items.len - start;
+        const row_count: usize = @min(@as(usize, @intCast(visible_rows)), available);
         const shift: usize = @intCast(delta);
         if (shift == 0 or shift >= row_count) return;
 
-        rotateLeft(ViewportRow, self.rows.items[0..row_count], shift);
-        for (self.rows.items[row_count - shift .. row_count]) |*row| {
+        const region = self.rows.items[start .. start + row_count];
+        rotateLeft(ViewportRow, region, shift);
+        for (region[row_count - shift .. row_count]) |*row| {
             row.valid = false;
         }
     }
@@ -918,16 +979,16 @@ const GraphicsState = struct {
         self.uploaded.clearRetainingCapacity();
     }
 
-    fn needsReset(self: *GraphicsState, main_pane: *Pane, split_pane: ?*Pane) bool {
+    fn needsUpdate(self: *GraphicsState, main_pane: *Pane, split_pane: ?*Pane) bool {
         if (comptime !kitty_graphics_enabled) return false;
-        if (self.paneNeedsReset(main_pane)) return true;
+        if (self.paneNeedsUpdate(main_pane)) return true;
         if (split_pane) |pane| {
-            if (self.paneNeedsReset(pane)) return true;
+            if (self.paneNeedsUpdate(pane)) return true;
         }
         return false;
     }
 
-    fn paneNeedsReset(self: *GraphicsState, pane: *Pane) bool {
+    fn paneNeedsUpdate(self: *GraphicsState, pane: *Pane) bool {
         const storage = &pane.term.screens.active.kitty_images;
         if (!storage.dirty) return false;
         return self.uploaded.count() != 0 or storage.placements.count() != 0;
@@ -946,10 +1007,17 @@ const GraphicsState = struct {
             return;
         }
 
-        const reset = force or self.needsReset(main_pane, split_pane);
-        if (!reset) return;
+        const update = force or self.needsUpdate(main_pane, split_pane);
+        if (!update) return;
 
-        try self.deleteAll(alloc, out);
+        // Scrolling marks Kitty placements dirty. Keep image payloads cached and
+        // refresh only placements unless the whole composed screen is rebuilt.
+        if (force) {
+            try self.deleteAll(alloc, out);
+        } else {
+            try self.deletePlacements(alloc, out);
+        }
+
         try self.renderPane(alloc, out, .main, main_pane, 0);
         main_pane.term.screens.active.kitty_images.dirty = false;
         if (layout.split_visible) {
@@ -957,6 +1025,13 @@ const GraphicsState = struct {
                 try self.renderPane(alloc, out, .split, pane, layout.splitTop());
                 pane.term.screens.active.kitty_images.dirty = false;
             }
+        }
+    }
+
+    fn deletePlacements(self: *GraphicsState, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        var iter = self.uploaded.iterator();
+        while (iter.next()) |entry| {
+            try emitDeletePlacements(alloc, out, entry.value_ptr.outer_id);
         }
     }
 
@@ -1208,6 +1283,10 @@ fn emitDeleteImage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outer_id: 
     try out.print(alloc, "\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{outer_id});
 }
 
+fn emitDeletePlacements(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outer_id: u32) !void {
+    try out.print(alloc, "\x1b_Ga=d,d=i,i={d},q=2;\x1b\\", .{outer_id});
+}
+
 const Compositor = struct {
     alloc: std.mem.Allocator,
     row_cache: std.ArrayList(std.ArrayList(u8)) = .empty,
@@ -1217,9 +1296,9 @@ const Compositor = struct {
     body: std.ArrayList(u8) = .empty,
     scratch: std.ArrayList(u8) = .empty,
     frame: std.ArrayList(u8) = .empty,
+    cursor_scratch: std.ArrayList(u8) = .empty,
+    last_cursor_state: std.ArrayList(u8) = .empty,
     cursor_valid: bool = false,
-    cursor_row: u16 = 0,
-    cursor_col: u16 = 0,
     full_render: bool = true,
 
     fn deinit(self: *Compositor) void {
@@ -1231,6 +1310,8 @@ const Compositor = struct {
         self.body.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
         self.frame.deinit(self.alloc);
+        self.cursor_scratch.deinit(self.alloc);
+        self.last_cursor_state.deinit(self.alloc);
     }
 
     fn invalidate(self: *Compositor) void {
@@ -1251,22 +1332,50 @@ const Compositor = struct {
         self.body.clearRetainingCapacity();
         self.scratch.clearRetainingCapacity();
 
-        const cursor_pos = composedCursorPos(layout, main_pane);
+        self.cursor_scratch.clearRetainingCapacity();
+        {
+            var aw: std.Io.Writer.Allocating = .fromArrayList(self.alloc, &self.cursor_scratch);
+            defer self.cursor_scratch = aw.toArrayList();
+            try writeComposedCursor(&aw.writer, layout, main_pane);
+        }
+        const cursor_state = self.cursor_scratch.items;
         const cursor_changed = !self.cursor_valid or
-            self.cursor_row != cursor_pos.row or
-            self.cursor_col != cursor_pos.col;
-        const graphics_dirty = self.full_render or self.graphics.needsReset(main_pane, split_pane);
+            !std.mem.eql(u8, self.last_cursor_state.items, cursor_state);
+        const graphics_dirty = self.full_render or self.graphics.needsUpdate(main_pane, split_pane);
 
-        const pending_scroll_up = main_pane.takePendingScrollUp();
+        const pending_main_scrolls = main_pane.takePendingScrolls();
+        const pending_split_scrolls = if (split_pane) |pane| pane.takePendingScrolls() else PendingScrollBatch{};
         try self.main_rows.ensure(self.alloc, main_pane.term.rows);
-        const scroll_delta = if (self.canMainScrollFastPath(layout, graphics_dirty))
-            self.mainScrollDelta(layout, main_pane, pending_scroll_up)
-        else
-            0;
-        if (scroll_delta > 0) {
-            try self.emitMainScrollUp(layout, scroll_delta);
-            self.rotateOuterRowsForMainScroll(layout.main_rows, scroll_delta);
-            self.main_rows.rotateScrollUp(layout.main_rows, scroll_delta);
+        if (self.canPaneScrollFastPath(layout.main_rows, graphics_dirty)) {
+            try self.applyPendingScrolls(&self.main_rows, 0, layout.main_rows, pending_main_scrolls);
+            if (pending_main_scrolls.len == 0 and !pending_main_scrolls.overflow) {
+                const main_scroll_delta = self.main_rows.detectScrollUp(&main_pane.term, layout.main_rows, false);
+                if (main_scroll_delta > 0) {
+                    try self.emitScrollUp(0, layout.main_rows, main_scroll_delta);
+                    self.rotateOuterRowsForRegion(0, layout.main_rows, main_scroll_delta);
+                    self.main_rows.rotateRegionScrollUp(0, layout.main_rows, main_scroll_delta);
+                }
+            }
+        }
+
+        if (split_pane) |pane| {
+            try self.split_rows.ensure(self.alloc, pane.term.rows);
+            if (self.canPaneScrollFastPath(layout.split_rows, graphics_dirty)) {
+                try self.applyPendingScrolls(
+                    &self.split_rows,
+                    layout.splitTop(),
+                    layout.split_rows,
+                    pending_split_scrolls,
+                );
+                if (pending_split_scrolls.len == 0 and !pending_split_scrolls.overflow) {
+                    const split_scroll_delta = self.split_rows.detectScrollUp(&pane.term, layout.split_rows, false);
+                    if (split_scroll_delta > 0) {
+                        try self.emitScrollUp(layout.splitTop(), layout.split_rows, split_scroll_delta);
+                        self.rotateOuterRowsForRegion(layout.splitTop(), layout.split_rows, split_scroll_delta);
+                        self.split_rows.rotateRegionScrollUp(0, layout.split_rows, split_scroll_delta);
+                    }
+                }
+            }
         }
 
         for (0..layout.rows) |row_index| {
@@ -1279,11 +1388,6 @@ const Compositor = struct {
             try self.body.print(self.alloc, "\x1b[{d};1H", .{row_index + 1});
             try self.body.appendSlice(self.alloc, self.scratch.items);
         }
-
-        var cursor_buf: [64]u8 = undefined;
-        var cursor_writer = std.Io.Writer.fixed(&cursor_buf);
-        try writeComposedCursor(&cursor_writer, cursor_pos);
-        const cursor = cursor_writer.buffered();
 
         if (self.body.items.len > 0 or cursor_changed or graphics_dirty) {
             self.frame.clearRetainingCapacity();
@@ -1298,48 +1402,67 @@ const Compositor = struct {
                 split_pane,
                 self.full_render,
             );
-            try self.frame.appendSlice(self.alloc, cursor);
-            try self.frame.appendSlice(self.alloc, "\x1b[?25h");
+            try self.frame.appendSlice(self.alloc, cursor_state);
             try self.frame.appendSlice(self.alloc, synchronized_update_end);
             try protocol.writeAll(stdout_fd, self.frame.items);
         }
 
         self.cursor_valid = true;
-        self.cursor_row = cursor_pos.row;
-        self.cursor_col = cursor_pos.col;
+        self.last_cursor_state.clearRetainingCapacity();
+        try self.last_cursor_state.appendSlice(self.alloc, cursor_state);
         main_pane.term.screens.active.pages.clearDirty();
         if (split_pane) |pane| pane.term.screens.active.pages.clearDirty();
         self.full_render = false;
     }
 
-    fn canMainScrollFastPath(self: *Compositor, layout: Layout, graphics_dirty: bool) bool {
+    fn canPaneScrollFastPath(self: *Compositor, visible_rows: u16, graphics_dirty: bool) bool {
         if (self.full_render or graphics_dirty) return false;
         if (self.graphics.uploaded.count() != 0) return false;
-        if (layout.main_rows < 3) return false;
+        if (visible_rows < 3) return false;
         return true;
     }
 
-    fn mainScrollDelta(self: *Compositor, layout: Layout, main_pane: *Pane, pending_scroll_up: usize) u16 {
-        const max_delta = layout.main_rows - 1;
-        if (pending_scroll_up > 0) return @intCast(@min(pending_scroll_up, max_delta));
-        return self.main_rows.detectScrollUp(&main_pane.term, layout.main_rows, self.full_render);
+    fn applyPendingScrolls(
+        self: *Compositor,
+        cache: *PaneRowCache,
+        outer_top: u16,
+        pane_visible_rows: u16,
+        pending: PendingScrollBatch,
+    ) !void {
+        if (pending.overflow) return;
+        for (pending.items[0..pending.len]) |scroll| {
+            if (scroll.top >= pane_visible_rows or scroll.bottom >= pane_visible_rows) continue;
+            const height = scroll.height();
+            if (height < 2) continue;
+            const delta: u16 = @intCast(@min(scroll.count, height));
+            if (delta == 0 or delta >= height) continue;
+            try self.emitScrollUp(outer_top + scroll.top, height, delta);
+            self.rotateOuterRowsForRegion(outer_top + scroll.top, height, delta);
+            cache.rotateRegionScrollUp(scroll.top, height, delta);
+        }
     }
 
-    fn emitMainScrollUp(self: *Compositor, layout: Layout, delta: u16) !void {
+    fn emitScrollUp(self: *Compositor, top: u16, visible_rows: u16, delta: u16) !void {
+        if (visible_rows == 0 or delta == 0) return;
+        const first = top + 1;
+        const last = top + visible_rows;
         try self.body.print(
             self.alloc,
-            "\x1b[1;{d}r\x1b[{d}S\x1b[r",
-            .{ layout.main_rows, delta },
+            "\x1b[{d};{d}r\x1b[{d}S\x1b[r",
+            .{ first, last, delta },
         );
     }
 
-    fn rotateOuterRowsForMainScroll(self: *Compositor, main_rows: u16, delta: u16) void {
-        const row_count: usize = @min(@as(usize, @intCast(main_rows)), self.row_cache.items.len);
+    fn rotateOuterRowsForRegion(self: *Compositor, top: u16, visible_rows: u16, delta: u16) void {
+        const start: usize = @min(@as(usize, @intCast(top)), self.row_cache.items.len);
+        const available = self.row_cache.items.len - start;
+        const row_count: usize = @min(@as(usize, @intCast(visible_rows)), available);
         const shift: usize = @intCast(delta);
         if (shift == 0 or shift >= row_count) return;
 
-        rotateLeft(std.ArrayList(u8), self.row_cache.items[0..row_count], shift);
-        for (self.row_cache.items[row_count - shift .. row_count]) |*row| {
+        const region = self.row_cache.items[start .. start + row_count];
+        rotateLeft(std.ArrayList(u8), region, shift);
+        for (region[row_count - shift .. row_count]) |*row| {
             row.clearRetainingCapacity();
         }
     }
@@ -1370,20 +1493,85 @@ const Compositor = struct {
     }
 };
 
-const CursorPos = struct {
-    row: u16,
-    col: u16,
-};
-
-fn composedCursorPos(layout: Layout, pane: *Pane) CursorPos {
+fn writeComposedCursor(writer: *std.Io.Writer, layout: Layout, pane: *Pane) !void {
     const cursor = &pane.term.screens.active.cursor;
     const row = @min(@as(u16, @intCast(cursor.y)), layout.main_rows - 1);
     const col = @min(@as(u16, @intCast(cursor.x)), layout.cols - 1);
-    return .{ .row = row, .col = col };
+    try writePaneCursorState(writer, &pane.term, row, col);
 }
 
-fn writeComposedCursor(writer: *std.Io.Writer, cursor: CursorPos) !void {
-    try writer.print("\x1b[{d};{d}H", .{ cursor.row + 1, cursor.col + 1 });
+fn writePaneCursorState(writer: *std.Io.Writer, term: *const vt.Terminal, row: usize, col: usize) !void {
+    const cursor = &term.screens.active.cursor;
+    try writeCursorStyle(writer, cursor.cursor_style, term.modes.get(.cursor_blinking));
+    try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+    try writer.writeAll(if (term.modes.get(.cursor_visible)) "\x1b[?25h" else "\x1b[?25l");
+}
+
+fn writeCursorStyle(writer: *std.Io.Writer, style: vt.Screen.CursorStyle, blinking: bool) !void {
+    const code: u8 = switch (style) {
+        .bar => if (blinking) 5 else 6,
+        .block => if (blinking) 1 else 2,
+        .underline => if (blinking) 3 else 4,
+        .block_hollow => if (blinking) 1 else 2,
+    };
+    try writer.print("\x1b[{d} q", .{code});
+}
+
+const KittyKey = struct {
+    codepoint: u21,
+    modifiers: u16,
+    len: usize,
+};
+
+fn parseKittyKey(input: []const u8) ?KittyKey {
+    const max_len = 64;
+    if (input.len < 4 or input[0] != 0x1b or input[1] != '[') return null;
+
+    var end: usize = 2;
+    while (end < input.len and end < max_len) : (end += 1) {
+        const byte = input[end];
+        if (byte == 'u') break;
+        if (!std.ascii.isDigit(byte) and byte != ';' and byte != ':') return null;
+    }
+    if (end >= input.len or input[end] != 'u') return null;
+
+    const body = input[2..end];
+    if (body.len == 0) return null;
+
+    var first_end = body.len;
+    if (std.mem.indexOfAny(u8, body, ";:")) |idx| first_end = idx;
+    if (first_end == 0) return null;
+
+    const codepoint = std.fmt.parseUnsigned(u21, body[0..first_end], 10) catch return null;
+    var modifiers: u16 = 1;
+    if (first_end < body.len and body[first_end] == ';') {
+        const rest = body[first_end + 1 ..];
+        var second_end = rest.len;
+        if (std.mem.indexOfAny(u8, rest, ";:")) |idx| second_end = idx;
+        if (second_end > 0) {
+            modifiers = std.fmt.parseUnsigned(u16, rest[0..second_end], 10) catch return null;
+        }
+    }
+
+    return .{
+        .codepoint = codepoint,
+        .modifiers = modifiers,
+        .len = end + 1,
+    };
+}
+
+fn kittyModifiersIncludeCtrl(modifiers: u16) bool {
+    return modifiers > 0 and ((modifiers - 1) & 4) != 0;
+}
+
+fn kittyKeyIsPrefix(key: KittyKey) bool {
+    return kittyModifiersIncludeCtrl(key.modifiers) and
+        (key.codepoint == 'b' or key.codepoint == 'B' or key.codepoint == 0x02);
+}
+
+fn kittyKeyCommand(key: KittyKey) ?u8 {
+    if (key.modifiers != 1 or key.codepoint > std.math.maxInt(u8)) return null;
+    return @intCast(key.codepoint);
 }
 
 const PrefixParser = struct {
@@ -1393,30 +1581,58 @@ const PrefixParser = struct {
         var result = PrefixResult{};
         var start: usize = 0;
         var i: usize = 0;
-        while (i < input.len) : (i += 1) {
+        while (i < input.len) {
             const byte = input[i];
             if (self.pending) {
                 if (start < i) try result.forwarded.appendSlice(alloc, input[start..i]);
                 self.pending = false;
-                switch (byte) {
-                    'x' => result.close_split = true,
-                    'b' => try result.forwarded.append(alloc, 0x02),
-                    else => {
-                        try result.forwarded.append(alloc, 0x02);
-                        try result.forwarded.append(alloc, byte);
-                    },
+
+                if (parseKittyKey(input[i..])) |key| {
+                    if (kittyKeyCommand(key)) |command| {
+                        try applyCommand(&result, alloc, command);
+                        i += key.len;
+                        start = i;
+                        continue;
+                    }
                 }
-                start = i + 1;
+
+                try applyCommand(&result, alloc, byte);
+                i += 1;
+                start = i;
                 continue;
             }
             if (byte == 0x02) {
                 if (start < i) try result.forwarded.appendSlice(alloc, input[start..i]);
                 self.pending = true;
-                start = i + 1;
+                i += 1;
+                start = i;
+                continue;
             }
+            if (parseKittyKey(input[i..])) |key| {
+                if (kittyKeyIsPrefix(key)) {
+                    if (start < i) try result.forwarded.appendSlice(alloc, input[start..i]);
+                    self.pending = true;
+                    i += key.len;
+                    start = i;
+                    continue;
+                }
+            }
+            i += 1;
         }
         if (start < input.len) try result.forwarded.appendSlice(alloc, input[start..]);
         return result;
+    }
+
+    fn applyCommand(result: *PrefixResult, alloc: std.mem.Allocator, byte: u8) !void {
+        switch (byte) {
+            'x' => result.close_split = true,
+            's' => result.open_split = true,
+            'b' => try result.forwarded.append(alloc, 0x02),
+            else => {
+                try result.forwarded.append(alloc, 0x02);
+                try result.forwarded.append(alloc, byte);
+            },
+        }
     }
 
     fn flush(self: *PrefixParser, alloc: std.mem.Allocator) !?[]u8 {
@@ -1429,6 +1645,7 @@ const PrefixParser = struct {
 const PrefixResult = struct {
     forwarded: std.ArrayList(u8) = .empty,
     close_split: bool = false,
+    open_split: bool = false,
 
     fn deinit(self: *PrefixResult, alloc: std.mem.Allocator) void {
         self.forwarded.deinit(alloc);
@@ -1447,7 +1664,10 @@ const App = struct {
     prefix: PrefixParser = .{},
     composed: bool,
     last_size: ptypkg.Winsize,
+    pending_resize: ?ptypkg.Winsize = null,
+    resize_due_ns: ?i128 = null,
     cell_size: CellSize,
+    split_replay_anchor: ?*vt.Pin = null,
 
     fn init(alloc: std.mem.Allocator, config: Config) !App {
         const outer_size = ptypkg.getSize(stdout_fd) catch ptypkg.makeWinsize(24, 80);
@@ -1516,6 +1736,7 @@ const App = struct {
     fn deinit(self: *App) void {
         self.restoreOuterTerminal();
         self.raw_terminal.restore();
+        self.clearSplitReplayAnchor();
         if (self.split_pane) |pane| pane.destroy();
         self.main_pane.destroy();
         self.compositor.deinit();
@@ -1524,6 +1745,7 @@ const App = struct {
     fn run(self: *App) !void {
         self.main_pane.passthrough = !self.composed;
         if (self.composed) {
+            try self.recordSplitReplayAnchor();
             try protocol.writeAll(stdout_fd, enter_canvas);
             self.compositor.invalidate();
             self.render_scheduler.markDirty(.urgent);
@@ -1538,7 +1760,7 @@ const App = struct {
             }
             if (self.split_pane) |pane| pane.reapIfExited();
 
-            try self.checkResize();
+            try self.checkResize(std.time.nanoTimestamp());
             try self.renderIfDue();
 
             var fds_storage: [3]posix.pollfd = undefined;
@@ -1564,10 +1786,7 @@ const App = struct {
             }
 
             const now = std.time.nanoTimestamp();
-            const timeout: i32 = if (self.composed)
-                self.render_scheduler.pollTimeoutMs(now)
-            else
-                50;
+            const timeout = self.pollTimeoutMs(now);
             _ = try posix.poll(fds_storage[0..count], timeout);
 
             if (fds_storage[stdin_index].revents != 0) {
@@ -1621,6 +1840,23 @@ const App = struct {
         self.render_scheduler.rendered(std.time.nanoTimestamp());
     }
 
+    fn pollTimeoutMs(self: *const App, now_ns: i128) i32 {
+        var timeout: i32 = if (self.composed)
+            self.render_scheduler.pollTimeoutMs(now_ns)
+        else
+            50;
+
+        if (self.pending_resize != null) {
+            const due_ns = self.resize_due_ns orelse return timeout;
+            if (now_ns >= due_ns) return 0;
+            const remaining_ns = due_ns - now_ns;
+            const remaining_ms: i32 = @intCast(@max(@as(i128, 1), @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            timeout = @min(timeout, remaining_ms);
+        }
+
+        return timeout;
+    }
+
     fn restoreOuterTerminal(self: *App) void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.alloc);
@@ -1642,17 +1878,29 @@ const App = struct {
             running.* = false;
             return false;
         }
-        if (!self.composed and self.split_pane == null) {
+        const parse_prefix = self.composed or self.config.split_cmd != null;
+        if (!parse_prefix) {
             try self.main_pane.writeInput(buf[0..n]);
             return true;
         }
         var result = try self.prefix.feed(self.alloc, buf[0..n]);
         defer result.deinit(self.alloc);
-        if (result.close_split) {
-            try self.closeSplit();
-        }
         if (result.forwarded.items.len > 0) {
             try self.main_pane.writeInput(result.forwarded.items);
+        }
+        if (result.close_split) {
+            if (self.split_pane != null) {
+                try self.closeSplit();
+            } else {
+                try self.main_pane.writeInput(&.{ 0x02, 'x' });
+            }
+        }
+        if (result.open_split) {
+            if (!self.composed and self.split_pane == null and self.config.split_cmd != null) {
+                try self.openSplit();
+            } else {
+                try self.main_pane.writeInput(&.{ 0x02, 's' });
+            }
         }
         return true;
     }
@@ -1676,6 +1924,7 @@ const App = struct {
         const bytes = buf[0..n];
         if (!self.composed and which == .main) {
             try protocol.writeAll(stdout_fd, bytes);
+            pane.feed(bytes);
         } else {
             pane.feed(bytes);
         }
@@ -1752,14 +2001,88 @@ const App = struct {
         return try posix.poll(fds_storage[0..count], 0) > 0;
     }
 
+    fn createSplitPane(self: *App) !*Pane {
+        const cmd = self.config.split_cmd orelse return error.NoSplitCommand;
+        var split_env = try std.process.getEnvMap(self.alloc);
+        defer split_env.deinit();
+        const outer_term = posix.getenv("TERM");
+        const colorterm = posix.getenv("COLORTERM");
+        try split_env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
+        try split_env.put("TINYMUX", "1");
+
+        const cwd = std.fs.cwd().realpathAlloc(self.alloc, ".") catch null;
+        defer if (cwd) |path| self.alloc.free(path);
+
+        const shell = posix.getenv("SHELL") orelse "/bin/sh";
+        const split_argv = [_][]const u8{ shell, "-lc", cmd };
+        return try Pane.create(
+            self.alloc,
+            &split_argv,
+            &split_env,
+            @max(self.layout.split_rows, 1),
+            self.layout.cols,
+            self.cell_size,
+            cwd,
+        );
+    }
+
+    fn clearSplitReplayAnchor(self: *App) void {
+        const anchor = self.split_replay_anchor orelse return;
+        self.main_pane.term.screens.active.pages.untrackPin(anchor);
+        self.split_replay_anchor = null;
+    }
+
+    fn recordSplitReplayAnchor(self: *App) !void {
+        self.clearSplitReplayAnchor();
+        const pages = &self.main_pane.term.screens.active.pages;
+        self.split_replay_anchor = try pages.trackPin(pages.getTopLeft(.active));
+    }
+
+    fn splitHistorySelection(self: *App) ?vt.Selection {
+        const anchor = self.split_replay_anchor orelse return null;
+        if (anchor.garbage) return null;
+
+        const pages = &self.main_pane.term.screens.active.pages;
+        const bottom = pages.getBottomRight(.history) orelse return null;
+        var start = anchor.*;
+        start.x = 0;
+        if (!start.eql(bottom) and bottom.before(start)) return null;
+        return vt.Selection.init(start, bottom, false);
+    }
+
+    fn openSplit(self: *App) !void {
+        if (self.split_pane != null or self.config.split_cmd == null) return;
+
+        try self.drainMainForSplitTransition();
+        try self.recordSplitReplayAnchor();
+
+        self.layout = Layout.compute(self.last_size.row, self.last_size.col, true, self.config.split_rows);
+        try self.main_pane.resize(self.layout.main_rows, self.layout.cols, self.cell_size);
+        const pane = try self.createSplitPane();
+        errdefer pane.destroy();
+
+        try protocol.writeAll(stdout_fd, enter_canvas);
+        self.split_pane = pane;
+        self.composed = true;
+        self.main_pane.passthrough = false;
+        self.compositor.invalidate();
+        self.render_scheduler.markDirty(.urgent);
+    }
+
     fn closeSplit(self: *App) !void {
         const pane = self.split_pane orelse return;
         pane.terminate();
         pane.destroy();
         self.split_pane = null;
+        try self.drainMainForRawTransition();
+        const history_replay = if (self.splitHistorySelection()) |selection|
+            try self.main_pane.replayHistory(self.alloc, selection)
+        else
+            null;
+        defer if (history_replay) |bytes| self.alloc.free(bytes);
+        self.clearSplitReplayAnchor();
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, false, self.config.split_rows);
         try self.main_pane.resize(self.layout.main_rows, self.layout.cols, self.cell_size);
-        try self.drainMainForRawTransition();
         self.composed = false;
         self.main_pane.passthrough = true;
         var leave: std.ArrayList(u8) = .empty;
@@ -1767,6 +2090,11 @@ const App = struct {
         try self.compositor.graphics.deleteAll(self.alloc, &leave);
         try leave.appendSlice(self.alloc, leave_canvas);
         try protocol.writeAll(stdout_fd, leave.items);
+        try protocol.writeAll(stdout_fd, synchronized_update_begin);
+        if (history_replay) |bytes| {
+            try protocol.writeAll(stdout_fd, bytes);
+            try self.flushReplayIntoParentScrollback();
+        }
         const repaint = try self.main_pane.repaint(self.alloc);
         defer self.alloc.free(repaint);
         var raw_repaint: std.ArrayList(u8) = .empty;
@@ -1780,11 +2108,21 @@ const App = struct {
             null,
             true,
         );
-        var cursor_buf: [64]u8 = undefined;
-        var cursor_writer = std.Io.Writer.fixed(&cursor_buf);
-        try self.main_pane.writeCursorPos(&cursor_writer);
-        try raw_repaint.appendSlice(self.alloc, cursor_writer.buffered());
+        {
+            var aw: std.Io.Writer.Allocating = .fromArrayList(self.alloc, &raw_repaint);
+            defer raw_repaint = aw.toArrayList();
+            try self.main_pane.writeCursorPos(&aw.writer);
+        }
+        try raw_repaint.appendSlice(self.alloc, synchronized_update_end);
         try protocol.writeAll(stdout_fd, raw_repaint.items);
+    }
+
+    fn flushReplayIntoParentScrollback(self: *App) !void {
+        if (self.layout.rows == 0) return;
+        var buf: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writer.print("\x1b[r\x1b[{d}S", .{self.layout.rows});
+        try protocol.writeAll(stdout_fd, writer.buffered());
     }
 
     fn drainMainForRawTransition(self: *App) !void {
@@ -1809,6 +2147,23 @@ const App = struct {
                 return;
             }
             self.main_pane.feed(buf[0..n]);
+        }
+    }
+
+    fn drainMainForSplitTransition(self: *App) !void {
+        const deadline = std.time.milliTimestamp() + raw_transition_drain_ms;
+        while (self.main_pane.pty_fd >= 0 and std.time.milliTimestamp() < deadline) {
+            var fds = [_]posix.pollfd{.{
+                .fd = self.main_pane.pty_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = try posix.poll(&fds, raw_transition_idle_ms);
+            if (ready == 0) break;
+            if (fds[0].revents == 0) continue;
+
+            var buf: [64 * 1024]u8 = undefined;
+            _ = try self.readPaneInto(self.main_pane, .main, &buf);
         }
     }
 
@@ -1838,10 +2193,42 @@ const App = struct {
         self.main_pane.closePty();
     }
 
-    fn checkResize(self: *App) !void {
+    fn checkResize(self: *App, now_ns: i128) !void {
         const size = ptypkg.getSize(stdout_fd) catch return;
-        if (size.row == self.last_size.row and size.col == self.last_size.col and
-            size.xpixel == self.last_size.xpixel and size.ypixel == self.last_size.ypixel) return;
+        if (sameGridSize(size, self.last_size)) {
+            self.pending_resize = null;
+            self.resize_due_ns = null;
+            self.last_size.xpixel = size.xpixel;
+            self.last_size.ypixel = size.ypixel;
+            return;
+        }
+
+        try self.queueResize(size, now_ns);
+    }
+
+    fn queueResize(self: *App, size: ptypkg.Winsize, now_ns: i128) !void {
+        const pending_changed = if (self.pending_resize) |pending|
+            !sameGridSize(size, pending)
+        else
+            true;
+
+        self.pending_resize = size;
+        if (!self.composed) {
+            self.resize_due_ns = now_ns;
+        } else if (pending_changed or self.resize_due_ns == null) {
+            self.resize_due_ns = now_ns + resize_quiet_ns;
+        }
+
+        try self.applyPendingResize(now_ns);
+    }
+
+    fn applyPendingResize(self: *App, now_ns: i128) !void {
+        const size = self.pending_resize orelse return;
+        const due_ns = self.resize_due_ns orelse return;
+        if (now_ns < due_ns) return;
+
+        self.pending_resize = null;
+        self.resize_due_ns = null;
         self.last_size = size;
         self.cell_size = CellSize.fromWinsize(size);
         self.layout = Layout.compute(size.row, size.col, self.composed, self.config.split_rows);
@@ -1850,7 +2237,7 @@ const App = struct {
             try pane.resize(@max(self.layout.split_rows, 1), self.layout.cols, self.cell_size);
         }
         self.compositor.invalidate();
-        self.render_scheduler.markDirty(.urgent);
+        self.render_scheduler.markDirty(.bulk);
     }
 };
 
@@ -1897,6 +2284,69 @@ test "layout clamps split while preserving rows when possible" {
     try std.testing.expectEqual(@as(u16, 2), clamped.split_rows);
 }
 
+test "winsize grid comparison ignores pixel-only changes" {
+    const a = ptypkg.makeWinsize(24, 80);
+    var b = ptypkg.makeWinsize(24, 80);
+    b.xpixel = 641;
+    b.ypixel = 480;
+
+    try std.testing.expect(sameGridSize(a, b));
+    try std.testing.expect(!sameGridSize(a, ptypkg.makeWinsize(24, 81)));
+    try std.testing.expect(!sameGridSize(a, ptypkg.makeWinsize(25, 80)));
+}
+
+test "composed pending resize waits for quiet deadline" {
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{ .cols = 80, .rows = 24 }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+
+    var app: App = .{
+        .alloc = alloc,
+        .config = .{ .main_argv = &.{"sh"} },
+        .layout = Layout.compute(24, 80, false, default_split_rows),
+        .main_pane = &pane,
+        .split_pane = null,
+        .raw_terminal = undefined,
+        .compositor = .{ .alloc = alloc },
+        .composed = true,
+        .last_size = ptypkg.makeWinsize(24, 80),
+        .cell_size = .{},
+    };
+    defer app.compositor.deinit();
+
+    const now = 1_000 * std.time.ns_per_ms;
+    try app.queueResize(ptypkg.makeWinsize(30, 100), now);
+
+    try std.testing.expectEqual(now + resize_quiet_ns, app.resize_due_ns.?);
+    try std.testing.expectEqual(@as(u16, 24), pane.term.rows);
+    try std.testing.expectEqual(@as(u16, 80), pane.term.cols);
+    try std.testing.expect(app.pending_resize != null);
+
+    try app.queueResize(ptypkg.makeWinsize(32, 120), now + resize_quiet_ns / 2);
+    const extended_due = now + resize_quiet_ns / 2 + resize_quiet_ns;
+    try std.testing.expectEqual(extended_due, app.resize_due_ns.?);
+
+    try app.applyPendingResize(now + resize_quiet_ns);
+    try std.testing.expectEqual(@as(u16, 24), pane.term.rows);
+    try std.testing.expectEqual(@as(u16, 80), pane.term.cols);
+
+    try app.applyPendingResize(extended_due);
+    try std.testing.expectEqual(app.layout.main_rows, pane.term.rows);
+    try std.testing.expectEqual(@as(u16, 120), pane.term.cols);
+    try std.testing.expect(app.pending_resize == null);
+    try std.testing.expect(app.resize_due_ns == null);
+    try std.testing.expectEqual(@as(u16, 32), app.last_size.row);
+    try std.testing.expectEqual(@as(u16, 120), app.last_size.col);
+}
+
 test "prefix parser closes split and forwards literal prefix" {
     const alloc = std.testing.allocator;
     var parser: PrefixParser = .{};
@@ -1910,6 +2360,21 @@ test "prefix parser closes split and forwards literal prefix" {
     defer close.deinit(alloc);
     try std.testing.expect(close.close_split);
     try std.testing.expectEqual(@as(usize, 0), close.forwarded.items.len);
+
+    var open = try parser.feed(alloc, "\x02s");
+    defer open.deinit(alloc);
+    try std.testing.expect(open.open_split);
+    try std.testing.expectEqual(@as(usize, 0), open.forwarded.items.len);
+
+    var encoded_prefix = try parser.feed(alloc, "\x1b[98;5u");
+    defer encoded_prefix.deinit(alloc);
+    try std.testing.expect(!encoded_prefix.open_split);
+    try std.testing.expectEqual(@as(usize, 0), encoded_prefix.forwarded.items.len);
+
+    var encoded_open = try parser.feed(alloc, "s");
+    defer encoded_open.deinit(alloc);
+    try std.testing.expect(encoded_open.open_split);
+    try std.testing.expectEqual(@as(usize, 0), encoded_open.forwarded.items.len);
 }
 
 test "prefix parser forwards unknown bindings unchanged" {
@@ -1918,6 +2383,16 @@ test "prefix parser forwards unknown bindings unchanged" {
     var result = try parser.feed(alloc, "a\x02zb");
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("a\x02zb", result.forwarded.items);
+}
+
+test "prefix parser forwards non-prefix kitty keys unchanged" {
+    const alloc = std.testing.allocator;
+    var parser: PrefixParser = .{};
+    var result = try parser.feed(alloc, "a\x1b[99;5ub");
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("a\x1b[99;5ub", result.forwarded.items);
+    try std.testing.expect(!result.close_split);
+    try std.testing.expect(!result.open_split);
 }
 
 test "render scheduler renders first dirty frame immediately" {
@@ -2043,6 +2518,60 @@ test "drain stats classify sustained output as bulk" {
     try std.testing.expect(!small.bulkish());
 }
 
+test "composed cursor mirrors child cursor style" {
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{ .cols = 10, .rows = 5 }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+    pane.term.screens.active.cursor.x = 3;
+    pane.term.screens.active.cursor.y = 2;
+    pane.term.screens.active.cursor.cursor_style = .bar;
+    pane.term.modes.set(.cursor_blinking, true);
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeComposedCursor(&writer, Layout.compute(5, 10, false, 0), &pane);
+
+    try std.testing.expectEqualStrings("\x1b[5 q\x1b[3;4H\x1b[?25h", writer.buffered());
+}
+
+test "composed cursor mirrors child cursor visibility" {
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{ .cols = 10, .rows = 5 }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+    pane.term.modes.set(.cursor_visible, false);
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeComposedCursor(&writer, Layout.compute(5, 10, false, 0), &pane);
+
+    try std.testing.expectEqualStrings("\x1b[2 q\x1b[1;1H\x1b[?25l", writer.buffered());
+}
+
+test "cursor style maps Ghostty-only hollow block to DECSCUSR block" {
+    var buf: [16]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    try writeCursorStyle(&writer, .block_hollow, false);
+
+    try std.testing.expectEqualStrings("\x1b[2 q", writer.buffered());
+}
+
 test "pane stream handler records full-pane upward scrolls" {
     const alloc = std.testing.allocator;
 
@@ -2058,16 +2587,52 @@ test "pane stream handler records full-pane upward scrolls" {
     pane.cell_size = .{};
     pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
     defer pane.term.deinit(alloc);
-    pane.pending_scroll_up = 0;
+    pane.pending_scroll_count = 0;
+    pane.pending_scroll_overflow = false;
     pane.stream = .initAlloc(alloc, Pane.StreamHandler.init(&pane));
     defer pane.stream.deinit();
 
     pane.feed("one\r\ntwo\r\nthree\r\nfour\r\n");
 
-    try std.testing.expectEqual(@as(usize, 2), pane.takePendingScrollUp());
+    const pending = pane.takePendingScrolls();
+    try std.testing.expect(!pending.overflow);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(@as(u16, 0), pending.items[0].top);
+    try std.testing.expectEqual(@as(u16, 2), pending.items[0].bottom);
+    try std.testing.expectEqual(@as(usize, 2), pending.items[0].count);
 }
 
-test "graphics reset ignores text-only scroll dirty without placements" {
+test "pane stream handler records partial-region upward scrolls" {
+    const alloc = std.testing.allocator;
+
+    var pane: Pane = undefined;
+    pane.alloc = alloc;
+    pane.pty_fd = -1;
+    pane.child_pid = 0;
+    pane.alive = false;
+    pane.reaped = true;
+    pane.command_title = "test";
+    pane.passthrough = false;
+    pane.feeding_discarded = false;
+    pane.cell_size = .{};
+    pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer pane.term.deinit(alloc);
+    pane.pending_scroll_count = 0;
+    pane.pending_scroll_overflow = false;
+    pane.stream = .initAlloc(alloc, Pane.StreamHandler.init(&pane));
+    defer pane.stream.deinit();
+
+    pane.feed("\x1b[2;5r\x1b[1S");
+
+    const pending = pane.takePendingScrolls();
+    try std.testing.expect(!pending.overflow);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(@as(u16, 1), pending.items[0].top);
+    try std.testing.expectEqual(@as(u16, 4), pending.items[0].bottom);
+    try std.testing.expectEqual(@as(usize, 1), pending.items[0].count);
+}
+
+test "graphics update ignores text-only scroll dirty without placements" {
     const alloc = std.testing.allocator;
     var pane: Pane = .{
         .alloc = alloc,
@@ -2090,7 +2655,7 @@ test "graphics reset ignores text-only scroll dirty without placements" {
     var graphics: GraphicsState = .{};
     defer graphics.deinit(alloc);
 
-    try std.testing.expect(!graphics.needsReset(&pane, null));
+    try std.testing.expect(!graphics.needsUpdate(&pane, null));
 }
 
 test "pane row cache detects upward viewport scroll" {
@@ -2116,7 +2681,7 @@ test "pane row cache detects upward viewport scroll" {
     stream.nextSlice("\r\nEEE");
 
     try std.testing.expectEqual(@as(u16, 1), cache.detectScrollUp(&term, 4, false));
-    cache.rotateScrollUp(4, 1);
+    cache.rotateRegionScrollUp(0, 4, 1);
 
     for (0..3) |y| {
         const pin = viewportPin(&term, @intCast(y)).?;
@@ -2136,12 +2701,43 @@ test "outer row cache rotation clears newly exposed rows" {
         try row.print(alloc, "row{d}", .{i});
     }
 
-    compositor.rotateOuterRowsForMainScroll(4, 1);
+    compositor.rotateOuterRowsForRegion(0, 4, 1);
 
     try std.testing.expectEqualStrings("row1", compositor.row_cache.items[0].items);
     try std.testing.expectEqualStrings("row2", compositor.row_cache.items[1].items);
     try std.testing.expectEqualStrings("row3", compositor.row_cache.items[2].items);
     try std.testing.expectEqual(@as(usize, 0), compositor.row_cache.items[3].items.len);
+}
+
+test "outer row cache rotation works for split region" {
+    const alloc = std.testing.allocator;
+
+    var compositor: Compositor = .{ .alloc = alloc };
+    defer compositor.deinit();
+
+    while (compositor.row_cache.items.len < 6) try compositor.row_cache.append(alloc, .empty);
+    for (compositor.row_cache.items, 0..) |*row, i| {
+        try row.print(alloc, "row{d}", .{i});
+    }
+
+    compositor.rotateOuterRowsForRegion(4, 2, 1);
+
+    try std.testing.expectEqualStrings("row0", compositor.row_cache.items[0].items);
+    try std.testing.expectEqualStrings("row3", compositor.row_cache.items[3].items);
+    try std.testing.expectEqualStrings("row5", compositor.row_cache.items[4].items);
+    try std.testing.expectEqual(@as(usize, 0), compositor.row_cache.items[5].items.len);
+}
+
+test "split pane scroll fast path emits split scroll region" {
+    const alloc = std.testing.allocator;
+
+    var compositor: Compositor = .{ .alloc = alloc };
+    defer compositor.deinit();
+
+    const layout = Layout.compute(6, 20, true, 2);
+    try compositor.emitScrollUp(layout.splitTop(), layout.split_rows, 1);
+
+    try std.testing.expectEqualStrings("\x1b[5;6r\x1b[1S\x1b[r", compositor.body.items);
 }
 
 test "term selection preserves graphics-capable outer terminals" {
@@ -2155,7 +2751,7 @@ test "term selection preserves graphics-capable outer terminals" {
     try std.testing.expectEqualStrings("xterm-kitty", selectTerm(.xterm_kitty, null, null));
 }
 
-test "graphics replay emits outer image upload and placement" {
+test "graphics replay keeps image upload cached across placement updates" {
     if (comptime !kitty_graphics_enabled) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -2191,6 +2787,15 @@ test "graphics replay emits outer image upload and placement" {
 
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=t") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "f=24,s=1,v=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1;1H\x1b_Ga=p") != null);
+    try std.testing.expect(!pane.term.screens.active.kitty_images.dirty);
+
+    out.clearRetainingCapacity();
+    pane.term.screens.active.kitty_images.dirty = true;
+    try graphics.render(alloc, &out, layout, &pane, null, false);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=d,d=i") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1;1H\x1b_Ga=p") != null);
     try std.testing.expect(!pane.term.screens.active.kitty_images.dirty);
 }

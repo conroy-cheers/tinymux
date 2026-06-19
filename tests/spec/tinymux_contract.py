@@ -118,6 +118,105 @@ class Session:
         raise AssertionError(f"terminal output did not go idle; output tail={self.output[-1000:]!r}")
 
 
+def terminal_scrollback_contains(data: bytes, marker: bytes, rows: int = DEFAULT_ROWS) -> bool:
+    history: list[bytes] = []
+    screen = [bytearray() for _ in range(rows)]
+    row = 0
+    col = 0
+
+    def scroll_up(count: int) -> None:
+        nonlocal screen
+        for _ in range(max(0, count)):
+            history.append(bytes(screen[0]))
+            screen = screen[1:] + [bytearray()]
+
+    def csi_params(body: bytes) -> list[int]:
+        clean = body
+        while clean and clean[0] in b"?=>":
+            clean = clean[1:]
+        first = clean.split(b";", 1)[0]
+        try:
+            return [int(part) if part else 0 for part in clean.split(b";")]
+        except ValueError:
+            try:
+                return [int(first)]
+            except ValueError:
+                return [0]
+
+    i = 0
+    while i < len(data):
+        byte = data[i]
+        if byte == 0x1B:
+            if i + 1 >= len(data):
+                break
+            introducer = data[i + 1]
+            if introducer == ord("["):
+                j = i + 2
+                while j < len(data) and not (0x40 <= data[j] <= 0x7E):
+                    j += 1
+                if j >= len(data):
+                    break
+                params = csi_params(data[i + 2 : j])
+                final = data[j]
+                if final in (ord("H"), ord("f")):
+                    row = max(0, min(rows - 1, (params[0] if len(params) > 0 and params[0] else 1) - 1))
+                    col = max(0, (params[1] if len(params) > 1 and params[1] else 1) - 1)
+                elif final == ord("J") and (not params or params[0] in (2, 3)):
+                    if params and params[0] == 3:
+                        history.clear()
+                    screen = [bytearray() for _ in range(rows)]
+                    row = 0
+                    col = 0
+                elif final == ord("K"):
+                    del screen[row][col:]
+                elif final == ord("S"):
+                    scroll_up(params[0] if params and params[0] else 1)
+                i = j + 1
+                continue
+            if introducer in (ord("]"), ord("_"), ord("P"), ord("^")):
+                j = i + 2
+                while j < len(data):
+                    if data[j] == 0x07:
+                        j += 1
+                        break
+                    if data[j] == 0x1B and j + 1 < len(data) and data[j + 1] == ord("\\"):
+                        j += 2
+                        break
+                    j += 1
+                i = j
+                continue
+            i += 2
+            continue
+        if byte == ord("\r"):
+            col = 0
+        elif byte == ord("\n"):
+            row += 1
+            if row >= rows:
+                scroll_up(1)
+                row = rows - 1
+        elif byte >= 0x20:
+            line = screen[row]
+            while len(line) < col:
+                line.append(ord(" "))
+            if col == len(line):
+                line.append(byte)
+            else:
+                line[col] = byte
+            col += 1
+        i += 1
+
+    return any(marker in line for line in history)
+
+
+def assert_marker_inside_synchronized_update(data: bytes, marker: bytes) -> None:
+    marker_index = data.find(marker)
+    assert marker_index >= 0, f"marker {marker!r} was not present; tail={data[-1000:]!r}"
+    begin_index = data.rfind(b"\x1b[?2026h", 0, marker_index)
+    end_index = data.find(b"\x1b[?2026l", marker_index)
+    assert begin_index >= 0, f"no synchronized update begin before {marker!r}; tail={data[-1000:]!r}"
+    assert end_index >= 0, f"no synchronized update end after {marker!r}; tail={data[-1000:]!r}"
+
+
 def test_split_renders_and_main_gets_input(tinymux: str) -> None:
     session = Session(
         [
@@ -211,6 +310,193 @@ def test_split_close_switches_to_raw_main(tinymux: str) -> None:
         session.close()
 
 
+def test_split_close_replays_main_history_to_parent_scrollback(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "i=0; while [ $i -lt 40 ]; do printf 'HIST_%02d\\n' \"$i\"; i=$((i+1)); done; cat",
+        ]
+    )
+    try:
+        session.wait_for(b"HIST_39")
+        session.drain_until_idle()
+        close_start = len(session.output)
+        session.write(b"\x02x")
+        session.wait_for_after(b"\x1b[?1049l", close_start)
+        session.drain_until_idle()
+        post_close = session.output[close_start:]
+        assert b"HIST_00" in post_close, (
+            "split-era main history was not replayed into the parent stream; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+    finally:
+        session.close()
+
+
+def test_split_close_replays_history_before_expanding_main(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "i=0; while [ $i -lt 20 ]; do printf 'SPLIT_ONLY_HIST_%02d\\n' \"$i\"; i=$((i+1)); done; cat",
+        ]
+    )
+    try:
+        session.wait_for(b"SPLIT_ONLY_HIST_19")
+        session.drain_until_idle()
+        close_start = len(session.output)
+        session.write(b"\x02x")
+        session.wait_for_after(b"\x1b[?1049l", close_start)
+        session.drain_until_idle()
+        post_close = session.output[close_start:]
+        assert b"SPLIT_ONLY_HIST_00" in post_close, (
+            "history that existed only because the main pane was split-sized was not replayed; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+        assert terminal_scrollback_contains(post_close, b"SPLIT_ONLY_HIST_00"), (
+            "split-sized history was replayed but not forced into native parent scrollback before repaint; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+        assert_marker_inside_synchronized_update(post_close, b"SPLIT_ONLY_HIST_00")
+    finally:
+        session.close()
+
+
+def test_csi_u_split_close_replays_main_history_to_parent_scrollback(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "i=0; while [ $i -lt 40 ]; do printf 'CSI_HIST_%02d\\n' \"$i\"; i=$((i+1)); done; cat",
+        ]
+    )
+    try:
+        session.wait_for(b"CSI_HIST_39")
+        session.drain_until_idle()
+        close_start = len(session.output)
+        session.write(b"\x1b[98;5ux")
+        session.wait_for_after(b"\x1b[?1049l", close_start)
+        session.drain_until_idle()
+        post_close = session.output[close_start:]
+        assert b"CSI_HIST_00" in post_close, (
+            "split-era main history was not replayed into the parent stream after CSI-u close; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+    finally:
+        session.close()
+
+
+def test_split_close_replays_history_beyond_old_small_scrollback_cap(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            (
+                "i=0; "
+                "while [ $i -lt 9000 ]; do "
+                "printf 'BIG_HIST_%05d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; "
+                "i=$((i+1)); "
+                "done; "
+                "cat"
+            ),
+        ]
+    )
+    try:
+        session.wait_for(b"BIG_HIST_08999", timeout=10.0)
+        session.drain_until_idle(timeout=5.0)
+        close_start = len(session.output)
+        session.write(b"\x02x")
+        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=10.0)
+        session.drain_until_idle(timeout=10.0)
+        post_close = session.output[close_start:]
+        assert b"BIG_HIST_00000" in post_close, (
+            "history older than the old 512 KiB cap was not replayed; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+        assert terminal_scrollback_contains(post_close, b"BIG_HIST_00000"), (
+            "large replay was written but not retained by parent native scrollback; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+        assert_marker_inside_synchronized_update(post_close, b"BIG_HIST_00000")
+    finally:
+        session.close()
+
+
+def test_raw_output_is_tracked_for_reopened_split(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_READY\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "printf 'MAIN_READY\\n'; cat",
+        ]
+    )
+    try:
+        session.wait_for(b"SPLIT_READY")
+        session.write(b"\x02x")
+        session.wait_for(b"\x1b[?1049l")
+        session.drain_until_idle()
+
+        session.write(b"RAW_TRACKED\n")
+        session.wait_for(b"RAW_TRACKED")
+        open_start = len(session.output)
+        session.write(b"\x02")
+        time.sleep(0.2)
+        session.write(b"s")
+        session.wait_for_after(b"\x1b[?1049h", open_start)
+        session.wait_for_after(b"RAW_TRACKED", open_start)
+    finally:
+        session.close()
+
+
+def test_csi_u_prefix_reopens_split_after_raw_mode(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_READY\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "printf 'MAIN_READY\\n'; cat",
+        ]
+    )
+    try:
+        session.wait_for(b"SPLIT_READY")
+        session.write(b"\x1b[98;5ux")
+        session.wait_for(b"\x1b[?1049l")
+        session.drain_until_idle()
+
+        open_start = len(session.output)
+        session.write(b"\x1b[98;5u")
+        time.sleep(0.2)
+        session.write(b"s")
+        session.wait_for_after(b"\x1b[?1049h", open_start)
+        session.wait_for_after(b"SPLIT_READY", open_start)
+    finally:
+        session.close()
+
+
 def test_split_close_then_dirty_main_exit_restores_parent_shell(tinymux: str) -> None:
     split_cmd = "printf 'SPLIT_READY\\n'; sleep 5"
     main_cmd = "printf 'MAIN_READY\\033[?2004h\\033[?2031h\\033[=5;1u> '; cat >/dev/null"
@@ -297,6 +583,12 @@ def main() -> int:
         test_split_replays_kitty_graphics,
         test_split_replays_kitty_png_graphics,
         test_split_close_switches_to_raw_main,
+        test_split_close_replays_main_history_to_parent_scrollback,
+        test_split_close_replays_history_before_expanding_main,
+        test_csi_u_split_close_replays_main_history_to_parent_scrollback,
+        test_split_close_replays_history_beyond_old_small_scrollback_cap,
+        test_raw_output_is_tracked_for_reopened_split,
+        test_csi_u_prefix_reopens_split_after_raw_mode,
     ]
     for test in tests:
         test(args.tinymux)
