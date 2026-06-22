@@ -69,7 +69,7 @@ function __tinymux_direnv_enter_root
         command rm -rf -- "$state"
         return 1
     end
-    env TINYMUX_DIRENV_ROOT="$root" TINYMUX_DIRENV_STATE="$state" command tinymux --seamless --handoff-state "$state" -- fish -i -C "source $state/config.fish"
+    command env TINYMUX_DIRENV_ROOT="$root" TINYMUX_DIRENV_STATE="$state" tinymux --seamless --handoff-state "$state" -- fish -i -C "source $state/config.fish"
     set -l code $status
     set -l reason ""
     test -f "$state/exit_reason"; and set reason (command cat "$state/exit_reason")

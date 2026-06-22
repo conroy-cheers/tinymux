@@ -1104,7 +1104,19 @@ find_envrc() {
 
 emit_export() {
     # Test paths are mktemp paths without single quotes.
-    printf "export %s='%s'\\n" "$1" "$2"
+    if [ "${DIRENV_INSTANT_SHELL:-}" = fish ]; then
+        printf "set -gx %s '%s'\\n" "$1" "$2"
+    else
+        printf "export %s='%s'\\n" "$1" "$2"
+    fi
+}
+
+emit_unset() {
+    if [ "${DIRENV_INSTANT_SHELL:-}" = fish ]; then
+        printf "set -e %s\\n" "$1"
+    else
+        printf "unset %s\\n" "$1"
+    fi
 }
 
 case "${1:-}" in
@@ -1112,25 +1124,25 @@ case "${1:-}" in
         root=$(find_envrc || true)
         printf 'START|TINYMUX=%s|PWD=%s|ROOT=%s\\n' "${TINYMUX:-}" "$PWD" "$root" >> "$TINYMUX_DIRENV_STUB_LOG"
         if [ -z "$root" ]; then
-            printf 'unset __DIRENV_INSTANT_CURRENT_DIR\\n'
-            printf 'unset __DIRENV_INSTANT_ENV_FILE\\n'
-            printf 'unset __DIRENV_INSTANT_STDERR_FILE\\n'
-            printf 'unset DIRENV_WRAPPED\\n'
+            emit_unset __DIRENV_INSTANT_CURRENT_DIR
+            emit_unset __DIRENV_INSTANT_ENV_FILE
+            emit_unset __DIRENV_INSTANT_STDERR_FILE
+            emit_unset DIRENV_WRAPPED
             exit 0
         fi
 
         env_file=$(mktemp "${TMPDIR:-/tmp}/tinymux-direnv-env.XXXXXX")
         stderr_file=$(mktemp "${TMPDIR:-/tmp}/tinymux-direnv-stderr.XXXXXX")
-        printf "export DIRENV_WRAPPED='from-file'\\n" > "$env_file"
+        DIRENV_INSTANT_SHELL=${DIRENV_INSTANT_SHELL:-} emit_export DIRENV_WRAPPED from-file > "$env_file"
 
         emit_export __DIRENV_INSTANT_CURRENT_DIR "$root"
         emit_export __DIRENV_INSTANT_ENV_FILE "$env_file"
         emit_export __DIRENV_INSTANT_STDERR_FILE "$stderr_file"
         if [ -n "${TINYMUX:-}" ]; then
-            printf "export DIRENV_WRAPPED='inside'\\n"
+            emit_export DIRENV_WRAPPED inside
             tmux split-window -d -l 5 /bin/sh -lc 'printf DIRENV_TINYMUX_LOG_READY; sleep 10'
         else
-            printf "export DIRENV_WRAPPED='outside'\\n"
+            emit_export DIRENV_WRAPPED outside
         fi
         ;;
     stop)
@@ -1218,6 +1230,38 @@ def test_direnv_instant_wrapper_enters_tinymux_and_returns_after_leaving_root(ti
             assert expected in after, (
                 "leaving the direnv root did not restore the parent shell outside tinymux; "
                 f"expected={expected!r} output={after[-2000:]!r}"
+            )
+        finally:
+            session.close()
+
+
+def test_direnv_instant_fish_wrapper_enters_tinymux_without_env_command_error(tinymux: str) -> None:
+    fish = shutil.which("fish")
+    bash = shutil.which("bash")
+    if fish is None or bash is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    wrapper = direnv_wrapper_for(tinymux_abs)
+    with tempfile.TemporaryDirectory() as root:
+        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
+        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
+        env["SHELL"] = fish
+        session = ForkSession([fish, "--no-config", "--interactive"], extra_env=env)
+        try:
+            session.write(b"function fish_prompt; end\n")
+            session.write(f"{shlex.quote(wrapper)} hook fish | source\n".encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+
+            enter_start = len(session.output)
+            session.write(f"cd {shlex.quote(project)}\n".encode())
+            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", enter_start, timeout=10.0)
+            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
+            after = session.output[enter_start:]
+            assert b"env: \xe2\x80\x98command\xe2\x80\x99" not in after
+            assert b"env: 'command'" not in after, (
+                "fish hook tried to run a shell builtin through env; "
+                f"output={after[-2000:]!r}"
             )
         finally:
             session.close()
@@ -1619,6 +1663,7 @@ def main() -> int:
         test_common_shell_init_outputs_entrypoint_functions,
         test_direnv_instant_wrapper_outputs_hooks,
         test_direnv_instant_wrapper_enters_tinymux_and_returns_after_leaving_root,
+        test_direnv_instant_fish_wrapper_enters_tinymux_without_env_command_error,
         test_direnv_instant_wrapper_child_exit_exits_parent_shell,
         test_direnv_instant_wrapper_skips_entry_inside_foreign_mux,
         test_fish_seamless_enter_exit_restores_cwd_and_env,
