@@ -132,6 +132,11 @@
         }
       );
 
+      homeManagerModules = {
+        tinymux = import ./modules/home-manager/tinymux.nix { inherit self; };
+        default = self.homeManagerModules.tinymux;
+      };
+
       apps = forAllSystems (
         system:
         let
