@@ -5,6 +5,7 @@ import argparse
 import os
 import pty
 import select
+import shutil
 import shlex
 import signal
 import struct
@@ -25,9 +26,15 @@ def set_winsize(fd: int, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> 
 
 
 class Session:
-    def __init__(self, argv: Sequence[str], extra_env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        argv: Sequence[str],
+        extra_env: dict[str, str] | None = None,
+        rows: int = DEFAULT_ROWS,
+        cols: int = DEFAULT_COLS,
+    ) -> None:
         self.master, slave = pty.openpty()
-        set_winsize(slave)
+        set_winsize(slave, rows, cols)
         subprocess.run(
             ["stty", "sane"],
             stdin=slave,
@@ -119,6 +126,21 @@ class Session:
 
 
 def terminal_scrollback_contains(data: bytes, marker: bytes, rows: int = DEFAULT_ROWS) -> bool:
+    history, _ = terminal_state(data, rows)
+    return any(marker in line for line in history)
+
+
+def terminal_scrollback_marker_count(data: bytes, marker: bytes, rows: int = DEFAULT_ROWS) -> int:
+    history, _ = terminal_state(data, rows)
+    return sum(1 for line in history if marker in line)
+
+
+def terminal_screen_contains(data: bytes, marker: bytes, rows: int = DEFAULT_ROWS) -> bool:
+    _, screen = terminal_state(data, rows)
+    return any(marker in line for line in screen)
+
+
+def terminal_state(data: bytes, rows: int = DEFAULT_ROWS) -> tuple[list[bytes], list[bytes]]:
     history: list[bytes] = []
     screen = [bytearray() for _ in range(rows)]
     row = 0
@@ -205,16 +227,19 @@ def terminal_scrollback_contains(data: bytes, marker: bytes, rows: int = DEFAULT
             col += 1
         i += 1
 
-    return any(marker in line for line in history)
+    return history, [bytes(line) for line in screen]
 
 
-def assert_marker_inside_synchronized_update(data: bytes, marker: bytes) -> None:
+def assert_marker_before_first_synchronized_update(data: bytes, marker: bytes) -> None:
     marker_index = data.find(marker)
     assert marker_index >= 0, f"marker {marker!r} was not present; tail={data[-1000:]!r}"
-    begin_index = data.rfind(b"\x1b[?2026h", 0, marker_index)
-    end_index = data.find(b"\x1b[?2026l", marker_index)
-    assert begin_index >= 0, f"no synchronized update begin before {marker!r}; tail={data[-1000:]!r}"
-    assert end_index >= 0, f"no synchronized update end after {marker!r}; tail={data[-1000:]!r}"
+    begin_index = data.find(b"\x1b[?2026h")
+    assert begin_index >= 0, f"no synchronized repaint after close; tail={data[-1000:]!r}"
+    assert marker_index < begin_index, (
+        "split-close history replay was emitted inside the repaint synchronized update; "
+        "real terminals can fail to retain the replay as native scrollback in that mode; "
+        f"marker_index={marker_index} begin_index={begin_index} tail={data[-1000:]!r}"
+    )
 
 
 def test_split_renders_and_main_gets_input(tinymux: str) -> None:
@@ -235,6 +260,157 @@ def test_split_renders_and_main_gets_input(tinymux: str) -> None:
         session.write(b"MAIN_INPUT\n")
         session.wait_for(b"MAIN_INPUT")
         assert b"\xe2\x94\x80" in session.output, "split border was not rendered"
+    finally:
+        session.close()
+
+
+def test_split_reserves_scrollbar_column_for_child_ptys(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "set -- $(stty size); printf 'SPLIT_SIZE_%s_%s\\n' \"$1\" \"$2\"; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "set -- $(stty size); printf 'MAIN_SIZE_%s_%s\\n' \"$1\" \"$2\"; cat",
+        ]
+    )
+    try:
+        session.wait_for(b"MAIN_SIZE_14_79")
+        session.wait_for(b"SPLIT_SIZE_9_79")
+        session.drain_until_idle()
+        assert b"\xe2\x96\x88" in session.output, "scrollbar thumb was not rendered"
+    finally:
+        session.close()
+
+
+def test_mouse_wheel_scrolls_main_pane_viewport(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_READY\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            (
+                "i=0; "
+                "while [ $i -lt 40 ]; do printf 'MAIN_SCROLL_%02d\\n' \"$i\"; i=$((i+1)); done; "
+                "cat"
+            ),
+        ]
+    )
+    try:
+        session.wait_for(b"SPLIT_READY")
+        session.wait_for(b"MAIN_SCROLL_39")
+        session.drain_until_idle()
+        scroll_start = len(session.output)
+        session.write(b"\x1b[<64;10;5M")
+        session.wait_for_after(b"MAIN_SCROLL_24", scroll_start)
+        session.drain_until_idle()
+        assert terminal_screen_contains(session.output, b"MAIN_SCROLL_24"), (
+            "wheel-up over main pane did not expose earlier main scrollback; "
+            f"screen tail={session.output[-1000:]!r}"
+        )
+    finally:
+        session.close()
+
+
+def test_mouse_drag_scrollbar_scrolls_main_pane_viewport(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_READY\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            (
+                "i=0; "
+                "while [ $i -lt 40 ]; do printf 'MAIN_DRAG_%02d\\n' \"$i\"; i=$((i+1)); done; "
+                "cat"
+            ),
+        ]
+    )
+    try:
+        session.wait_for(b"SPLIT_READY")
+        session.wait_for(b"MAIN_DRAG_39")
+        session.drain_until_idle()
+        scroll_start = len(session.output)
+        session.write(
+            b"\x1b[<0;80;13M"
+            b"\x1b[<32;80;1M"
+            b"\x1b[<0;80;1m"
+        )
+        session.wait_for_after(b"MAIN_DRAG_00", scroll_start)
+        session.drain_until_idle()
+        assert terminal_screen_contains(session.output, b"MAIN_DRAG_00"), (
+            "dragging the main-pane scrollbar did not expose the top of main scrollback; "
+            f"screen tail={session.output[-1000:]!r}"
+        )
+    finally:
+        session.close()
+
+
+def test_mouse_wheel_scrolls_split_pane_viewport(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            (
+                "i=0; "
+                "while [ $i -lt 30 ]; do printf 'SPLIT_SCROLL_%02d\\n' \"$i\"; i=$((i+1)); done; "
+                "sleep 5"
+            ),
+            "--",
+            "/bin/sh",
+            "-lc",
+            "printf 'MAIN_READY\\n'; cat",
+        ]
+    )
+    try:
+        session.wait_for(b"MAIN_READY")
+        session.wait_for(b"SPLIT_SCROLL_29")
+        session.drain_until_idle()
+        scroll_start = len(session.output)
+        session.write(b"\x1b[<64;10;20M")
+        session.wait_for_after(b"SPLIT_SCROLL_19", scroll_start)
+        session.drain_until_idle()
+        assert terminal_screen_contains(session.output, b"SPLIT_SCROLL_19"), (
+            "wheel-up over split pane did not expose earlier split scrollback; "
+            f"screen tail={session.output[-1000:]!r}"
+        )
+    finally:
+        session.close()
+
+
+def test_mouse_wheel_forwards_when_child_requests_mouse(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_READY\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            (
+                "printf '\\033[?1000h\\033[?1006hMOUSE_READY\\n'; "
+                "stty raw -echo; "
+                "python3 -c 'import sys, time; "
+                "data = sys.stdin.buffer.read(11); "
+                "sys.stdout.buffer.write(b\"MOUSE_BYTES|\" + data.hex().encode() + b\"\\n\"); "
+                "sys.stdout.flush(); "
+                "time.sleep(0.2)'"
+            ),
+        ]
+    )
+    try:
+        session.wait_for(b"MOUSE_READY")
+        session.wait_for(b"SPLIT_READY")
+        forward_start = len(session.output)
+        session.write(b"\x1b[<64;10;5M")
+        session.wait_for_after(b"MOUSE_BYTES|1b5b3c36343b31303b354d", forward_start)
     finally:
         session.close()
 
@@ -366,7 +542,7 @@ def test_split_close_replays_history_before_expanding_main(tinymux: str) -> None
             "split-sized history was replayed but not forced into native parent scrollback before repaint; "
             f"post-close tail={post_close[-1000:]!r}"
         )
-        assert_marker_inside_synchronized_update(post_close, b"SPLIT_ONLY_HIST_00")
+        assert_marker_before_first_synchronized_update(post_close, b"SPLIT_ONLY_HIST_00")
     finally:
         session.close()
 
@@ -434,7 +610,127 @@ def test_split_close_replays_history_beyond_old_small_scrollback_cap(tinymux: st
             "large replay was written but not retained by parent native scrollback; "
             f"post-close tail={post_close[-1000:]!r}"
         )
-        assert_marker_inside_synchronized_update(post_close, b"BIG_HIST_00000")
+        assert_marker_before_first_synchronized_update(post_close, b"BIG_HIST_00000")
+    finally:
+        session.close()
+
+
+def test_split_close_replays_long_history_outside_synchronized_repaint(tinymux: str) -> None:
+    line_count = 420
+    fish = shutil.which("fish")
+    if fish:
+        main_argv = [
+            fish,
+            "-c",
+            (
+                f"for i in (seq 0 {line_count - 1}); "
+                "printf 'SYNC_REPLAY_%04d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' $i; "
+                "end; "
+                "cat"
+            ),
+        ]
+    else:
+        main_argv = [
+            "/bin/sh",
+            "-lc",
+            (
+                "i=0; "
+                f"while [ $i -lt {line_count} ]; do "
+                "printf 'SYNC_REPLAY_%04d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; "
+                "i=$((i+1)); "
+                "done; "
+                "cat"
+            ),
+        ]
+
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "--",
+            *main_argv,
+        ]
+    )
+    try:
+        session.wait_for(f"SYNC_REPLAY_{line_count - 1:04d}".encode(), timeout=10.0)
+        session.drain_until_idle(timeout=5.0)
+        close_start = len(session.output)
+        session.write(b"\x02x")
+        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=10.0)
+        session.drain_until_idle(timeout=10.0)
+        post_close = session.output[close_start:]
+
+        first_marker = b"SYNC_REPLAY_0000"
+        deep_history_marker = f"SYNC_REPLAY_{line_count - DEFAULT_ROWS - 10:04d}".encode()
+        last_marker = f"SYNC_REPLAY_{line_count - 1:04d}".encode()
+        assert first_marker in post_close, (
+            "beginning of long split-era history was not replayed after close; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+        assert deep_history_marker in post_close, (
+            "deep split-era history was not replayed after close; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+        assert last_marker in post_close, (
+            "end of long split-era history was not replayed after close; "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+        assert_marker_before_first_synchronized_update(post_close, first_marker)
+        assert_marker_before_first_synchronized_update(post_close, deep_history_marker)
+
+        retained_lines = terminal_scrollback_marker_count(post_close, b"SYNC_REPLAY_")
+        assert retained_lines >= line_count - DEFAULT_ROWS - 5, (
+            "long split-era replay did not become native parent scrollback; "
+            f"retained_lines={retained_lines} line_count={line_count} "
+            f"post-close tail={post_close[-1000:]!r}"
+        )
+    finally:
+        session.close()
+
+
+def test_split_close_replays_retained_history_after_anchor_pruned(tinymux: str) -> None:
+    line_count = 24000
+    retained_index = line_count - 1000
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            (
+                "i=0; "
+                f"while [ $i -lt {line_count} ]; do "
+                "printf 'PRUNED_ANCHOR_%05d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; "
+                "i=$((i+1)); "
+                "done; "
+                "printf 'PRUNED_ANCHOR_DONE\\n'; "
+                "cat"
+            ),
+        ],
+        cols=1000,
+    )
+    try:
+        session.wait_for(b"PRUNED_ANCHOR_DONE", timeout=20.0)
+        session.drain_until_idle(timeout=5.0)
+        close_start = len(session.output)
+        session.write(b"\x02x")
+        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=10.0)
+        session.drain_until_idle(timeout=10.0)
+        post_close = session.output[close_start:]
+
+        retained_marker = f"PRUNED_ANCHOR_{retained_index:05d}".encode()
+        assert retained_marker in post_close, (
+            "closing split mode did not replay retained history after the split-start anchor was pruned; "
+            f"marker={retained_marker!r} post-close tail={post_close[-1000:]!r}"
+        )
+        assert_marker_before_first_synchronized_update(post_close, retained_marker)
+        assert terminal_scrollback_contains(post_close, retained_marker), (
+            "retained split-era history was replayed but did not become parent native scrollback; "
+            f"marker={retained_marker!r} post-close tail={post_close[-1000:]!r}"
+        )
     finally:
         session.close()
 
@@ -695,6 +991,11 @@ def main() -> int:
         test_raw_only_passthrough,
         test_raw_only_does_not_parse_prefix,
         test_split_renders_and_main_gets_input,
+        test_split_reserves_scrollbar_column_for_child_ptys,
+        test_mouse_wheel_scrolls_main_pane_viewport,
+        test_mouse_drag_scrollbar_scrolls_main_pane_viewport,
+        test_mouse_wheel_scrolls_split_pane_viewport,
+        test_mouse_wheel_forwards_when_child_requests_mouse,
         test_split_replays_kitty_graphics,
         test_split_replays_kitty_png_graphics,
         test_split_close_switches_to_raw_main,
@@ -702,6 +1003,8 @@ def main() -> int:
         test_split_close_replays_history_before_expanding_main,
         test_csi_u_split_close_replays_main_history_to_parent_scrollback,
         test_split_close_replays_history_beyond_old_small_scrollback_cap,
+        test_split_close_replays_long_history_outside_synchronized_repaint,
+        test_split_close_replays_retained_history_after_anchor_pruned,
         test_raw_output_is_tracked_for_reopened_split,
         test_csi_u_prefix_reopens_split_after_raw_mode,
         test_tmux_compat_env_and_private_shim,

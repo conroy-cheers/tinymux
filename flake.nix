@@ -156,6 +156,7 @@
             packages = [
               pkgs.zig_0_15
               pkgs.python3
+              pkgs.tmux
               pkgs.nixpkgs-fmt
             ];
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const vt = @import("ghostty-vt");
 const ptypkg = @import("pty.zig");
@@ -13,6 +14,8 @@ const default_split_rows: u16 = 9;
 const exit_drain_ms: i64 = 50;
 const raw_transition_drain_ms: i64 = 120;
 const raw_transition_idle_ms: i32 = 10;
+const termination_poll_ns: u64 = 1 * std.time.ns_per_ms;
+const termination_grace_polls: usize = 100;
 const composed_idle_poll_ms: i32 = 50;
 const composed_frame_interval_ns: i128 = 4 * std.time.ns_per_ms;
 const bulk_frame_interval_ns: i128 = 8 * std.time.ns_per_ms;
@@ -26,7 +29,12 @@ const pty_drain_max_bytes: usize = 8 * 1024 * 1024;
 const bulk_damage_bytes: usize = 16 * 1024;
 const bulk_damage_reads: usize = 2;
 const max_pending_scrolls: usize = 8;
+const wheel_scroll_rows: isize = 3;
+const max_sgr_mouse_sequence: usize = 64;
 const scrollback_bytes: usize = 256 * 1024 * 1024;
+const deferred_raw_state_limit: usize = 64 * 1024 * 1024;
+const deferred_raw_bulk_prealloc_trigger: usize = 32 * 1024;
+const deferred_raw_bulk_prealloc_bytes: usize = 16 * 1024 * 1024;
 const kitty_image_storage_limit: usize = 320 * 1024 * 1024;
 const kitty_upload_chunk_bytes: usize = 3000;
 const outer_image_id_start: u32 = 0x70000000;
@@ -38,8 +46,10 @@ const sgr_reset = "\x1b[0m";
 const style_dim = "\x1b[2m";
 const synchronized_update_begin = "\x1b[?2026h";
 const synchronized_update_end = "\x1b[?2026l";
-const enter_canvas = "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J";
+const enter_canvas = "\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?25l\x1b[H\x1b[2J";
 const leave_canvas = restore_terminal_sequence ++ "\x1b[?1049l";
+const scrollbar_track = "│";
+const scrollbar_thumb = "█";
 
 extern "c" fn cfmakeraw(termios_p: *posix.termios) void;
 
@@ -87,6 +97,18 @@ const RenderScheduler = struct {
 
     fn noteBulk(self: *RenderScheduler, now_ns: i128) void {
         self.bulk_until_ns = now_ns + bulk_sticky_window_ns;
+    }
+
+    fn dirtyKindForDamage(self: *RenderScheduler, now_ns: i128, stats: DrainStats) DirtyKind {
+        const recent_input = self.recentlyInput(now_ns);
+        const interactive_damage = recent_input and
+            !stats.saturated and
+            stats.bytes < bulk_damage_bytes;
+        if (stats.bulkish() and !interactive_damage) self.noteBulk(now_ns);
+        if (interactive_damage) return .urgent;
+        if (stats.bulkish() or self.bulkActive(now_ns)) return .bulk;
+        if (recent_input) return .urgent;
+        return .normal;
     }
 
     fn bulkActive(self: *const RenderScheduler, now_ns: i128) bool {
@@ -153,8 +175,13 @@ const DrainStats = struct {
 
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const alloc = debug_allocator.allocator();
+    defer {
+        if (builtin.mode == .Debug) _ = debug_allocator.deinit();
+    }
+    const alloc = if (builtin.mode == .Debug)
+        debug_allocator.allocator()
+    else
+        std.heap.smp_allocator;
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
@@ -703,6 +730,18 @@ const Layout = struct {
     fn splitTop(self: Layout) u16 {
         return if (self.border_row) |row| row + 1 else self.rows;
     }
+
+    fn scrollbarVisible(self: Layout) bool {
+        return self.split_visible and self.cols > 1;
+    }
+
+    fn paneCols(self: Layout) u16 {
+        return if (self.scrollbarVisible()) self.cols - 1 else self.cols;
+    }
+
+    fn scrollbarCol(self: Layout) ?u16 {
+        return if (self.scrollbarVisible()) self.cols else null;
+    }
 };
 
 const PendingScrollUp = struct {
@@ -784,6 +823,68 @@ fn sameGridSize(a: ptypkg.Winsize, b: ptypkg.Winsize) bool {
     return a.row == b.row and a.col == b.col;
 }
 
+fn plainAsciiEligible(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        switch (byte) {
+            '\r', '\n', 0x20...0x7e => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+const PlainCursorState = struct {
+    col: u16 = 0,
+    pending_wrap: bool = false,
+};
+
+fn plainPassthroughEndState(bytes: []const u8, pane_cols: u16, start: PlainCursorState) ?PlainCursorState {
+    if (pane_cols == 0) return null;
+    var state = start;
+    for (bytes) |byte| {
+        switch (byte) {
+            0x20...0x7e => {
+                if (state.pending_wrap) {
+                    state.col = 0;
+                    state.pending_wrap = false;
+                }
+                if (state.col >= pane_cols) return null;
+                if (state.col == pane_cols - 1) {
+                    state.pending_wrap = true;
+                } else {
+                    state.col += 1;
+                }
+            },
+            '\r' => {
+                state.col = 0;
+                state.pending_wrap = false;
+            },
+            '\n' => {
+                state.pending_wrap = false;
+            },
+            else => return null,
+        }
+    }
+    return state;
+}
+
+fn terminalCursorWillScrollUp(term: *const vt.Terminal) bool {
+    const cursor = term.screens.active.cursor;
+    return cursor.y == term.scrolling_region.bottom and
+        cursor.x >= term.scrolling_region.left and
+        cursor.x <= term.scrolling_region.right;
+}
+
+fn cloneEnvMap(alloc: std.mem.Allocator, source: *const std.process.EnvMap) !std.process.EnvMap {
+    var env = std.process.EnvMap.init(alloc);
+    errdefer env.deinit();
+    var it = source.iterator();
+    while (it.next()) |entry| {
+        try env.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return env;
+}
+
 const Pane = struct {
     alloc: std.mem.Allocator,
     pty_fd: posix.fd_t,
@@ -793,6 +894,7 @@ const Pane = struct {
     command_title: []const u8,
     passthrough: bool = false,
     feeding_discarded: bool = false,
+    ascii_fast_feed_enabled: bool = true,
     cell_size: CellSize,
     term: vt.Terminal,
     stream: Stream,
@@ -981,7 +1083,43 @@ const Pane = struct {
     }
 
     fn feed(self: *Pane, bytes: []const u8) void {
+        if (self.ascii_fast_feed_enabled) {
+            if (plainAsciiEligible(bytes)) {
+                if (self.feedPlainAscii(bytes)) return;
+                self.ascii_fast_feed_enabled = false;
+                return;
+            } else {
+                self.ascii_fast_feed_enabled = false;
+            }
+        }
         self.stream.nextSlice(bytes);
+    }
+
+    fn feedPlainAscii(self: *Pane, bytes: []const u8) bool {
+        var start: usize = 0;
+        for (bytes, 0..) |byte, i| {
+            switch (byte) {
+                '\r', '\n' => {
+                    if (start < i) self.term.printString(bytes[start..i]) catch return false;
+                    if (byte == '\r') {
+                        self.term.carriageReturn();
+                    } else {
+                        if (terminalCursorWillScrollUp(&self.term)) {
+                            self.noteScrollUp(.{
+                                .top = self.term.scrolling_region.top,
+                                .bottom = self.term.scrolling_region.bottom,
+                                .count = 1,
+                            });
+                        }
+                        self.term.linefeed() catch return false;
+                    }
+                    start = i + 1;
+                },
+                else => {},
+            }
+        }
+        if (start < bytes.len) self.term.printString(bytes[start..]) catch return false;
+        return true;
     }
 
     fn noteScrollUp(self: *Pane, scroll: PendingScrollUp) void {
@@ -1056,19 +1194,21 @@ const Pane = struct {
         if (self.reaped) return;
 
         posix.kill(self.child_pid, posix.SIG.HUP) catch {};
-        for (0..10) |_| {
-            if (self.reap(posix.W.NOHANG)) return;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-        }
+        if (self.waitForExit(termination_grace_polls, termination_poll_ns)) return;
 
         posix.kill(self.child_pid, posix.SIG.TERM) catch {};
-        for (0..10) |_| {
-            if (self.reap(posix.W.NOHANG)) return;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-        }
+        if (self.waitForExit(termination_grace_polls, termination_poll_ns)) return;
 
         posix.kill(self.child_pid, posix.SIG.KILL) catch {};
         _ = self.reap(0);
+    }
+
+    fn waitForExit(self: *Pane, polls: usize, sleep_ns: u64) bool {
+        for (0..polls) |_| {
+            if (self.reap(posix.W.NOHANG)) return true;
+            std.Thread.sleep(sleep_ns);
+        }
+        return false;
     }
 
     fn reap(self: *Pane, options: u32) bool {
@@ -1516,6 +1656,11 @@ fn placementRequest(
     origin_row: u16,
     placement_id: u32,
 ) ?PlacementRequest {
+    switch (placement.location) {
+        .pin => |pin| if (pin.garbage) return null,
+        .virtual => return null,
+    }
+
     const rect = placement.rect(image, &pane.term) orelse return null;
     const rect_tl = (pane.term.screens.active.pages.pointFromPin(.screen, rect.top_left) orelse return null).screen;
     const pixel_size = placement.pixelSize(image, &pane.term);
@@ -1859,7 +2004,7 @@ const Compositor = struct {
             try self.main_rows.appendRow(self.alloc, &main_pane.term, y, self.full_render, out);
         } else if (layout.border_row != null and y == layout.border_row.?) {
             try out.appendSlice(self.alloc, style_dim);
-            for (0..layout.cols) |_| try out.appendSlice(self.alloc, "─");
+            for (0..layout.paneCols()) |_| try out.appendSlice(self.alloc, "─");
             try out.appendSlice(self.alloc, sgr_reset);
         } else if (split_pane) |pane| {
             const split_y = y - layout.splitTop();
@@ -1867,15 +2012,70 @@ const Compositor = struct {
                 try self.split_rows.appendRow(self.alloc, &pane.term, split_y, self.full_render, out);
             }
         }
+        try self.appendScrollbarCell(layout, main_pane, split_pane, y, out);
         try out.appendSlice(self.alloc, sgr_reset);
+    }
+
+    fn appendScrollbarCell(
+        self: *Compositor,
+        layout: Layout,
+        main_pane: *Pane,
+        split_pane: ?*Pane,
+        y: u16,
+        out: *std.ArrayList(u8),
+    ) !void {
+        const col = layout.scrollbarCol() orelse return;
+        const cell = scrollbarCell(layout, main_pane, split_pane, y) orelse return;
+        try out.print(self.alloc, "\x1b[{d};{d}H", .{ y + 1, col });
+        switch (cell) {
+            .track => {
+                try out.appendSlice(self.alloc, style_dim);
+                try out.appendSlice(self.alloc, scrollbar_track);
+            },
+            .thumb => {
+                try out.appendSlice(self.alloc, sgr_reset);
+                try out.appendSlice(self.alloc, scrollbar_thumb);
+            },
+        }
     }
 };
 
+const ScrollbarCell = enum { track, thumb };
+
+fn scrollbarCell(layout: Layout, main_pane: *Pane, split_pane: ?*Pane, y: u16) ?ScrollbarCell {
+    if (!layout.scrollbarVisible()) return null;
+
+    if (y < layout.main_rows) {
+        return paneScrollbarCell(main_pane, y, layout.main_rows);
+    }
+    if (layout.border_row != null and y == layout.border_row.?) return .track;
+    if (split_pane) |pane| {
+        if (y >= layout.splitTop()) {
+            const split_y = y - layout.splitTop();
+            if (split_y < layout.split_rows) return paneScrollbarCell(pane, split_y, layout.split_rows);
+        }
+    }
+    return null;
+}
+
+fn paneScrollbarCell(pane: *Pane, y: u16, track_len: u16) ScrollbarCell {
+    const info = scrollbarInfo(pane, track_len) orelse return .track;
+    return if (y >= info.thumb_start and y < info.thumb_start + info.thumb_len) .thumb else .track;
+}
+
 fn writeComposedCursor(writer: *std.Io.Writer, layout: Layout, pane: *Pane) !void {
+    const screen = pane.term.screens.active;
     const cursor = &pane.term.screens.active.cursor;
-    const row = @min(@as(u16, @intCast(cursor.y)), layout.main_rows - 1);
-    const col = @min(@as(u16, @intCast(cursor.x)), layout.cols - 1);
-    try writePaneCursorState(writer, &pane.term, row, col);
+    const point = screen.pages.pointFromPin(.viewport, cursor.page_pin.*) orelse {
+        try writeHiddenCursorState(writer, &pane.term);
+        return;
+    };
+    const viewport = point.viewport;
+    if (viewport.y >= layout.main_rows or viewport.x >= layout.paneCols()) {
+        try writeHiddenCursorState(writer, &pane.term);
+        return;
+    }
+    try writePaneCursorState(writer, &pane.term, viewport.y, viewport.x);
 }
 
 fn writePaneCursorState(writer: *std.Io.Writer, term: *const vt.Terminal, row: usize, col: usize) !void {
@@ -1883,6 +2083,12 @@ fn writePaneCursorState(writer: *std.Io.Writer, term: *const vt.Terminal, row: u
     try writeCursorStyle(writer, cursor.cursor_style, term.modes.get(.cursor_blinking));
     try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
     try writer.writeAll(if (term.modes.get(.cursor_visible)) "\x1b[?25h" else "\x1b[?25l");
+}
+
+fn writeHiddenCursorState(writer: *std.Io.Writer, term: *const vt.Terminal) !void {
+    const cursor = &term.screens.active.cursor;
+    try writeCursorStyle(writer, cursor.cursor_style, term.modes.get(.cursor_blinking));
+    try writer.writeAll("\x1b[?25l");
 }
 
 fn writeCursorStyle(writer: *std.Io.Writer, style: vt.Screen.CursorStyle, blinking: bool) !void {
@@ -2030,6 +2236,218 @@ const PrefixResult = struct {
     }
 };
 
+const mouse_modifier_mask: u16 = 4 | 8 | 16;
+const mouse_motion_mask: u16 = 32;
+
+const WheelAction = enum { up, down, left, right };
+
+const SgrMouseEvent = struct {
+    cb: u16,
+    x: u16,
+    y: u16,
+    final: u8,
+    len: usize,
+
+    fn baseButton(self: SgrMouseEvent) u16 {
+        return self.cb & ~(mouse_modifier_mask | mouse_motion_mask);
+    }
+
+    fn isRelease(self: SgrMouseEvent) bool {
+        return self.final == 'm';
+    }
+
+    fn isMotion(self: SgrMouseEvent) bool {
+        return self.final == 'M' and (self.cb & mouse_motion_mask) != 0;
+    }
+
+    fn isPrimaryPress(self: SgrMouseEvent) bool {
+        return self.final == 'M' and !self.isMotion() and self.baseButton() == 0;
+    }
+
+    fn wheelAction(self: SgrMouseEvent) ?WheelAction {
+        return switch (self.baseButton()) {
+            64 => .up,
+            65 => .down,
+            66 => .left,
+            67 => .right,
+            else => null,
+        };
+    }
+};
+
+const SgrMouseParseResult = union(enum) {
+    none,
+    incomplete,
+    event: SgrMouseEvent,
+};
+
+fn parseSgrMouse(input: []const u8) SgrMouseParseResult {
+    const prefix = "\x1b[<";
+    if (input.len == 0) return .none;
+    if (input.len < prefix.len) return .none;
+    if (!std.mem.eql(u8, input[0..prefix.len], prefix)) return .none;
+    if (input.len > max_sgr_mouse_sequence) return .none;
+
+    var i: usize = prefix.len;
+    const cb = parseSgrMouseNumber(input, &i) orelse return if (i == input.len) .incomplete else .none;
+    if (i >= input.len) return .incomplete;
+    if (input[i] != ';') return .none;
+    i += 1;
+
+    const x = parseSgrMouseNumber(input, &i) orelse return if (i == input.len) .incomplete else .none;
+    if (i >= input.len) return .incomplete;
+    if (input[i] != ';') return .none;
+    i += 1;
+
+    const y = parseSgrMouseNumber(input, &i) orelse return if (i == input.len) .incomplete else .none;
+    if (i >= input.len) return .incomplete;
+    const final = input[i];
+    if (final != 'M' and final != 'm') return .none;
+
+    return .{ .event = .{
+        .cb = cb,
+        .x = x,
+        .y = y,
+        .final = final,
+        .len = i + 1,
+    } };
+}
+
+fn parseSgrMouseNumber(input: []const u8, index: *usize) ?u16 {
+    const start = index.*;
+    var value: u32 = 0;
+    while (index.* < input.len and std.ascii.isDigit(input[index.*])) : (index.* += 1) {
+        value = value * 10 + (input[index.*] - '0');
+        if (value > std.math.maxInt(u16)) return null;
+    }
+    if (index.* == start) return null;
+    return @intCast(value);
+}
+
+const MousePaneHit = struct {
+    pane: PaneId,
+    x: u16,
+    y: u16,
+};
+
+const ScrollbarHit = struct {
+    pane: PaneId,
+    y: u16,
+    track_len: u16,
+};
+
+const MouseHit = union(enum) {
+    pane: MousePaneHit,
+    scrollbar: ScrollbarHit,
+    border,
+    outside,
+};
+
+fn hitTestMouse(layout: Layout, split_available: bool, x: u16, y: u16) MouseHit {
+    if (x < 1 or y < 1 or x > layout.cols or y > layout.rows) return .outside;
+    const pane_cols = layout.paneCols();
+    if (y <= layout.main_rows) {
+        if (layout.scrollbarCol()) |col| {
+            if (x == col) return .{ .scrollbar = .{ .pane = .main, .y = y, .track_len = layout.main_rows } };
+        }
+        if (x <= pane_cols) return .{ .pane = .{ .pane = .main, .x = x, .y = y } };
+        return .outside;
+    }
+    if (layout.border_row) |border_row| {
+        if (y == border_row + 1) return .border;
+    }
+    if (layout.split_visible and split_available and y > layout.splitTop()) {
+        const local_y = y - layout.splitTop();
+        if (local_y >= 1 and local_y <= layout.split_rows) {
+            if (layout.scrollbarCol()) |col| {
+                if (x == col) return .{ .scrollbar = .{ .pane = .split, .y = local_y, .track_len = layout.split_rows } };
+            }
+            if (x <= pane_cols) return .{ .pane = .{ .pane = .split, .x = x, .y = local_y } };
+            return .outside;
+        }
+    }
+    return .outside;
+}
+
+const ScrollbarInfo = struct {
+    total: usize,
+    offset: usize,
+    len: usize,
+    track_len: u16,
+    thumb_start: u16,
+    thumb_len: u16,
+    max_offset: usize,
+    max_thumb_start: u16,
+};
+
+fn scrollbarInfo(pane: *Pane, track_len: u16) ?ScrollbarInfo {
+    if (track_len == 0) return null;
+    const scrollbar = pane.term.screens.active.pages.scrollbar();
+    if (scrollbar.total == 0 or scrollbar.len == 0) return null;
+
+    const total = @max(scrollbar.total, scrollbar.len);
+    const len = @min(scrollbar.len, total);
+    const max_offset = total - len;
+    const track: usize = @intCast(track_len);
+    const thumb_raw = @max(@divTrunc(track * len, total), 1);
+    const thumb_len: u16 = @intCast(@min(thumb_raw, track));
+    const max_thumb_start = track_len - thumb_len;
+    const thumb_start: u16 = if (max_offset == 0 or max_thumb_start == 0)
+        0
+    else
+        @intCast(@min(@divTrunc(scrollbar.offset * @as(usize, @intCast(max_thumb_start)), max_offset), @as(usize, @intCast(max_thumb_start))));
+
+    return .{
+        .total = total,
+        .offset = @min(scrollbar.offset, max_offset),
+        .len = len,
+        .track_len = track_len,
+        .thumb_start = thumb_start,
+        .thumb_len = thumb_len,
+        .max_offset = max_offset,
+        .max_thumb_start = max_thumb_start,
+    };
+}
+
+fn scrollbarTargetOffset(info: ScrollbarInfo, local_y: u16, grab_offset: u16) usize {
+    if (info.max_offset == 0 or info.max_thumb_start == 0) return 0;
+    const bounded_y = @min(@max(local_y, 1), info.track_len);
+    const local0: usize = @as(usize, @intCast(bounded_y)) - 1;
+    const grab = @min(@as(usize, @intCast(grab_offset)), local0);
+    const desired = @min(local0 - grab, @as(usize, @intCast(info.max_thumb_start)));
+    return @divTrunc(desired * info.max_offset + @divTrunc(@as(usize, @intCast(info.max_thumb_start)), 2), @as(usize, @intCast(info.max_thumb_start)));
+}
+
+fn encodeMouseForPane(writer: *std.Io.Writer, pane: *const Pane, event: SgrMouseEvent, x: u16, y: u16) !void {
+    switch (pane.term.flags.mouse_format) {
+        .x10 => try encodeX10Mouse(writer, event, x, y),
+        .urxvt => try writer.print("\x1b[{d};{d};{d}M", .{ 32 + event.cb, x, y }),
+        .utf8, .sgr, .sgr_pixels => try encodeSgrMouse(writer, event, x, y),
+    }
+}
+
+fn encodeSgrMouse(writer: *std.Io.Writer, event: SgrMouseEvent, x: u16, y: u16) !void {
+    try writer.print("\x1b[<{d};{d};{d}{c}", .{ event.cb, x, y, event.final });
+}
+
+fn encodeX10Mouse(writer: *std.Io.Writer, event: SgrMouseEvent, x: u16, y: u16) !void {
+    const cb: u16 = if (event.final == 'm') 3 else event.cb;
+    if (cb > 223 or x > 223 or y > 223) {
+        return encodeSgrMouse(writer, event, x, y);
+    }
+    try writer.writeAll("\x1b[M");
+    try writer.writeByte(32 + @as(u8, @intCast(cb)));
+    try writer.writeByte(32 + @as(u8, @intCast(x)));
+    try writer.writeByte(32 + @as(u8, @intCast(y)));
+}
+
+const ScrollbarDrag = struct {
+    pane: PaneId,
+    track_top: u16,
+    track_len: u16,
+    grab_offset: u16,
+};
+
 const App = struct {
     alloc: std.mem.Allocator,
     config: Config,
@@ -2041,6 +2459,12 @@ const App = struct {
     compositor: Compositor,
     render_scheduler: RenderScheduler = .{},
     prefix: PrefixParser = .{},
+    input_buffer: std.ArrayList(u8) = .empty,
+    deferred_main_state: std.ArrayList(u8) = .empty,
+    direct_main_painted_bytes: usize = 0,
+    main_passthrough_cursor: PlainCursorState = .{},
+    main_passthrough_outer_active: bool = false,
+    scrollbar_drag: ?ScrollbarDrag = null,
     composed: bool,
     last_size: ptypkg.Winsize,
     active_split_rows: u16,
@@ -2077,7 +2501,7 @@ const App = struct {
             config.main_argv,
             &main_env,
             layout.main_rows,
-            layout.cols,
+            layout.paneCols(),
             cell_size,
             cwd,
         );
@@ -2085,10 +2509,10 @@ const App = struct {
 
         var split_pane: ?*Pane = null;
         if (config.split_cmd) |cmd| {
-            var split_env = try std.process.getEnvMap(alloc);
+            var split_env = try cloneEnvMap(alloc, &main_env);
             defer split_env.deinit();
             try split_env.put("TERM", selectTerm(config.split_term, outer_term, colorterm));
-            try applyTinymuxEnv(alloc, &split_env, if (tmux_runtime) |*runtime| runtime else null, "%1");
+            if (tmux_runtime != null) try split_env.put("TMUX_PANE", "%1");
             const shell = posix.getenv("SHELL") orelse "/bin/sh";
             const split_argv = [_][]const u8{ shell, "-lc", cmd };
             split_pane = try Pane.create(
@@ -2096,7 +2520,7 @@ const App = struct {
                 &split_argv,
                 &split_env,
                 @max(layout.split_rows, 1),
-                layout.cols,
+                layout.paneCols(),
                 cell_size,
                 cwd,
             );
@@ -2129,6 +2553,8 @@ const App = struct {
         self.clearSplitReplayAnchor();
         if (self.split_pane) |pane| pane.destroy();
         self.main_pane.destroy();
+        self.input_buffer.deinit(self.alloc);
+        self.deferred_main_state.deinit(self.alloc);
         self.compositor.deinit();
         if (self.tmux_runtime) |*runtime| runtime.deinit(self.alloc);
     }
@@ -2138,8 +2564,8 @@ const App = struct {
         if (self.composed) {
             try self.recordSplitReplayAnchor();
             try protocol.writeAll(stdout_fd, enter_canvas);
+            try self.writeInitialComposedCanvas();
             self.compositor.invalidate();
-            self.render_scheduler.markDirty(.urgent);
         }
 
         var running = true;
@@ -2201,6 +2627,7 @@ const App = struct {
             }
 
             var pane_stats: DrainStats = .{};
+            self.direct_main_painted_bytes = 0;
             if (main_index) |index| {
                 if (fds_storage[index].revents != 0) {
                     pane_stats.record(try self.readPane(self.main_pane, .main));
@@ -2218,16 +2645,18 @@ const App = struct {
                 const drain_now = std.time.nanoTimestamp();
                 pane_stats.merge(try self.drainReadyPanes(self.render_scheduler.ptyDrainBudget(drain_now, pane_stats)));
                 if (self.composed) {
-                    const damage_now = std.time.nanoTimestamp();
-                    if (pane_stats.bulkish()) self.render_scheduler.noteBulk(damage_now);
-                    const kind: RenderScheduler.DirtyKind = if (pane_stats.bulkish() or
-                        self.render_scheduler.bulkActive(damage_now))
-                        .bulk
-                    else if (self.render_scheduler.recentlyInput(damage_now))
-                        .urgent
-                    else
-                        .normal;
-                    self.render_scheduler.markDirty(kind);
+                    var model_stats = pane_stats;
+                    model_stats.bytes -|= self.direct_main_painted_bytes;
+                    if (model_stats.bytes == 0 and self.direct_main_painted_bytes >= pane_stats.bytes) {
+                        model_stats.saturated = false;
+                        model_stats.reads = 0;
+                    }
+                    if (model_stats.bytes > 0 or model_stats.saturated) {
+                        if (self.direct_main_painted_bytes > 0) model_stats.reads = 1;
+                        const damage_now = std.time.nanoTimestamp();
+                        const kind = self.render_scheduler.dirtyKindForDamage(damage_now, model_stats);
+                        self.render_scheduler.markDirty(kind);
+                    }
                 }
             }
             try self.closeAutoSplitIfExited();
@@ -2242,6 +2671,8 @@ const App = struct {
         if (!self.composed) return;
         const render_now = std.time.nanoTimestamp();
         if (!self.render_scheduler.shouldRender(render_now)) return;
+        try self.endComposedMainPassthrough();
+        self.flushDeferredMainState();
         try self.compositor.render(self.layout, self.main_pane, self.split_pane);
         self.render_scheduler.rendered(std.time.nanoTimestamp());
     }
@@ -2266,9 +2697,36 @@ const App = struct {
     fn restoreOuterTerminal(self: *App) void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.alloc);
+        self.endComposedMainPassthrough() catch {};
         self.compositor.graphics.deleteAll(self.alloc, &out) catch {};
         out.appendSlice(self.alloc, leave_canvas) catch {};
         protocol.writeAll(stdout_fd, out.items) catch {};
+    }
+
+    fn writeInitialComposedCanvas(self: *App) !void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.alloc);
+        try out.appendSlice(self.alloc, synchronized_update_begin);
+        try out.appendSlice(self.alloc, "\x1b[?25l");
+        if (self.layout.border_row) |border| {
+            try out.print(self.alloc, "\x1b[{d};1H{s}", .{ border + 1, style_dim });
+            for (0..self.layout.paneCols()) |_| try out.appendSlice(self.alloc, "─");
+            try out.appendSlice(self.alloc, sgr_reset);
+        }
+        if (self.layout.scrollbarCol()) |col| {
+            try out.appendSlice(self.alloc, style_dim);
+            for (0..self.layout.rows) |row| {
+                try out.print(self.alloc, "\x1b[{d};{d}H{s}", .{ row + 1, col, scrollbar_track });
+            }
+            try out.appendSlice(self.alloc, sgr_reset);
+        }
+        {
+            var aw: std.Io.Writer.Allocating = .fromArrayList(self.alloc, &out);
+            defer out = aw.toArrayList();
+            try writeComposedCursor(&aw.writer, self.layout, self.main_pane);
+        }
+        try out.appendSlice(self.alloc, synchronized_update_end);
+        try protocol.writeAll(stdout_fd, out.items);
     }
 
     fn readInput(self: *App, running: *bool) !bool {
@@ -2284,12 +2742,74 @@ const App = struct {
             running.* = false;
             return false;
         }
-        const parse_prefix = self.composed or self.config.split_cmd != null;
-        if (!parse_prefix) {
-            try self.main_pane.writeInput(buf[0..n]);
+
+        if (!self.composed) {
+            try self.forwardKeyboardInput(buf[0..n]);
             return true;
         }
-        var result = try self.prefix.feed(self.alloc, buf[0..n]);
+
+        try self.input_buffer.appendSlice(self.alloc, buf[0..n]);
+        try self.processComposedInputBuffer();
+        return true;
+    }
+
+    fn processComposedInputBuffer(self: *App) !void {
+        var forward_start: usize = 0;
+        var cursor: usize = 0;
+        var retain_start: ?usize = null;
+        const bytes = self.input_buffer.items;
+
+        while (cursor < bytes.len) {
+            if (bytes[cursor] != 0x1b) {
+                cursor += 1;
+                continue;
+            }
+
+            switch (parseSgrMouse(bytes[cursor..])) {
+                .none => cursor += 1,
+                .incomplete => {
+                    if (forward_start < cursor) try self.forwardKeyboardInput(bytes[forward_start..cursor]);
+                    if (!self.composed) {
+                        if (cursor < bytes.len) try self.forwardKeyboardInput(bytes[cursor..]);
+                        self.input_buffer.clearRetainingCapacity();
+                        return;
+                    }
+                    retain_start = cursor;
+                    break;
+                },
+                .event => |event| {
+                    if (forward_start < cursor) try self.forwardKeyboardInput(bytes[forward_start..cursor]);
+                    if (!self.composed) {
+                        try self.forwardKeyboardInput(bytes[cursor..]);
+                        self.input_buffer.clearRetainingCapacity();
+                        return;
+                    }
+
+                    try self.handleSgrMouse(event);
+                    cursor += event.len;
+                    forward_start = cursor;
+                },
+            }
+        }
+
+        if (retain_start) |start| {
+            const remaining = bytes[start..];
+            std.mem.copyForwards(u8, self.input_buffer.items[0..remaining.len], remaining);
+            self.input_buffer.shrinkRetainingCapacity(remaining.len);
+            return;
+        }
+
+        if (forward_start < bytes.len) try self.forwardKeyboardInput(bytes[forward_start..]);
+        self.input_buffer.clearRetainingCapacity();
+    }
+
+    fn forwardKeyboardInput(self: *App, bytes: []const u8) !void {
+        const parse_prefix = self.composed or self.config.split_cmd != null;
+        if (!parse_prefix) {
+            try self.main_pane.writeInput(bytes);
+            return;
+        }
+        var result = try self.prefix.feed(self.alloc, bytes);
         defer result.deinit(self.alloc);
         if (result.forwarded.items.len > 0) {
             try self.main_pane.writeInput(result.forwarded.items);
@@ -2308,7 +2828,123 @@ const App = struct {
                 try self.main_pane.writeInput(&.{ 0x02, 's' });
             }
         }
-        return true;
+    }
+
+    fn handleSgrMouse(self: *App, event: SgrMouseEvent) !void {
+        if (self.scrollbar_drag) |drag| {
+            if (event.isRelease()) {
+                self.scrollbar_drag = null;
+                return;
+            }
+            if (event.isMotion()) {
+                try self.dragScrollbar(drag, event.y);
+                return;
+            }
+            return;
+        }
+
+        const hit = hitTestMouse(self.layout, self.split_pane != null, event.x, event.y);
+        switch (hit) {
+            .outside, .border => return,
+            .scrollbar => |scrollbar_hit| {
+                const pane = self.paneForId(scrollbar_hit.pane) orelse return;
+                if (event.wheelAction()) |wheel| {
+                    switch (wheel) {
+                        .up => self.scrollPaneViewport(pane, -wheel_scroll_rows),
+                        .down => self.scrollPaneViewport(pane, wheel_scroll_rows),
+                        .left, .right => {},
+                    }
+                    return;
+                }
+                if (event.isPrimaryPress()) {
+                    try self.startScrollbarDrag(scrollbar_hit, event.y);
+                    return;
+                }
+                if (event.isRelease()) self.scrollbar_drag = null;
+            },
+            .pane => |pane_hit| {
+                const pane = self.paneForId(pane_hit.pane) orelse return;
+
+                if (pane.term.flags.mouse_event != .none) {
+                    var buf: [64]u8 = undefined;
+                    var writer = std.Io.Writer.fixed(&buf);
+                    try encodeMouseForPane(&writer, pane, event, pane_hit.x, pane_hit.y);
+                    try pane.writeInput(writer.buffered());
+                    return;
+                }
+
+                const delta: isize = switch (event.wheelAction() orelse return) {
+                    .up => -wheel_scroll_rows,
+                    .down => wheel_scroll_rows,
+                    .left, .right => return,
+                };
+                self.scrollPaneViewport(pane, delta);
+            },
+        }
+    }
+
+    fn paneForId(self: *App, pane: PaneId) ?*Pane {
+        return switch (pane) {
+            .main => self.main_pane,
+            .split => self.split_pane,
+        };
+    }
+
+    fn scrollbarTrackTop(self: *const App, pane: PaneId) u16 {
+        return switch (pane) {
+            .main => 1,
+            .split => self.layout.splitTop() + 1,
+        };
+    }
+
+    fn scrollPaneViewport(self: *App, pane: *Pane, delta: isize) void {
+        self.endComposedMainPassthrough() catch {};
+        if (pane == self.main_pane) self.flushDeferredMainState();
+        pane.term.scrollViewport(.{ .delta = delta });
+        self.compositor.invalidate();
+        self.render_scheduler.markDirty(.urgent);
+    }
+
+    fn startScrollbarDrag(self: *App, hit: ScrollbarHit, absolute_y: u16) !void {
+        const pane = self.paneForId(hit.pane) orelse return;
+        try self.endComposedMainPassthrough();
+        if (pane == self.main_pane) self.flushDeferredMainState();
+        const info = scrollbarInfo(pane, hit.track_len) orelse return;
+        const local0 = @as(u16, hit.y - 1);
+        const thumb_end = info.thumb_start + info.thumb_len;
+        const grab_offset: u16 = if (local0 >= info.thumb_start and local0 < thumb_end)
+            local0 - info.thumb_start
+        else
+            @min(info.thumb_len / 2, info.thumb_len - 1);
+        const drag: ScrollbarDrag = .{
+            .pane = hit.pane,
+            .track_top = self.scrollbarTrackTop(hit.pane),
+            .track_len = hit.track_len,
+            .grab_offset = grab_offset,
+        };
+        self.scrollbar_drag = drag;
+        try self.dragScrollbar(drag, absolute_y);
+    }
+
+    fn dragScrollbar(self: *App, drag: ScrollbarDrag, absolute_y: u16) !void {
+        if (drag.track_len == 0) return;
+        const pane = self.paneForId(drag.pane) orelse return;
+        try self.endComposedMainPassthrough();
+        if (pane == self.main_pane) self.flushDeferredMainState();
+        const info = scrollbarInfo(pane, drag.track_len) orelse return;
+        const track_top: usize = @intCast(drag.track_top);
+        const track_bottom: usize = track_top + @as(usize, @intCast(drag.track_len)) - 1;
+        const absolute: usize = @intCast(absolute_y);
+        const local_y: u16 = if (absolute <= track_top)
+            1
+        else if (absolute >= track_bottom)
+            drag.track_len
+        else
+            @intCast(absolute - track_top + 1);
+        const target = scrollbarTargetOffset(info, local_y, drag.grab_offset);
+        pane.term.screens.active.scroll(.{ .row = target });
+        self.compositor.invalidate();
+        self.render_scheduler.markDirty(.urgent);
     }
 
     const WhichPane = enum { main, split };
@@ -2330,11 +2966,99 @@ const App = struct {
         const bytes = buf[0..n];
         if (!self.composed and which == .main) {
             try protocol.writeAll(stdout_fd, bytes);
+            if (self.rawModeNeedsPaneState()) try self.deferMainState(bytes);
+        } else if (self.composed and which == .main) {
+            if (try self.tryComposedMainPassthrough(bytes)) return n;
+            try self.endComposedMainPassthrough();
+            self.flushDeferredMainState();
             pane.feed(bytes);
+            self.syncMainPassthroughCursor();
         } else {
             pane.feed(bytes);
         }
         return n;
+    }
+
+    fn rawModeNeedsPaneState(self: *const App) bool {
+        return self.config.split_cmd != null or self.tmux_runtime != null;
+    }
+
+    fn deferMainState(self: *App, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        var required = self.deferred_main_state.items.len + bytes.len;
+        if (required > deferred_raw_state_limit) {
+            self.flushDeferredMainState();
+            required = bytes.len;
+        }
+        if (bytes.len > deferred_raw_state_limit) {
+            self.main_pane.feed(bytes);
+            return;
+        }
+        if (bytes.len >= deferred_raw_bulk_prealloc_trigger and self.deferred_main_state.capacity < required) {
+            try self.deferred_main_state.ensureTotalCapacity(
+                self.alloc,
+                @min(deferred_raw_state_limit, @max(required, deferred_raw_bulk_prealloc_bytes)),
+            );
+        }
+        try self.deferred_main_state.appendSlice(self.alloc, bytes);
+    }
+
+    fn flushDeferredMainState(self: *App) void {
+        if (self.deferred_main_state.items.len == 0) return;
+        self.main_pane.feed(self.deferred_main_state.items);
+        self.deferred_main_state.clearRetainingCapacity();
+        self.syncMainPassthroughCursor();
+    }
+
+    fn tryComposedMainPassthrough(self: *App, bytes: []const u8) !bool {
+        if (!self.main_pane.ascii_fast_feed_enabled) return false;
+        if (!self.mainPaneLiveBottom()) return false;
+        if (self.compositor.graphics.uploaded.count() != 0) return false;
+        if (self.compositor.graphics.needsUpdate(self.main_pane, self.split_pane)) return false;
+
+        if (!self.main_passthrough_outer_active and self.deferred_main_state.items.len == 0) {
+            self.syncMainPassthroughCursor();
+        }
+        const cursor = plainPassthroughEndState(bytes, self.layout.paneCols(), self.main_passthrough_cursor) orelse return false;
+        try self.writeComposedMainPassthrough(bytes);
+        try self.deferMainState(bytes);
+        self.main_passthrough_cursor = cursor;
+        self.direct_main_painted_bytes += bytes.len;
+        return true;
+    }
+
+    fn syncMainPassthroughCursor(self: *App) void {
+        const cursor = self.main_pane.term.screens.active.cursor;
+        self.main_passthrough_cursor = .{
+            .col = @intCast(@min(cursor.x, std.math.maxInt(u16))),
+            .pending_wrap = cursor.pending_wrap,
+        };
+    }
+
+    fn mainPaneLiveBottom(self: *App) bool {
+        const info = scrollbarInfo(self.main_pane, self.layout.main_rows) orelse return true;
+        return info.offset == info.max_offset;
+    }
+
+    fn writeComposedMainPassthrough(self: *App, bytes: []const u8) !void {
+        if (self.layout.main_rows == 0) return;
+        try self.beginComposedMainPassthrough();
+        try protocol.writeAll(stdout_fd, bytes);
+    }
+
+    fn beginComposedMainPassthrough(self: *App) !void {
+        if (self.main_passthrough_outer_active) return;
+        var buf: [96]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writer.print("\x1b[?69h\x1b[1;{d}r\x1b[1;{d}s", .{ self.layout.main_rows, self.layout.paneCols() });
+        try protocol.writeAll(stdout_fd, writer.buffered());
+        self.main_passthrough_outer_active = true;
+    }
+
+    fn endComposedMainPassthrough(self: *App) !void {
+        if (!self.main_passthrough_outer_active) return;
+        try protocol.writeAll(stdout_fd, "\x1b[r\x1b[s\x1b[?69l");
+        self.main_passthrough_outer_active = false;
     }
 
     fn drainReadyPanes(self: *App, budget_ns: i128) !DrainStats {
@@ -2465,7 +3189,7 @@ const App = struct {
             argv,
             env,
             @max(rows, 1),
-            self.layout.cols,
+            self.layout.paneCols(),
             self.cell_size,
             cwd,
         );
@@ -2485,11 +3209,9 @@ const App = struct {
 
     fn splitHistorySelection(self: *App) ?vt.Selection {
         const anchor = self.split_replay_anchor orelse return null;
-        if (anchor.garbage) return null;
-
         const pages = &self.main_pane.term.screens.active.pages;
         const bottom = pages.getBottomRight(.history) orelse return null;
-        var start = anchor.*;
+        var start = if (anchor.garbage) pages.getTopLeft(.history) else anchor.*;
         start.x = 0;
         if (!start.eql(bottom) and bottom.before(start)) return null;
         return vt.Selection.init(start, bottom, false);
@@ -2525,11 +3247,13 @@ const App = struct {
         if (self.split_pane != null) return error.SplitAlreadyOpen;
 
         try self.drainMainForSplitTransition();
+        self.flushDeferredMainState();
         try self.recordSplitReplayAnchor();
 
         self.active_split_rows = rows;
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, true, self.active_split_rows);
-        try self.main_pane.resize(self.layout.main_rows, self.layout.cols, self.cell_size);
+        self.scrollbar_drag = null;
+        try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
         const pane = try self.createSplitPaneFrom(argv, env, cwd, self.layout.split_rows);
         errdefer pane.destroy();
 
@@ -2548,7 +3272,9 @@ const App = struct {
         pane.destroy();
         self.split_pane = null;
         self.split_autoclose = false;
+        try self.endComposedMainPassthrough();
         try self.drainMainForRawTransition();
+        self.flushDeferredMainState();
         const history_replay = if (self.splitHistorySelection()) |selection|
             try self.main_pane.replayHistory(self.alloc, selection)
         else
@@ -2556,7 +3282,8 @@ const App = struct {
         defer if (history_replay) |bytes| self.alloc.free(bytes);
         self.clearSplitReplayAnchor();
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, false, self.active_split_rows);
-        try self.main_pane.resize(self.layout.main_rows, self.layout.cols, self.cell_size);
+        self.scrollbar_drag = null;
+        try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
         self.active_split_rows = self.config.split_rows;
         self.composed = false;
         self.main_pane.passthrough = true;
@@ -2565,11 +3292,11 @@ const App = struct {
         try self.compositor.graphics.deleteAll(self.alloc, &leave);
         try leave.appendSlice(self.alloc, leave_canvas);
         try protocol.writeAll(stdout_fd, leave.items);
-        try protocol.writeAll(stdout_fd, synchronized_update_begin);
         if (history_replay) |bytes| {
             try protocol.writeAll(stdout_fd, bytes);
             try self.flushReplayIntoParentScrollback();
         }
+        try protocol.writeAll(stdout_fd, synchronized_update_begin);
         const repaint = try self.main_pane.repaint(self.alloc);
         defer self.alloc.free(repaint);
         var raw_repaint: std.ArrayList(u8) = .empty;
@@ -2714,9 +3441,12 @@ const App = struct {
         self.last_size = size;
         self.cell_size = CellSize.fromWinsize(size);
         self.layout = Layout.compute(size.row, size.col, self.composed, self.active_split_rows);
-        try self.main_pane.resize(self.layout.main_rows, self.layout.cols, self.cell_size);
+        self.scrollbar_drag = null;
+        try self.endComposedMainPassthrough();
+        self.flushDeferredMainState();
+        try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
         if (self.split_pane) |pane| {
-            try pane.resize(@max(self.layout.split_rows, 1), self.layout.cols, self.cell_size);
+            try pane.resize(@max(self.layout.split_rows, 1), self.layout.paneCols(), self.cell_size);
         }
         self.compositor.invalidate();
         self.render_scheduler.markDirty(.bulk);
@@ -2813,14 +3543,74 @@ test "layout clamps split while preserving rows when possible" {
     try std.testing.expectEqual(@as(u16, 22), normal.main_rows);
     try std.testing.expectEqual(@as(u16, 9), normal.split_rows);
     try std.testing.expectEqual(@as(?u16, 22), normal.border_row);
+    try std.testing.expect(normal.scrollbarVisible());
+    try std.testing.expectEqual(@as(u16, 99), normal.paneCols());
+    try std.testing.expectEqual(@as(?u16, 100), normal.scrollbarCol());
 
     const tiny = Layout.compute(2, 80, true, 9);
     try std.testing.expect(!tiny.split_visible);
     try std.testing.expectEqual(@as(u16, 2), tiny.main_rows);
+    try std.testing.expect(!tiny.scrollbarVisible());
+    try std.testing.expectEqual(@as(u16, 80), tiny.paneCols());
 
     const clamped = Layout.compute(4, 80, true, 99);
     try std.testing.expectEqual(@as(u16, 1), clamped.main_rows);
     try std.testing.expectEqual(@as(u16, 2), clamped.split_rows);
+}
+
+test "mouse hit testing targets main border and split rows" {
+    const layout = Layout.compute(24, 80, true, 9);
+
+    switch (hitTestMouse(layout, true, 10, 5)) {
+        .pane => |hit| {
+            try std.testing.expectEqual(PaneId.main, hit.pane);
+            try std.testing.expectEqual(@as(u16, 10), hit.x);
+            try std.testing.expectEqual(@as(u16, 5), hit.y);
+        },
+        else => return error.ExpectedMainHit,
+    }
+
+    switch (hitTestMouse(layout, true, 80, 5)) {
+        .scrollbar => |hit| {
+            try std.testing.expectEqual(PaneId.main, hit.pane);
+            try std.testing.expectEqual(@as(u16, 5), hit.y);
+            try std.testing.expectEqual(@as(u16, 14), hit.track_len);
+        },
+        else => return error.ExpectedMainScrollbarHit,
+    }
+
+    switch (hitTestMouse(layout, true, 10, 15)) {
+        .border => {},
+        else => return error.ExpectedBorderHit,
+    }
+
+    switch (hitTestMouse(layout, true, 80, 15)) {
+        .border => {},
+        else => return error.ExpectedBorderHit,
+    }
+
+    switch (hitTestMouse(layout, true, 10, 16)) {
+        .pane => |hit| {
+            try std.testing.expectEqual(PaneId.split, hit.pane);
+            try std.testing.expectEqual(@as(u16, 10), hit.x);
+            try std.testing.expectEqual(@as(u16, 1), hit.y);
+        },
+        else => return error.ExpectedSplitHit,
+    }
+
+    switch (hitTestMouse(layout, true, 80, 16)) {
+        .scrollbar => |hit| {
+            try std.testing.expectEqual(PaneId.split, hit.pane);
+            try std.testing.expectEqual(@as(u16, 1), hit.y);
+            try std.testing.expectEqual(@as(u16, 9), hit.track_len);
+        },
+        else => return error.ExpectedSplitScrollbarHit,
+    }
+
+    switch (hitTestMouse(layout, true, 81, 16)) {
+        .outside => {},
+        else => return error.ExpectedOutsideHit,
+    }
 }
 
 test "winsize grid comparison ignores pixel-only changes" {
@@ -2880,7 +3670,7 @@ test "composed pending resize waits for quiet deadline" {
 
     try app.applyPendingResize(extended_due);
     try std.testing.expectEqual(app.layout.main_rows, pane.term.rows);
-    try std.testing.expectEqual(@as(u16, 120), pane.term.cols);
+    try std.testing.expectEqual(app.layout.paneCols(), pane.term.cols);
     try std.testing.expect(app.pending_resize == null);
     try std.testing.expect(app.resize_due_ns == null);
     try std.testing.expectEqual(@as(u16, 32), app.last_size.row);
@@ -2933,6 +3723,102 @@ test "prefix parser forwards non-prefix kitty keys unchanged" {
     try std.testing.expectEqualStrings("a\x1b[99;5ub", result.forwarded.items);
     try std.testing.expect(!result.close_split);
     try std.testing.expect(!result.open_split);
+}
+
+test "SGR mouse parser accepts wheel events and preserves partial input" {
+    switch (parseSgrMouse("\x1b[<64;10;5M")) {
+        .event => |event| {
+            try std.testing.expectEqual(@as(u16, 64), event.cb);
+            try std.testing.expectEqual(@as(u16, 10), event.x);
+            try std.testing.expectEqual(@as(u16, 5), event.y);
+            try std.testing.expectEqual(@as(u8, 'M'), event.final);
+            try std.testing.expectEqual(@as(usize, 11), event.len);
+            try std.testing.expectEqual(WheelAction.up, event.wheelAction().?);
+        },
+        else => return error.ExpectedSgrMouse,
+    }
+
+    switch (parseSgrMouse("\x1b[<65;10;5M")) {
+        .event => |event| try std.testing.expectEqual(WheelAction.down, event.wheelAction().?),
+        else => return error.ExpectedSgrMouse,
+    }
+    switch (parseSgrMouse("\x1b[<32;80;2M")) {
+        .event => |event| {
+            try std.testing.expect(event.isMotion());
+            try std.testing.expectEqual(@as(u16, 0), event.baseButton());
+        },
+        else => return error.ExpectedSgrMouse,
+    }
+    switch (parseSgrMouse("\x1b[<0;80;2m")) {
+        .event => |event| try std.testing.expect(event.isRelease()),
+        else => return error.ExpectedSgrMouse,
+    }
+
+    switch (parseSgrMouse("\x1b[<64;10;")) {
+        .incomplete => {},
+        else => return error.ExpectedIncompleteSgrMouse,
+    }
+    switch (parseSgrMouse("\x1b[<64;x;5M")) {
+        .none => {},
+        else => return error.ExpectedNoSgrMouse,
+    }
+    switch (parseSgrMouse("\x1b[64;10;5M")) {
+        .none => {},
+        else => return error.ExpectedNoSgrMouse,
+    }
+    switch (parseSgrMouse("\x1b")) {
+        .none => {},
+        else => return error.ExpectedNoSgrMouse,
+    }
+    switch (parseSgrMouse("\x1b[")) {
+        .none => {},
+        else => return error.ExpectedNoSgrMouse,
+    }
+}
+
+test "mouse forwarding encoder remaps coordinates into child pane space" {
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{ .cols = 80, .rows = 9 }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+
+    const event: SgrMouseEvent = .{ .cb = 64, .x = 10, .y = 20, .final = 'M', .len = 12 };
+
+    var sgr_buf: [64]u8 = undefined;
+    var sgr_writer = std.Io.Writer.fixed(&sgr_buf);
+    pane.term.flags.mouse_format = .sgr;
+    try encodeMouseForPane(&sgr_writer, &pane, event, 10, 5);
+    try std.testing.expectEqualStrings("\x1b[<64;10;5M", sgr_writer.buffered());
+
+    var x10_buf: [16]u8 = undefined;
+    var x10_writer = std.Io.Writer.fixed(&x10_buf);
+    pane.term.flags.mouse_format = .x10;
+    try encodeMouseForPane(&x10_writer, &pane, event, 10, 5);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x1b, '[', 'M', 96, 42, 37 }, x10_writer.buffered());
+}
+
+test "scrollbar target offset maps gutter rows to absolute scrollback rows" {
+    const info: ScrollbarInfo = .{
+        .total = 40,
+        .offset = 30,
+        .len = 10,
+        .track_len = 10,
+        .thumb_start = 7,
+        .thumb_len = 2,
+        .max_offset = 30,
+        .max_thumb_start = 8,
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), scrollbarTargetOffset(info, 1, 0));
+    try std.testing.expectEqual(@as(usize, 30), scrollbarTargetOffset(info, 10, 0));
+    try std.testing.expect(scrollbarTargetOffset(info, 5, 1) < scrollbarTargetOffset(info, 10, 1));
 }
 
 test "render scheduler renders first dirty frame immediately" {
@@ -3044,6 +3930,22 @@ test "render scheduler bulk first read overrides recent input drain budget" {
     );
 }
 
+test "render scheduler treats small multi-read echo after input as urgent" {
+    var scheduler: RenderScheduler = .{};
+    const input_at: i128 = 1_000 * std.time.ns_per_ms;
+    scheduler.noteInput(input_at);
+
+    var echo: DrainStats = .{};
+    for (0..bulk_damage_reads) |_| echo.record(8);
+
+    try std.testing.expect(echo.bulkish());
+    try std.testing.expectEqual(
+        RenderScheduler.DirtyKind.urgent,
+        scheduler.dirtyKindForDamage(input_at + std.time.ns_per_ms, echo),
+    );
+    try std.testing.expect(!scheduler.bulkActive(input_at + std.time.ns_per_ms));
+}
+
 test "drain stats classify sustained output as bulk" {
     var by_bytes: DrainStats = .{};
     by_bytes.record(bulk_damage_bytes);
@@ -3058,6 +3960,75 @@ test "drain stats classify sustained output as bulk" {
     try std.testing.expect(!small.bulkish());
 }
 
+test "plain passthrough cursor state tracks soft wraps" {
+    var state = (plainPassthroughEndState("abcd", 5, .{}) orelse return error.ExpectedCursorState);
+    try std.testing.expectEqual(@as(u16, 4), state.col);
+    try std.testing.expect(!state.pending_wrap);
+
+    state = (plainPassthroughEndState("e", 5, state) orelse return error.ExpectedCursorState);
+    try std.testing.expectEqual(@as(u16, 4), state.col);
+    try std.testing.expect(state.pending_wrap);
+
+    state = (plainPassthroughEndState("f", 5, state) orelse return error.ExpectedCursorState);
+    try std.testing.expectEqual(@as(u16, 1), state.col);
+    try std.testing.expect(!state.pending_wrap);
+
+    state = (plainPassthroughEndState("\rxy", 5, state) orelse return error.ExpectedCursorState);
+    try std.testing.expectEqual(@as(u16, 2), state.col);
+    try std.testing.expect(!state.pending_wrap);
+
+    state = (plainPassthroughEndState("z\nq", 5, state) orelse return error.ExpectedCursorState);
+    try std.testing.expectEqual(@as(u16, 4), state.col);
+    try std.testing.expect(!state.pending_wrap);
+}
+
+test "plain ascii fast feed matches vt stream repaint" {
+    const alloc = std.testing.allocator;
+    var fast: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "fast",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{ .cols = 8, .rows = 3, .max_scrollback = scrollback_bytes }),
+        .stream = undefined,
+    };
+    defer fast.term.deinit(alloc);
+    fast.stream = .initAlloc(alloc, Pane.StreamHandler.init(&fast));
+    defer fast.stream.deinit();
+
+    var slow: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "slow",
+        .cell_size = .{},
+        .ascii_fast_feed_enabled = false,
+        .term = try vt.Terminal.init(alloc, .{ .cols = 8, .rows = 3, .max_scrollback = scrollback_bytes }),
+        .stream = undefined,
+    };
+    defer slow.term.deinit(alloc);
+    slow.stream = .initAlloc(alloc, Pane.StreamHandler.init(&slow));
+    defer slow.stream.deinit();
+
+    const input =
+        "one\r\n" ++
+        "two\r\n" ++
+        "three\r\n" ++
+        "four\r\n" ++
+        "five\r\n";
+    fast.feed(input);
+    slow.feed(input);
+
+    const fast_repaint = try fast.repaint(alloc);
+    defer alloc.free(fast_repaint);
+    const slow_repaint = try slow.repaint(alloc);
+    defer alloc.free(slow_repaint);
+
+    try std.testing.expectEqualStrings(slow_repaint, fast_repaint);
+    try std.testing.expectEqual(slow.pending_scroll_count, fast.pending_scroll_count);
+}
+
 test "composed cursor mirrors child cursor style" {
     const alloc = std.testing.allocator;
     var pane: Pane = .{
@@ -3070,8 +4041,9 @@ test "composed cursor mirrors child cursor style" {
         .stream = undefined,
     };
     defer pane.term.deinit(alloc);
-    pane.term.screens.active.cursor.x = 3;
-    pane.term.screens.active.cursor.y = 2;
+    var stream = pane.term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[3;4H");
     pane.term.screens.active.cursor.cursor_style = .bar;
     pane.term.modes.set(.cursor_blinking, true);
 
@@ -3101,6 +4073,31 @@ test "composed cursor mirrors child cursor visibility" {
     try writeComposedCursor(&writer, Layout.compute(5, 10, false, 0), &pane);
 
     try std.testing.expectEqualStrings("\x1b[2 q\x1b[1;1H\x1b[?25l", writer.buffered());
+}
+
+test "composed cursor hides when child cursor is outside the viewport" {
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{ .cols = 10, .rows = 3, .max_scrollback = scrollback_bytes }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+
+    var stream = pane.term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+    pane.term.scrollViewport(.{ .delta = -1 });
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeComposedCursor(&writer, Layout.compute(3, 10, false, 0), &pane);
+
+    try std.testing.expectEqualStrings("\x1b[2 q\x1b[?25l", writer.buffered());
 }
 
 test "cursor style maps Ghostty-only hollow block to DECSCUSR block" {
@@ -3230,6 +4227,22 @@ test "pane row cache detects upward viewport scroll" {
     try std.testing.expect(!cache.rows.items[3].valid);
 }
 
+test "pane viewport scroll changes visible top row" {
+    const alloc = std.testing.allocator;
+
+    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3, .max_scrollback = scrollback_bytes });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+    const before = viewportPin(&term, 0).?;
+    term.scrollViewport(.{ .delta = -1 });
+    const after = viewportPin(&term, 0).?;
+
+    try std.testing.expect(!before.eql(after));
+}
+
 test "outer row cache rotation clears newly exposed rows" {
     const alloc = std.testing.allocator;
 
@@ -3337,6 +4350,58 @@ test "graphics replay keeps image upload cached across placement updates" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=t") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=d,d=i") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1;1H\x1b_Ga=p") != null);
+    try std.testing.expect(!pane.term.screens.active.kitty_images.dirty);
+}
+
+test "graphics replay skips garbage placement pins after scrollback pruning" {
+    if (comptime !kitty_graphics_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{
+            .cols = 10,
+            .rows = 5,
+            .max_scrollback = scrollback_bytes,
+            .kitty_image_storage_limit = kitty_image_storage_limit,
+            .kitty_image_loading_limits = .all,
+        }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+    pane.cell_size.applyToTerm(&pane.term);
+
+    var stream = pane.term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b_Ga=T,f=24,t=d,i=1,s=1,v=1,c=1,r=1,q=2;////\x1b\\");
+
+    var graphics: GraphicsState = .{};
+    defer graphics.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const layout = Layout.compute(5, 10, false, 0);
+    try graphics.render(alloc, &out, layout, &pane, null, true);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1;1H\x1b_Ga=p") != null);
+
+    var iter = pane.term.screens.active.kitty_images.placements.iterator();
+    while (iter.next()) |entry| {
+        switch (entry.value_ptr.location) {
+            .pin => |pin| pin.garbage = true,
+            .virtual => {},
+        }
+    }
+
+    out.clearRetainingCapacity();
+    pane.term.screens.active.kitty_images.dirty = true;
+    try graphics.render(alloc, &out, layout, &pane, null, false);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=d,d=i") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b_Ga=p") == null);
     try std.testing.expect(!pane.term.screens.active.kitty_images.dirty);
 }
 

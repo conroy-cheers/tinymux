@@ -38,6 +38,30 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const bench_cmd = b.addSystemCommand(&.{
+        "python3",
+        "tests/benchmarks/tinymux_bench.py",
+        "--tinymux",
+    });
+    bench_cmd.addFileArg(exe.getEmittedBin());
+    bench_cmd.addArgs(&.{ "--profile", "quick" });
+    bench_cmd.step.dependOn(&exe.step);
+    if (b.args) |args| bench_cmd.addArgs(args);
+    const bench_step = b.step("bench", "Run the quick benchmark suite");
+    bench_step.dependOn(&bench_cmd.step);
+
+    const bench_full_cmd = b.addSystemCommand(&.{
+        "python3",
+        "tests/benchmarks/tinymux_bench.py",
+        "--tinymux",
+    });
+    bench_full_cmd.addFileArg(exe.getEmittedBin());
+    bench_full_cmd.addArgs(&.{ "--profile", "full" });
+    bench_full_cmd.step.dependOn(&exe.step);
+    if (b.args) |args| bench_full_cmd.addArgs(args);
+    const bench_full_step = b.step("bench-full", "Run the full benchmark suite");
+    bench_full_step.dependOn(&bench_full_cmd.step);
 }
 
 const GhosttySource = union(enum) {
