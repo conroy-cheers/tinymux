@@ -47,6 +47,10 @@
             nativeBuildInputs = [
               pkgs.zig_0_15
               pkgs.python3
+              pkgs.bashInteractive
+              pkgs.fish
+              pkgs.zsh
+              pkgs.nushell
             ];
 
             patchPhase = ''
@@ -156,6 +160,10 @@
             packages = [
               pkgs.zig_0_15
               pkgs.python3
+              pkgs.bashInteractive
+              pkgs.fish
+              pkgs.zsh
+              pkgs.nushell
               pkgs.tmux
               pkgs.nixpkgs-fmt
             ];

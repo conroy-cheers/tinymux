@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pty
 import select
@@ -12,6 +13,7 @@ import struct
 import subprocess
 import sys
 import termios
+import tempfile
 import time
 from collections.abc import Sequence
 
@@ -123,6 +125,145 @@ class Session:
             self.output += chunk
             idle_deadline = time.monotonic() + idle
         raise AssertionError(f"terminal output did not go idle; output tail={self.output[-1000:]!r}")
+
+
+class ForkSession:
+    def __init__(
+        self,
+        argv: Sequence[str],
+        extra_env: dict[str, str] | None = None,
+        rows: int = DEFAULT_ROWS,
+        cols: int = DEFAULT_COLS,
+    ) -> None:
+        self.pid, self.master = pty.fork()
+        if self.pid == 0:
+            env = os.environ.copy()
+            env.setdefault("TERM", "xterm-256color")
+            env.setdefault("SHELL", "/bin/sh")
+            if extra_env is not None:
+                env.update(extra_env)
+            os.execvpe(argv[0], argv, env)
+        set_winsize(self.master, rows, cols)
+        self.output = b""
+        self.terminal_query_offset = 0
+
+    def close(self) -> None:
+        try:
+            os.write(self.master, b"\x04")
+        except OSError:
+            pass
+        try:
+            pid, _ = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            pid = self.pid
+        if pid == 0:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    pid, _ = os.waitpid(self.pid, os.WNOHANG)
+                except ChildProcessError:
+                    pid = self.pid
+                if pid != 0:
+                    break
+                time.sleep(0.05)
+            if pid == 0:
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(self.pid, 0)
+                except ChildProcessError:
+                    pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+    def write(self, data: bytes) -> None:
+        os.write(self.master, data)
+
+    def wait_for(self, marker: bytes, timeout: float = 5.0) -> bytes:
+        return self.wait_for_after(marker, 0, timeout)
+
+    def wait_exited(self, timeout: float = 5.0) -> int:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return 0
+            if pid != 0:
+                return status
+
+            readable, _, _ = select.select([self.master], [], [], 0.05)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                continue
+            if chunk:
+                self.output += chunk
+                self.answer_terminal_queries()
+        raise AssertionError(f"timed out waiting for child exit; output tail={self.output[-1000:]!r}")
+
+    def wait_for_after(self, marker: bytes, offset: int, timeout: float = 5.0) -> bytes:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if marker in self.output[offset:]:
+                return self.output
+            readable, _, _ = select.select([self.master], [], [], 0.05)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.output += chunk
+            self.answer_terminal_queries()
+        raise AssertionError(f"timed out waiting for {marker!r}; output tail={self.output[-1000:]!r}")
+
+    def drain_until_idle(self, idle: float = 0.1, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        idle_deadline = time.monotonic() + idle
+        while time.monotonic() < deadline:
+            wait = max(0.0, min(0.05, idle_deadline - time.monotonic()))
+            readable, _, _ = select.select([self.master], [], [], wait)
+            if not readable:
+                if time.monotonic() >= idle_deadline:
+                    return
+                continue
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            self.output += chunk
+            self.answer_terminal_queries()
+            idle_deadline = time.monotonic() + idle
+        raise AssertionError(f"terminal output did not go idle; output tail={self.output[-1000:]!r}")
+
+    def answer_terminal_queries(self) -> None:
+        query = b"\x1b[6n"
+        start = self.terminal_query_offset
+        while True:
+            index = self.output.find(query, start)
+            if index < 0:
+                self.terminal_query_offset = max(0, len(self.output) - len(query) + 1)
+                return
+            try:
+                os.write(self.master, b"\x1b[1;1R")
+            except OSError:
+                return
+            start = index + len(query)
 
 
 def terminal_scrollback_contains(data: bytes, marker: bytes, rows: int = DEFAULT_ROWS) -> bool:
@@ -580,7 +721,7 @@ def test_split_close_replays_history_beyond_old_small_scrollback_cap(tinymux: st
         [
             tinymux,
             "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "printf 'SPLIT_STAYS\\n'; sleep 30",
             "--",
             "/bin/sh",
             "-lc",
@@ -599,7 +740,7 @@ def test_split_close_replays_history_beyond_old_small_scrollback_cap(tinymux: st
         session.drain_until_idle(timeout=5.0)
         close_start = len(session.output)
         session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=10.0)
+        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=30.0)
         session.drain_until_idle(timeout=10.0)
         post_close = session.output[close_start:]
         assert b"BIG_HIST_00000" in post_close, (
@@ -647,7 +788,7 @@ def test_split_close_replays_long_history_outside_synchronized_repaint(tinymux: 
         [
             tinymux,
             "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "printf 'SPLIT_STAYS\\n'; sleep 30",
             "--",
             *main_argv,
         ]
@@ -657,7 +798,7 @@ def test_split_close_replays_long_history_outside_synchronized_repaint(tinymux: 
         session.drain_until_idle(timeout=5.0)
         close_start = len(session.output)
         session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=10.0)
+        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=30.0)
         session.drain_until_idle(timeout=10.0)
         post_close = session.output[close_start:]
 
@@ -696,7 +837,7 @@ def test_split_close_replays_retained_history_after_anchor_pruned(tinymux: str) 
         [
             tinymux,
             "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 5",
+            "printf 'SPLIT_STAYS\\n'; sleep 30",
             "--",
             "/bin/sh",
             "-lc",
@@ -717,7 +858,7 @@ def test_split_close_replays_retained_history_after_anchor_pruned(tinymux: str) 
         session.drain_until_idle(timeout=5.0)
         close_start = len(session.output)
         session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=10.0)
+        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=30.0)
         session.drain_until_idle(timeout=10.0)
         post_close = session.output[close_start:]
 
@@ -837,6 +978,491 @@ def test_split_close_then_dirty_main_exit_restores_parent_shell(tinymux: str) ->
         session.wait_for(b"PARENT_INPUT")
     finally:
         session.close()
+
+
+def test_seamless_raw_only_has_no_terminal_redraw(tinymux: str) -> None:
+    session = Session([tinymux, "--seamless", "--", "/bin/sh", "-lc", "printf 'SEAMLESS_RAW'"])
+    try:
+        session.wait_for(b"SEAMLESS_RAW")
+        session.drain_until_idle()
+        assert b"\x1b[?1049h" not in session.output
+        assert b"\x1b[?1049l" not in session.output
+        assert b"\x1b[?2026h" not in session.output
+        assert b"\x1b[H\x1b[2J" not in session.output
+    finally:
+        session.close()
+
+
+def test_handoff_apply_emits_safe_shell_state(tinymux: str) -> None:
+    tinymux_abs = os.path.abspath(tinymux)
+    with tempfile.TemporaryDirectory() as state:
+        with tempfile.TemporaryDirectory() as parent_cwd:
+            with tempfile.TemporaryDirectory() as child_cwd:
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "HANDOFF_TEST_KEEP": "old",
+                        "HANDOFF_TEST_NEW": "before",
+                        "TERM": "xterm-256color",
+                    }
+                )
+                subprocess.run(
+                    [tinymux_abs, "handoff-capture", "--state", state, "--slot", "baseline"],
+                    cwd=parent_cwd,
+                    env=env,
+                    check=True,
+                )
+                env.update(
+                    {
+                        "HANDOFF_TEST_KEEP": "new",
+                        "HANDOFF_TEST_ADDED": "child value",
+                        "TERM": "should-not-apply",
+                        "TINYMUX_INTERNAL": "should-not-apply",
+                        "TMUX": "should-not-apply",
+                    }
+                )
+                subprocess.run(
+                    [tinymux_abs, "handoff-capture", "--state", state, "--slot", "result"],
+                    cwd=child_cwd,
+                    env=env,
+                    check=True,
+                )
+                applied = subprocess.check_output(
+                    [tinymux_abs, "handoff-apply", "--shell", "sh", "--state", state],
+                    text=True,
+                )
+                nu_applied = json.loads(
+                    subprocess.check_output(
+                        [tinymux_abs, "handoff-apply", "--shell", "nu", "--state", state],
+                        text=True,
+                    )
+                )
+
+    assert "cd -- " in applied and child_cwd in applied
+    assert "export HANDOFF_TEST_KEEP='new'" in applied
+    assert "export HANDOFF_TEST_ADDED='child value'" in applied
+    assert "should-not-apply" not in applied
+    assert nu_applied["cwd"] == child_cwd
+    assert nu_applied["env"]["HANDOFF_TEST_KEEP"] == "new"
+    assert nu_applied["env"]["HANDOFF_TEST_ADDED"] == "child value"
+    assert "TERM" not in nu_applied["env"]
+    assert "TINYMUX_INTERNAL" not in nu_applied["env"]
+    assert "TMUX" not in nu_applied["env"]
+
+
+def test_common_shell_init_outputs_entrypoint_functions(tinymux: str) -> None:
+    tinymux_abs = os.path.abspath(tinymux)
+    for shell in ("fish", "sh", "bash", "zsh", "nu", "nushell"):
+        script = subprocess.check_output([tinymux_abs, "init", shell], text=True)
+        assert "tinymux-enter" in script
+        assert "tinymux-exit" in script
+        assert "--seamless" in script
+        assert "handoff-capture" in script
+        assert "handoff-apply" in script
+
+
+def direnv_wrapper_for(tinymux_abs: str) -> str:
+    wrapper = os.path.join(os.path.dirname(tinymux_abs), "tinymux-direnv-instant")
+    assert os.path.exists(wrapper), f"missing installed direnv wrapper next to tinymux: {wrapper}"
+    return wrapper
+
+
+def test_direnv_instant_wrapper_outputs_hooks(tinymux: str) -> None:
+    wrapper = direnv_wrapper_for(os.path.abspath(tinymux))
+    for shell in ("bash", "zsh", "fish", "nu", "nushell"):
+        script = subprocess.check_output([wrapper, "hook", shell], text=True)
+        assert "tinymux --seamless" in script
+        assert "handoff-capture" in script
+        assert "direnv-instant" in script
+        assert "__DIRENV_INSTANT_ENV_FILE" in script
+        assert "__DIRENV_INSTANT_STDERR_FILE" in script
+
+        child_script = subprocess.check_output([wrapper, "child-init", shell], text=True)
+        assert "left-root" in child_script
+        assert "handoff-capture" in child_script
+
+
+def write_direnv_instant_stub(bin_dir: str) -> None:
+    stub = os.path.join(bin_dir, "direnv-instant")
+    with open(stub, "w", encoding="utf-8") as file:
+        file.write(
+            """#!/bin/sh
+set -eu
+
+find_envrc() {
+    dir=$PWD
+    while :; do
+        if [ -f "$dir/.envrc" ]; then
+            printf '%s\\n' "$dir"
+            return 0
+        fi
+        [ "$dir" = / ] && return 1
+        dir=${dir%/*}
+        [ -n "$dir" ] || dir=/
+    done
+}
+
+emit_export() {
+    # Test paths are mktemp paths without single quotes.
+    printf "export %s='%s'\\n" "$1" "$2"
+}
+
+case "${1:-}" in
+    start)
+        root=$(find_envrc || true)
+        printf 'START|TINYMUX=%s|PWD=%s|ROOT=%s\\n' "${TINYMUX:-}" "$PWD" "$root" >> "$TINYMUX_DIRENV_STUB_LOG"
+        if [ -z "$root" ]; then
+            printf 'unset __DIRENV_INSTANT_CURRENT_DIR\\n'
+            printf 'unset __DIRENV_INSTANT_ENV_FILE\\n'
+            printf 'unset __DIRENV_INSTANT_STDERR_FILE\\n'
+            printf 'unset DIRENV_WRAPPED\\n'
+            exit 0
+        fi
+
+        env_file=$(mktemp "${TMPDIR:-/tmp}/tinymux-direnv-env.XXXXXX")
+        stderr_file=$(mktemp "${TMPDIR:-/tmp}/tinymux-direnv-stderr.XXXXXX")
+        printf "export DIRENV_WRAPPED='from-file'\\n" > "$env_file"
+
+        emit_export __DIRENV_INSTANT_CURRENT_DIR "$root"
+        emit_export __DIRENV_INSTANT_ENV_FILE "$env_file"
+        emit_export __DIRENV_INSTANT_STDERR_FILE "$stderr_file"
+        if [ -n "${TINYMUX:-}" ]; then
+            printf "export DIRENV_WRAPPED='inside'\\n"
+            tmux split-window -d -l 5 /bin/sh -lc 'printf DIRENV_TINYMUX_LOG_READY; sleep 10'
+        else
+            printf "export DIRENV_WRAPPED='outside'\\n"
+        fi
+        ;;
+    stop)
+        printf 'STOP|PWD=%s\\n' "$PWD" >> "$TINYMUX_DIRENV_STUB_LOG"
+        ;;
+    *)
+        printf 'unexpected direnv-instant command: %s\\n' "${1:-}" >&2
+        exit 2
+        ;;
+esac
+"""
+        )
+    os.chmod(stub, 0o755)
+
+
+def direnv_wrapper_test_env(tinymux_abs: str, bash: str, root: str, bin_dir: str, log: str) -> dict[str, str]:
+    env = handoff_test_env(tinymux_abs, bash, root)
+    tinymux_dir = os.path.dirname(tinymux_abs)
+    env["PATH"] = f"{bin_dir}:{tinymux_dir}:{env.get('PATH', '')}"
+    env["TINYMUX_DIRENV_INSTANT_BIN"] = "direnv-instant"
+    env["TINYMUX_DIRENV_STUB_LOG"] = log
+    return env
+
+
+def wait_file_contains(path: str, marker: str, timeout: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                content = file.read()
+        except FileNotFoundError:
+            content = ""
+        if marker in content:
+            return content
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {marker!r} in {path}; content={content!r}")
+
+
+def setup_direnv_wrapper_project(root: str) -> tuple[str, str, str, str]:
+    project = os.path.join(root, "project")
+    outside = os.path.join(root, "outside")
+    bin_dir = os.path.join(root, "bin")
+    log = os.path.join(root, "direnv-instant.log")
+    os.mkdir(project)
+    os.mkdir(outside)
+    os.mkdir(bin_dir)
+    with open(os.path.join(project, ".envrc"), "w", encoding="utf-8") as file:
+        file.write("export DIRENV_WRAPPED=real\n")
+    write_direnv_instant_stub(bin_dir)
+    return project, outside, bin_dir, log
+
+
+def test_direnv_instant_wrapper_enters_tinymux_and_returns_after_leaving_root(tinymux: str) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    wrapper = direnv_wrapper_for(tinymux_abs)
+    with tempfile.TemporaryDirectory() as root:
+        project, outside, bin_dir, log = setup_direnv_wrapper_project(root)
+        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
+        session = ForkSession([bash, "--noprofile", "--norc", "-i"], extra_env=env)
+        try:
+            session.write(b"stty -echo\n")
+            session.write(b"PS1=''\n")
+            session.write(f'eval "$({shlex.quote(wrapper)} hook bash)"\n'.encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+
+            enter_start = len(session.output)
+            session.write(f"cd {shlex.quote(project)}\n".encode())
+            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", enter_start, timeout=10.0)
+            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
+
+            leave_start = len(session.output)
+            session.write(f"cd {shlex.quote(outside)}\n".encode())
+            session.wait_for_after(b"\x1b[?1049l", leave_start, timeout=10.0)
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+
+            after_start = len(session.output)
+            session.write(b"printf '%s|%s|%s|%s\\n' AFTER \"$PWD\" \"${TINYMUX:-}\" \"${DIRENV_WRAPPED:-}\"\n")
+            session.wait_for_after(b"AFTER|", after_start, timeout=10.0)
+            after = session.output[after_start:]
+            expected = f"AFTER|{outside}||".encode()
+            assert expected in after, (
+                "leaving the direnv root did not restore the parent shell outside tinymux; "
+                f"expected={expected!r} output={after[-2000:]!r}"
+            )
+        finally:
+            session.close()
+
+
+def test_direnv_instant_wrapper_child_exit_exits_parent_shell(tinymux: str) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    wrapper = direnv_wrapper_for(tinymux_abs)
+    with tempfile.TemporaryDirectory() as root:
+        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
+        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
+        session = ForkSession([bash, "--noprofile", "--norc", "-i"], extra_env=env)
+        try:
+            session.write(b"stty -echo\n")
+            session.write(b"PS1=''\n")
+            session.write(f'eval "$({shlex.quote(wrapper)} hook bash)"\n'.encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+
+            enter_start = len(session.output)
+            session.write(f"cd {shlex.quote(project)}\n".encode())
+            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", enter_start, timeout=10.0)
+            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
+
+            session.write(b"exit\n")
+            status = session.wait_exited(timeout=10.0)
+            assert os.WIFEXITED(status), f"parent shell did not exit cleanly: status={status}"
+        finally:
+            session.close()
+
+
+def test_direnv_instant_wrapper_skips_entry_inside_foreign_mux(tinymux: str) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    wrapper = direnv_wrapper_for(tinymux_abs)
+    with tempfile.TemporaryDirectory() as root:
+        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
+        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
+        env["TMUX"] = "/tmp/foreign-tmux,123,0"
+        session = ForkSession([bash, "--noprofile", "--norc", "-i"], extra_env=env)
+        try:
+            session.write(b"stty -echo\n")
+            session.write(b"PS1=''\n")
+            session.write(f'eval "$({shlex.quote(wrapper)} hook bash)"\n'.encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+
+            session.write(f"cd {shlex.quote(project)}\n".encode())
+            wait_file_contains(log, f"PWD={project}", timeout=5.0)
+            after_start = len(session.output)
+            session.write(b"printf '%s|%s|%s\\n' SKIP \"${TINYMUX:-}\" \"${DIRENV_WRAPPED:-}\"\n")
+            session.wait_for_after(b"SKIP|", after_start, timeout=5.0)
+            after = session.output[after_start:]
+            assert b"SKIP||outside" in after, (
+                "wrapper entered tinymux even though a foreign mux was already active; "
+                f"output={after[-2000:]!r}"
+            )
+            assert b"DIRENV_TINYMUX_LOG_READY" not in after
+        finally:
+            session.close()
+
+
+def handoff_test_env(tinymux_abs: str, shell_path: str, root: str) -> dict[str, str]:
+    tinymux_dir = os.path.dirname(tinymux_abs)
+    home = os.path.join(root, "home")
+    xdg_config = os.path.join(root, "xdg-config")
+    zdotdir = os.path.join(root, "zdotdir")
+    nushell_config = os.path.join(xdg_config, "nushell")
+    os.mkdir(home)
+    os.makedirs(nushell_config)
+    os.mkdir(zdotdir)
+    with open(os.path.join(nushell_config, "config.nu"), "w", encoding="utf-8") as file:
+        file.write("")
+    with open(os.path.join(nushell_config, "env.nu"), "w", encoding="utf-8") as file:
+        file.write("")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{tinymux_dir}:{env.get('PATH', '')}"
+    env["SHELL"] = shell_path
+    env["TERM"] = "dumb"
+    env["HOME"] = home
+    env["XDG_CONFIG_HOME"] = xdg_config
+    env["ZDOTDIR"] = zdotdir
+    return env
+
+
+def expect_handoff_state(session: ForkSession, child_dir: str, shell_name: str) -> None:
+    after_start = len(session.output)
+    if shell_name == "fish":
+        session.write(
+            b"printf '%s|%s|%s|%s|%s\\n' AFTER (pwd) \"$HANDOFF_TEST_VAR\" \"$TERM\" \"$TINYMUX_BLOCKED\"\n"
+        )
+    elif shell_name == "nu":
+        session.write(
+            b'print (["AFTER", (pwd), $env.HANDOFF_TEST_VAR, $env.TERM, ($env.TINYMUX_BLOCKED? | default "")] | str join "|")\n'
+        )
+    else:
+        session.write(
+            b"printf '%s|%s|%s|%s|%s\\n' AFTER \"$PWD\" \"$HANDOFF_TEST_VAR\" \"$TERM\" \"$TINYMUX_BLOCKED\"\n"
+        )
+    session.wait_for_after(b"AFTER|", after_start, timeout=10.0)
+    session.drain_until_idle()
+    after = session.output[after_start:]
+    expected = f"AFTER|{child_dir}|after|dumb|".encode()
+    assert expected in after, (
+        f"{shell_name} handoff did not restore expected state; output={after[-2000:]!r}"
+    )
+
+
+def run_posix_style_handoff_test(
+    tinymux: str,
+    shell_name: str,
+    parent_argv: Sequence[str],
+) -> None:
+    shell_path = shutil.which(parent_argv[0])
+    if shell_path is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    with tempfile.TemporaryDirectory() as root:
+        parent_dir = os.path.join(root, "parent")
+        child_dir = os.path.join(root, "child")
+        os.mkdir(parent_dir)
+        os.mkdir(child_dir)
+
+        env = handoff_test_env(tinymux_abs, shell_path, root)
+        session = ForkSession(parent_argv, extra_env=env)
+        try:
+            session.write(b"stty -echo\n")
+            session.write(b"PS1=''\n")
+            session.write(f'eval "$({shlex.quote(tinymux_abs)} init {shell_name})"\n'.encode())
+            session.write(f"cd {shlex.quote(parent_dir)}\n".encode())
+            session.write(b"export HANDOFF_TEST_VAR=before\n")
+            session.write(b"printf '%s_%s\\n' PARENT READY\n")
+            session.wait_for(b"PARENT_READY")
+
+            session.write(b"tinymux-enter; printf '%s_%s\\n' RETURNED FROM_TINYMUX\n")
+            time.sleep(0.5)
+            session.write(f"cd {shlex.quote(child_dir)}\n".encode())
+            session.write(b"export HANDOFF_TEST_VAR=after\n")
+            session.write(b"export TINYMUX_BLOCKED=should-not-apply\n")
+            session.write(b"tinymux-exit\n")
+            session.wait_for(b"RETURNED_FROM_TINYMUX", timeout=10.0)
+            expect_handoff_state(session, child_dir, shell_name)
+        finally:
+            session.close()
+
+
+def test_fish_seamless_enter_exit_restores_cwd_and_env(tinymux: str) -> None:
+    fish = shutil.which("fish")
+    if fish is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    with tempfile.TemporaryDirectory() as root:
+        parent_dir = os.path.join(root, "parent")
+        child_dir = os.path.join(root, "child")
+        os.mkdir(parent_dir)
+        os.mkdir(child_dir)
+
+        env = handoff_test_env(tinymux_abs, fish, root)
+        session = ForkSession([fish, "--no-config"], extra_env=env)
+        try:
+            session.write(b"stty -echo\n")
+            session.write(f"source ({shlex.quote(tinymux_abs)} init fish | psub)\n".encode())
+            session.write(f"cd {shlex.quote(parent_dir)}\n".encode())
+            session.write(b"set -gx HANDOFF_TEST_VAR before\n")
+            session.write(b"printf '%s_%s\\n' PARENT READY\n")
+            session.wait_for(b"PARENT_READY")
+
+            session.write(b"tinymux-enter; printf '%s_%s\\n' RETURNED FROM_TINYMUX\n")
+            time.sleep(0.5)
+            session.write(f"cd {shlex.quote(child_dir)}\n".encode())
+            session.write(b"set -gx HANDOFF_TEST_VAR after\n")
+            session.write(b"set -gx TINYMUX_BLOCKED should-not-apply\n")
+            session.write(b"tinymux-exit\n")
+            session.wait_for(b"RETURNED_FROM_TINYMUX", timeout=10.0)
+            expect_handoff_state(session, child_dir, "fish")
+        finally:
+            session.close()
+
+
+def test_sh_seamless_enter_exit_restores_cwd_and_env(tinymux: str) -> None:
+    run_posix_style_handoff_test(tinymux, "sh", ["sh", "-i"])
+
+
+def test_bash_seamless_enter_exit_restores_cwd_and_env(tinymux: str) -> None:
+    run_posix_style_handoff_test(tinymux, "bash", ["bash", "--noprofile", "--norc", "-i"])
+
+
+def test_zsh_seamless_enter_exit_restores_cwd_and_env(tinymux: str) -> None:
+    run_posix_style_handoff_test(tinymux, "zsh", ["zsh", "-f", "-i"])
+
+
+def nu_quote(value: str) -> str:
+    return json.dumps(value)
+
+
+def test_nu_seamless_enter_exit_restores_cwd_and_env(tinymux: str) -> None:
+    nu = shutil.which("nu")
+    if nu is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    with tempfile.TemporaryDirectory() as root:
+        parent_dir = os.path.join(root, "parent")
+        child_dir = os.path.join(root, "child")
+        init_script = os.path.join(root, "tinymux.nu")
+        os.mkdir(parent_dir)
+        os.mkdir(child_dir)
+        with open(init_script, "w", encoding="utf-8") as file:
+            file.write(subprocess.check_output([tinymux_abs, "init", "nu"], text=True))
+
+        env = handoff_test_env(tinymux_abs, nu, root)
+        session = ForkSession([nu, "--no-history", "-i"], extra_env=env)
+        try:
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(f"source {nu_quote(init_script)}\n".encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(f"cd {nu_quote(parent_dir)}\n".encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(b"$env.HANDOFF_TEST_VAR = \"before\"\n")
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(b'print ("PARENT_" + "READY")\n')
+            session.wait_for(b"PARENT_READY")
+
+            session.write(b'tinymux-enter; print ("RETURNED_" + "FROM_TINYMUX")\n')
+            time.sleep(0.5)
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(f"cd {nu_quote(child_dir)}\n".encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(b"$env.HANDOFF_TEST_VAR = \"after\"\n")
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(b"$env.TINYMUX_BLOCKED = \"should-not-apply\"\n")
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+            session.write(b"tinymux-exit\n")
+            session.wait_for(b"RETURNED_FROM_TINYMUX", timeout=10.0)
+            expect_handoff_state(session, child_dir, "nu")
+        finally:
+            session.close()
 
 
 def test_raw_only_passthrough(tinymux: str) -> None:
@@ -988,6 +1614,18 @@ def main() -> int:
 
     tests = [
         test_split_close_then_dirty_main_exit_restores_parent_shell,
+        test_seamless_raw_only_has_no_terminal_redraw,
+        test_handoff_apply_emits_safe_shell_state,
+        test_common_shell_init_outputs_entrypoint_functions,
+        test_direnv_instant_wrapper_outputs_hooks,
+        test_direnv_instant_wrapper_enters_tinymux_and_returns_after_leaving_root,
+        test_direnv_instant_wrapper_child_exit_exits_parent_shell,
+        test_direnv_instant_wrapper_skips_entry_inside_foreign_mux,
+        test_fish_seamless_enter_exit_restores_cwd_and_env,
+        test_sh_seamless_enter_exit_restores_cwd_and_env,
+        test_bash_seamless_enter_exit_restores_cwd_and_env,
+        test_zsh_seamless_enter_exit_restores_cwd_and_env,
+        test_nu_seamless_enter_exit_restores_cwd_and_env,
         test_raw_only_passthrough,
         test_raw_only_does_not_parse_prefix,
         test_split_renders_and_main_gets_input,

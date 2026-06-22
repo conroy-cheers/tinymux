@@ -4,6 +4,7 @@ const posix = std.posix;
 const vt = @import("ghostty-vt");
 const ptypkg = @import("pty.zig");
 const protocol = @import("protocol.zig");
+const shell_scripts = @import("shell_scripts.zig");
 
 pub const version = "0.1.0";
 
@@ -29,6 +30,7 @@ const pty_drain_max_bytes: usize = 8 * 1024 * 1024;
 const bulk_damage_bytes: usize = 16 * 1024;
 const bulk_damage_reads: usize = 2;
 const max_pending_scrolls: usize = 8;
+const max_handoff_state_bytes: usize = 64 * 1024 * 1024;
 const wheel_scroll_rows: isize = 3;
 const max_sgr_mouse_sequence: usize = 64;
 const scrollback_bytes: usize = 256 * 1024 * 1024;
@@ -196,6 +198,24 @@ pub fn main() !void {
         return;
     }
 
+    if (args.len > 0 and std.mem.eql(u8, std.fs.path.basename(args[0]), "tinymux-direnv-instant")) {
+        try runDirenvInstantWrapper(args[1..]);
+        return;
+    }
+
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "init")) {
+        try runInit(args[2..]);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "handoff-capture")) {
+        try runHandoffCapture(alloc, args[2..]);
+        return;
+    }
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "handoff-apply")) {
+        try runHandoffApply(alloc, args[2..]);
+        return;
+    }
+
     const config = parseArgs(args) catch |err| {
         try printUsage(err);
         return err;
@@ -213,10 +233,15 @@ fn printUsage(err: anyerror) !void {
         \\
         \\usage:
         \\  tinymux --split <split-cmd> [--split-rows <n>] [--split-term auto|xterm-256color|xterm-direct|xterm-kitty|xterm-ghostty] -- <main-argv...>
+        \\  tinymux --seamless [--handoff-state <dir>] -- <main-argv...>
         \\  tinymux -- <main-argv...>
+        \\  tinymux init fish|sh|bash|zsh|nu
+        \\  tinymux handoff-capture --state <dir> --slot baseline|result
+        \\  tinymux handoff-apply --shell fish|sh|nu --state <dir>
         \\
         \\options:
         \\  --no-tmux-compat    do not expose a private tmux shim to child processes
+        \\  --seamless          avoid raw-mode terminal cleanup/redraw bytes unless a split is opened
         \\
     , .{@errorName(err)});
 }
@@ -290,6 +315,8 @@ const Config = struct {
     split_rows: u16 = default_split_rows,
     split_term: TermChoice = .auto,
     tmux_compat: bool = true,
+    seamless: bool = false,
+    handoff_state: ?[]const u8 = null,
     main_argv: []const []const u8,
 };
 
@@ -319,6 +346,12 @@ fn parseArgs(args: []const []const u8) !Config {
             config.split_term = try TermChoice.parse(args[i]);
         } else if (std.mem.eql(u8, arg, "--no-tmux-compat")) {
             config.tmux_compat = false;
+        } else if (std.mem.eql(u8, arg, "--seamless")) {
+            config.seamless = true;
+        } else if (std.mem.eql(u8, arg, "--handoff-state")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHandoffState;
+            config.handoff_state = args[i];
         } else {
             return error.UnknownArgument;
         }
@@ -328,6 +361,396 @@ fn parseArgs(args: []const []const u8) !Config {
     if (i >= args.len) return error.MissingMainCommand;
     config.main_argv = args[i..];
     return config;
+}
+
+fn runInit(args: []const []const u8) !void {
+    if (args.len != 1) return error.UnsupportedShell;
+    const shell = shell_scripts.parseInitShell(args[0]) orelse return error.UnsupportedShell;
+
+    var stdout = std.fs.File.stdout().writer(&.{});
+    try stdout.interface.writeAll(shell_scripts.initScript(shell));
+    try stdout.interface.flush();
+}
+
+fn runDirenvInstantWrapper(args: []const []const u8) !void {
+    if (args.len == 2 and std.mem.eql(u8, args[0], "hook")) {
+        try runDirenvInstantHook(args[1]);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[0], "child-init")) {
+        try runDirenvInstantChildInit(args[1]);
+        return;
+    }
+    try printDirenvInstantUsage();
+    return error.InvalidDirenvInstantCommand;
+}
+
+fn printDirenvInstantUsage() !void {
+    var stderr = std.fs.File.stderr().writer(&.{});
+    try stderr.interface.writeAll(
+        \\usage:
+        \\  tinymux-direnv-instant hook bash|zsh|fish|nu
+        \\  tinymux-direnv-instant child-init bash|zsh|fish|nu
+        \\
+    );
+    try stderr.interface.flush();
+}
+
+fn runDirenvInstantHook(shell_name: []const u8) !void {
+    const shell = shell_scripts.parseDirenvShell(shell_name) orelse return error.UnsupportedShell;
+
+    var stdout = std.fs.File.stdout().writer(&.{});
+    try stdout.interface.writeAll(shell_scripts.direnvHook(shell));
+    try stdout.interface.flush();
+}
+
+fn runDirenvInstantChildInit(shell_name: []const u8) !void {
+    const shell = shell_scripts.parseDirenvShell(shell_name) orelse return error.UnsupportedShell;
+    const child_init = shell_scripts.direnvChildInit(shell);
+
+    var stdout = std.fs.File.stdout().writer(&.{});
+    if (child_init.prefix) |prefix| try stdout.interface.writeAll(prefix);
+    try stdout.interface.writeAll(child_init.hook);
+    try stdout.interface.writeAll(child_init.guard);
+    try stdout.interface.flush();
+}
+
+fn runHandoffCapture(alloc: std.mem.Allocator, args: []const []const u8) !void {
+    var state: ?[]const u8 = null;
+    var slot: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--state")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHandoffState;
+            state = args[i];
+        } else if (std.mem.eql(u8, args[i], "--slot")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHandoffSlot;
+            slot = args[i];
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+
+    const state_dir = state orelse return error.MissingHandoffState;
+    const slot_name = slot orelse return error.MissingHandoffSlot;
+    if (!validHandoffSlot(slot_name)) return error.InvalidHandoffSlot;
+
+    try std.fs.cwd().makePath(state_dir);
+    const cwd_path = try handoffPath(alloc, state_dir, slot_name, "cwd");
+    defer alloc.free(cwd_path);
+    const env_path = try handoffPath(alloc, state_dir, slot_name, "env");
+    defer alloc.free(env_path);
+
+    const cwd = try std.fs.cwd().realpathAlloc(alloc, ".");
+    defer alloc.free(cwd);
+    try writeFile(cwd_path, cwd);
+    try writeEnvSnapshot(alloc, env_path);
+}
+
+fn runHandoffApply(alloc: std.mem.Allocator, args: []const []const u8) !void {
+    var state: ?[]const u8 = null;
+    var shell: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--state")) {
+            i += 1;
+            if (i >= args.len) return error.MissingHandoffState;
+            state = args[i];
+        } else if (std.mem.eql(u8, args[i], "--shell")) {
+            i += 1;
+            if (i >= args.len) return error.UnsupportedShell;
+            shell = args[i];
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+
+    const state_dir = state orelse return error.MissingHandoffState;
+    const shell_name = shell orelse return error.UnsupportedShell;
+    const apply_shell = parseApplyShell(shell_name) orelse return error.UnsupportedShell;
+
+    try emitHandoffApply(alloc, state_dir, apply_shell);
+}
+
+const ApplyShell = enum { fish, sh, nu };
+
+fn parseApplyShell(shell_name: []const u8) ?ApplyShell {
+    if (std.mem.eql(u8, shell_name, "fish")) return .fish;
+    if (std.mem.eql(u8, shell_name, "sh") or
+        std.mem.eql(u8, shell_name, "bash") or
+        std.mem.eql(u8, shell_name, "zsh"))
+    {
+        return .sh;
+    }
+    if (std.mem.eql(u8, shell_name, "nu") or std.mem.eql(u8, shell_name, "nushell")) return .nu;
+    return null;
+}
+
+fn validHandoffSlot(slot: []const u8) bool {
+    return std.mem.eql(u8, slot, "baseline") or std.mem.eql(u8, slot, "result");
+}
+
+fn handoffPath(alloc: std.mem.Allocator, state_dir: []const u8, slot: []const u8, suffix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}.{s}", .{ state_dir, slot, suffix });
+}
+
+fn writeFile(path: []const u8, bytes: []const u8) !void {
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
+}
+
+fn writeEnvSnapshot(alloc: std.mem.Allocator, path: []const u8) !void {
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(&buffer);
+    const out = &writer.interface;
+
+    var it = env.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        try out.print("{d}\n", .{key.len});
+        try out.writeAll(key);
+        try out.writeByte('\n');
+        try out.print("{d}\n", .{value.len});
+        try out.writeAll(value);
+        try out.writeByte('\n');
+    }
+    try out.flush();
+}
+
+const EnvSnapshot = struct {
+    data: []u8,
+    map: std.StringHashMap([]const u8),
+
+    fn deinit(self: *EnvSnapshot, alloc: std.mem.Allocator) void {
+        self.map.deinit();
+        alloc.free(self.data);
+        self.* = undefined;
+    }
+};
+
+fn readEnvSnapshot(alloc: std.mem.Allocator, path: []const u8) !EnvSnapshot {
+    const data = try std.fs.cwd().readFileAlloc(alloc, path, max_handoff_state_bytes);
+    errdefer alloc.free(data);
+    var map = std.StringHashMap([]const u8).init(alloc);
+    errdefer map.deinit();
+
+    var index: usize = 0;
+    while (index < data.len) {
+        const key_len = try parseSnapshotLen(data, &index);
+        const key = try parseSnapshotBytes(data, &index, key_len);
+        const value_len = try parseSnapshotLen(data, &index);
+        const value = try parseSnapshotBytes(data, &index, value_len);
+        try map.put(key, value);
+    }
+
+    return .{ .data = data, .map = map };
+}
+
+fn parseSnapshotLen(data: []const u8, index: *usize) !usize {
+    const start = index.*;
+    while (index.* < data.len and data[index.*] != '\n') : (index.* += 1) {}
+    if (index.* >= data.len or index.* == start) return error.InvalidHandoffState;
+    const len = try std.fmt.parseUnsigned(usize, data[start..index.*], 10);
+    index.* += 1;
+    return len;
+}
+
+fn parseSnapshotBytes(data: []const u8, index: *usize, len: usize) ![]const u8 {
+    if (index.* + len > data.len) return error.InvalidHandoffState;
+    const bytes = data[index.* .. index.* + len];
+    index.* += len;
+    if (index.* >= data.len or data[index.*] != '\n') return error.InvalidHandoffState;
+    index.* += 1;
+    return bytes;
+}
+
+fn emitHandoffApply(alloc: std.mem.Allocator, state_dir: []const u8, shell: ApplyShell) !void {
+    const baseline_path = try handoffPath(alloc, state_dir, "baseline", "env");
+    defer alloc.free(baseline_path);
+    const result_path = try handoffPath(alloc, state_dir, "result", "env");
+    defer alloc.free(result_path);
+    const result_cwd_path = try handoffPath(alloc, state_dir, "result", "cwd");
+    defer alloc.free(result_cwd_path);
+
+    var baseline = readEnvSnapshot(alloc, baseline_path) catch |err| switch (err) {
+        error.FileNotFound => EnvSnapshot{
+            .data = try alloc.dupe(u8, ""),
+            .map = std.StringHashMap([]const u8).init(alloc),
+        },
+        else => return err,
+    };
+    defer baseline.deinit(alloc);
+
+    var result = readEnvSnapshot(alloc, result_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer result.deinit(alloc);
+
+    const result_cwd = std.fs.cwd().readFileAlloc(alloc, result_cwd_path, std.fs.max_path_bytes) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (result_cwd) |cwd| alloc.free(cwd);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&stdout_buffer);
+    const out = &stdout.interface;
+
+    if (shell == .nu) {
+        try emitNuHandoffApply(out, &baseline, &result, result_cwd);
+        try out.flush();
+        return;
+    }
+
+    if (result_cwd) |cwd| {
+        if (cwd.len > 0) {
+            if (shell == .fish) {
+                try out.writeAll("cd -- ");
+                try writeFishQuoted(out, cwd);
+                try out.writeByte('\n');
+            } else {
+                try out.writeAll("cd -- ");
+                try writeShQuoted(out, cwd);
+                try out.writeByte('\n');
+            }
+        }
+    }
+
+    var it = result.map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (!handoffVarAllowed(key)) continue;
+        if (baseline.map.get(key)) |old| {
+            if (std.mem.eql(u8, old, value)) continue;
+        }
+        if (shell == .fish) {
+            try out.writeAll("set -gx ");
+            try out.writeAll(key);
+            try out.writeByte(' ');
+            try writeFishQuoted(out, value);
+            try out.writeByte('\n');
+        } else {
+            try out.writeAll("export ");
+            try out.writeAll(key);
+            try out.writeByte('=');
+            try writeShQuoted(out, value);
+            try out.writeByte('\n');
+        }
+    }
+    try out.flush();
+}
+
+fn emitNuHandoffApply(
+    out: *std.Io.Writer,
+    baseline: *const EnvSnapshot,
+    result: *const EnvSnapshot,
+    result_cwd: ?[]const u8,
+) !void {
+    try out.writeAll("{\"cwd\":");
+    if (result_cwd) |cwd| {
+        if (cwd.len == 0) {
+            try out.writeAll("null");
+        } else {
+            try writeJsonString(out, cwd);
+        }
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"env\":{");
+
+    var first = true;
+    var it = result.map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (!handoffVarAllowed(key)) continue;
+        if (baseline.map.get(key)) |old| {
+            if (std.mem.eql(u8, old, value)) continue;
+        }
+        if (!first) try out.writeByte(',');
+        first = false;
+        try writeJsonString(out, key);
+        try out.writeByte(':');
+        try writeJsonString(out, value);
+    }
+    try out.writeAll("}}\n");
+}
+
+fn handoffVarAllowed(key: []const u8) bool {
+    if (!isShellIdentifier(key)) return false;
+    if (std.mem.eql(u8, key, "_")) return false;
+    if (std.mem.eql(u8, key, "PWD")) return false;
+    if (std.mem.eql(u8, key, "OLDPWD")) return false;
+    if (std.mem.eql(u8, key, "SHLVL")) return false;
+    if (std.mem.eql(u8, key, "TERM")) return false;
+    if (std.mem.eql(u8, key, "SHELL")) return false;
+    if (std.mem.startsWith(u8, key, "TMUX")) return false;
+    if (std.mem.eql(u8, key, "TINYMUX")) return false;
+    if (std.mem.startsWith(u8, key, "TINYMUX_")) return false;
+    return true;
+}
+
+fn isShellIdentifier(key: []const u8) bool {
+    if (key.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(key[0]) or key[0] == '_')) return false;
+    for (key[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return true;
+}
+
+fn writeShQuoted(out: *std.Io.Writer, bytes: []const u8) !void {
+    try out.writeByte('\'');
+    for (bytes) |byte| {
+        if (byte == '\'') {
+            try out.writeAll("'\\''");
+        } else {
+            try out.writeByte(byte);
+        }
+    }
+    try out.writeByte('\'');
+}
+
+fn writeFishQuoted(out: *std.Io.Writer, bytes: []const u8) !void {
+    try out.writeByte('\'');
+    for (bytes) |byte| {
+        if (byte == '\'' or byte == '\\') try out.writeByte('\\');
+        try out.writeByte(byte);
+    }
+    try out.writeByte('\'');
+}
+
+fn writeJsonString(out: *std.Io.Writer, bytes: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try out.writeByte('"');
+    for (bytes) |byte| {
+        switch (byte) {
+            '"' => try out.writeAll("\\\""),
+            '\\' => try out.writeAll("\\\\"),
+            '\n' => try out.writeAll("\\n"),
+            '\r' => try out.writeAll("\\r"),
+            '\t' => try out.writeAll("\\t"),
+            else => if (byte < 0x20) {
+                try out.writeAll("\\u00");
+                try out.writeByte(hex[@as(usize, byte >> 4)]);
+                try out.writeByte(hex[@as(usize, byte & 0x0f)]);
+            } else {
+                try out.writeByte(byte);
+            },
+        }
+    }
+    try out.writeByte('"');
 }
 
 const tmux_control_magic = "TINYMUX_TMUX_CONTROL_1";
@@ -2473,6 +2896,8 @@ const App = struct {
     cell_size: CellSize,
     split_replay_anchor: ?*vt.Pin = null,
     tmux_runtime: ?TmuxRuntime = null,
+    outer_canvas_active: bool = false,
+    terminal_restore_needed: bool = false,
 
     fn init(alloc: std.mem.Allocator, config: Config) !App {
         var tmux_runtime: ?TmuxRuntime = if (config.tmux_compat)
@@ -2490,11 +2915,16 @@ const App = struct {
 
         const outer_term = posix.getenv("TERM");
         const colorterm = posix.getenv("COLORTERM");
-        const main_term = selectTerm(.auto, outer_term, colorterm);
-
         var main_env = try std.process.getEnvMap(alloc);
         defer main_env.deinit();
-        try main_env.put("TERM", main_term);
+        if (!config.seamless) {
+            const main_term = selectTerm(.auto, outer_term, colorterm);
+            try main_env.put("TERM", main_term);
+        }
+        if (config.handoff_state) |state| {
+            try main_env.put("TINYMUX_HANDOFF_STATE", state);
+            try main_env.put("TINYMUX_SEAMLESS", "1");
+        }
         try applyTinymuxEnv(alloc, &main_env, if (tmux_runtime) |*runtime| runtime else null, "%0");
         const main_pane = try Pane.create(
             alloc,
@@ -2544,6 +2974,7 @@ const App = struct {
             .active_split_rows = config.split_rows,
             .cell_size = cell_size,
             .tmux_runtime = tmux_runtime,
+            .terminal_restore_needed = !config.seamless,
         };
     }
 
@@ -2563,7 +2994,7 @@ const App = struct {
         self.main_pane.passthrough = !self.composed;
         if (self.composed) {
             try self.recordSplitReplayAnchor();
-            try protocol.writeAll(stdout_fd, enter_canvas);
+            try self.enterOuterCanvas();
             try self.writeInitialComposedCanvas();
             self.compositor.invalidate();
         }
@@ -2699,8 +3130,27 @@ const App = struct {
         defer out.deinit(self.alloc);
         self.endComposedMainPassthrough() catch {};
         self.compositor.graphics.deleteAll(self.alloc, &out) catch {};
-        out.appendSlice(self.alloc, leave_canvas) catch {};
+        if (self.outer_canvas_active) {
+            out.appendSlice(self.alloc, leave_canvas) catch {};
+            self.outer_canvas_active = false;
+            self.terminal_restore_needed = false;
+        } else if (self.terminal_restore_needed) {
+            out.appendSlice(self.alloc, restore_terminal_sequence) catch {};
+            self.terminal_restore_needed = false;
+        }
         protocol.writeAll(stdout_fd, out.items) catch {};
+    }
+
+    fn enterOuterCanvas(self: *App) !void {
+        try protocol.writeAll(stdout_fd, enter_canvas);
+        self.outer_canvas_active = true;
+        self.terminal_restore_needed = true;
+    }
+
+    fn leaveOuterCanvas(self: *App, out: *std.ArrayList(u8)) !void {
+        try out.appendSlice(self.alloc, leave_canvas);
+        self.outer_canvas_active = false;
+        self.terminal_restore_needed = true;
     }
 
     fn writeInitialComposedCanvas(self: *App) !void {
@@ -3257,7 +3707,7 @@ const App = struct {
         const pane = try self.createSplitPaneFrom(argv, env, cwd, self.layout.split_rows);
         errdefer pane.destroy();
 
-        try protocol.writeAll(stdout_fd, enter_canvas);
+        try self.enterOuterCanvas();
         self.split_pane = pane;
         self.split_autoclose = autoclose;
         self.composed = true;
@@ -3290,7 +3740,7 @@ const App = struct {
         var leave: std.ArrayList(u8) = .empty;
         defer leave.deinit(self.alloc);
         try self.compositor.graphics.deleteAll(self.alloc, &leave);
-        try leave.appendSlice(self.alloc, leave_canvas);
+        try self.leaveOuterCanvas(&leave);
         try protocol.writeAll(stdout_fd, leave.items);
         if (history_replay) |bytes| {
             try protocol.writeAll(stdout_fd, bytes);
