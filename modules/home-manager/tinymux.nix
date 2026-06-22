@@ -32,7 +32,7 @@ in
         defaultText = lib.literalExpression "pkgs.direnv-instant";
         description = ''
           The direnv-instant package to install alongside tinymux. Set this
-          explicitly when direnv-instant is not available from nixpkgs.
+          to null when another module already installs direnv-instant.
         '';
       };
 
@@ -46,16 +46,6 @@ in
   };
 
   config = mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = !cfg.direnvInstant.enable || cfg.direnvInstant.package != null;
-        message = ''
-          programs.tinymux.direnvInstant.package must be set because
-          pkgs.direnv-instant is not available.
-        '';
-      }
-    ];
-
     home.packages =
       [ cfg.package ]
       ++ optional (cfg.direnvInstant.enable && cfg.direnvInstant.package != null) cfg.direnvInstant.package;
