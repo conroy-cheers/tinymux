@@ -134,6 +134,7 @@ class ForkSession:
         extra_env: dict[str, str] | None = None,
         rows: int = DEFAULT_ROWS,
         cols: int = DEFAULT_COLS,
+        cwd: str | None = None,
     ) -> None:
         self.pid, self.master = pty.fork()
         if self.pid == 0:
@@ -142,6 +143,8 @@ class ForkSession:
             env.setdefault("SHELL", "/bin/sh")
             if extra_env is not None:
                 env.update(extra_env)
+            if cwd is not None:
+                os.chdir(cwd)
             os.execvpe(argv[0], argv, env)
         set_winsize(self.master, rows, cols)
         self.output = b""
@@ -1267,6 +1270,83 @@ def test_direnv_instant_fish_wrapper_enters_tinymux_without_env_command_error(ti
             session.close()
 
 
+def test_direnv_instant_fish_wrapper_enters_tinymux_when_sourced_inside_root(tinymux: str) -> None:
+    fish = shutil.which("fish")
+    bash = shutil.which("bash")
+    if fish is None or bash is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    wrapper = direnv_wrapper_for(tinymux_abs)
+    with tempfile.TemporaryDirectory() as root:
+        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
+        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
+        env["SHELL"] = fish
+        session = ForkSession([fish, "--no-config", "--interactive"], extra_env=env)
+        try:
+            session.write(b"function fish_prompt; end\n")
+            session.write(f"cd {shlex.quote(project)}\n".encode())
+            session.drain_until_idle(idle=0.2, timeout=5.0)
+
+            start = len(session.output)
+            session.write(f"{shlex.quote(wrapper)} hook fish | source\n".encode())
+            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", start, timeout=10.0)
+            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
+            after = session.output[start:]
+            assert b"NotATerminal" not in after, (
+                "fish startup hook tried to capture handoff state while stdin was the source pipe; "
+                f"output={after[-2000:]!r}"
+            )
+        finally:
+            session.close()
+
+
+def test_direnv_instant_fish_startup_enters_before_parent_greeting(tinymux: str) -> None:
+    fish = shutil.which("fish")
+    bash = shutil.which("bash")
+    if fish is None or bash is None:
+        return
+
+    tinymux_abs = os.path.abspath(tinymux)
+    wrapper = direnv_wrapper_for(tinymux_abs)
+    with tempfile.TemporaryDirectory() as root:
+        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
+        xdg_config = os.path.join(root, "xdg-config")
+        fish_config_dir = os.path.join(xdg_config, "fish")
+        os.makedirs(fish_config_dir)
+        with open(os.path.join(fish_config_dir, "config.fish"), "w", encoding="utf-8") as file:
+            file.write(
+                f"""
+function fish_greeting
+    printf 'GREETING|TERM=%s|TINYMUX=%s\\n' "$TERM" "$TINYMUX"
+end
+{shlex.quote(wrapper)} hook fish | source
+"""
+            )
+
+        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
+        env["SHELL"] = fish
+        env["XDG_CONFIG_HOME"] = xdg_config
+        session = ForkSession([fish, "--interactive"], extra_env=env, cwd=project)
+        try:
+            session.wait_for(b"DIRENV_TINYMUX_LOG_READY", timeout=10.0)
+            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
+            assert b"NotATerminal" not in session.output, (
+                "fish startup hook tried to enter tinymux before reconnecting to /dev/tty; "
+                f"output={session.output[-2000:]!r}"
+            )
+            assert b"|TINYMUX=\r\n" not in session.output, (
+                "parent fish greeting ran before the tinymux handoff child took over; "
+                f"output={session.output[-2000:]!r}"
+            )
+            assert b"|TINYMUX=1" in session.output, (
+                "tinymux handoff child did not run the interactive fish greeting; "
+                f"output={session.output[-2000:]!r}"
+            )
+        finally:
+            session.close()
+
+
 def test_direnv_instant_wrapper_child_exit_exits_parent_shell(tinymux: str) -> None:
     bash = shutil.which("bash")
     if bash is None:
@@ -1664,6 +1744,8 @@ def main() -> int:
         test_direnv_instant_wrapper_outputs_hooks,
         test_direnv_instant_wrapper_enters_tinymux_and_returns_after_leaving_root,
         test_direnv_instant_fish_wrapper_enters_tinymux_without_env_command_error,
+        test_direnv_instant_fish_wrapper_enters_tinymux_when_sourced_inside_root,
+        test_direnv_instant_fish_startup_enters_before_parent_greeting,
         test_direnv_instant_wrapper_child_exit_exits_parent_shell,
         test_direnv_instant_wrapper_skips_entry_inside_foreign_mux,
         test_fish_seamless_enter_exit_restores_cwd_and_env,
