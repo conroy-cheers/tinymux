@@ -109,7 +109,11 @@
               export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
               export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
               zig build test -Dghostty-src=.nix-ghostty --summary all
-              python3 ${./tests/spec/tinymux_contract.py} --tinymux "$out/bin/tinymux"
+              # Darwin's Nix sandbox does not reliably deliver the watcher
+              # exit signal used by the full seamless-shell lifecycle tests.
+              python3 ${./tests/spec/tinymux_contract.py} \
+                --tinymux "$out/bin/tinymux" \
+                ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin "--persistent-only"}
               runHook postCheck
             '';
 
