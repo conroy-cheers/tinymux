@@ -679,6 +679,83 @@ def test_split_replays_kitty_png_graphics(tinymux: str) -> None:
         session.close()
 
 
+def test_persistent_split_hands_kitty_placements_back_to_raw_mode(tinymux: str) -> None:
+    outer_id = 0x70000000
+    command = (
+        "printf '\\033[4;6H"
+        "\\033_Ga=T,f=24,t=d,i=77,p=23,s=1,v=1,c=2,r=2,q=2;////\\033\\\\"
+        "\\033[1;1HRAW_IMAGE_READY'; "
+        "sleep 0.2; "
+        "tmux split-window -d -l 5 /bin/sh -lc 'sleep 0.4'; "
+        "sleep 1; "
+        "printf 'RAW_IMAGE_CLOSE_DONE'; "
+        "sleep 5"
+    )
+    session = Session(
+        [tinymux, "session", "--", "/bin/sh", "-c", command],
+        extra_env={"TERM": "xterm-ghostty"},
+    )
+    try:
+        session.wait_for(b"RAW_IMAGE_CLOSE_DONE", timeout=8.0)
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+        output = session.output
+
+        raw_upload = output.index(b"a=T,f=24,t=d,i=77,p=23")
+        raw_delete = output.index(b"a=d,d=I,i=77", raw_upload)
+        managed_upload = output.index(f"a=t,t=d,f=24,s=1,v=1,i={outer_id}".encode(), raw_delete)
+        managed_delete = output.index(f"a=d,d=I,i={outer_id}".encode(), managed_upload)
+        restored_upload = output.index(b"a=t,t=d,f=24,s=1,v=1,i=77", managed_delete)
+        restored_placement = output.index(b"a=p,i=77,p=23", restored_upload)
+
+        assert raw_upload < raw_delete < managed_upload < managed_delete
+        assert managed_delete < restored_upload < restored_placement
+        assert f"a=p,i={outer_id}".encode() not in output[managed_delete:], (
+            "split-close text reconciliation recreated a compositor-owned placement"
+        )
+        assert output.count(b"a=p,i=77,p=23") == 1, (
+            "raw application placement was restored more than once"
+        )
+    finally:
+        session.close()
+
+
+def test_persistent_split_keeps_kitty_images_screen_local(tinymux: str) -> None:
+    outer_id = 0x70000000
+    command = (
+        "printf '\033[2;2H"
+        "\033_Ga=T,f=24,t=d,i=81,p=31,s=1,v=1,c=1,r=1,q=2;////\033\\"
+        "\033[?47h\033[3;4H"
+        "\033_Ga=T,f=24,t=d,i=82,p=32,s=1,v=1,c=1,r=1,q=2;AAAA\033\\"
+        "\033[1;1HSCREEN_IMAGE_READY'; "
+        "sleep 0.2; "
+        "tmux split-window -d -l 5 /bin/sh -lc 'sleep 0.8'; "
+        "sleep 0.15; printf '\033[?47l'; "
+        "sleep 0.15; printf '\033[?47h'; "
+        "sleep 1; printf 'SCREEN_IMAGE_CLOSE_DONE'; sleep 5"
+    )
+    session = Session(
+        [tinymux, "session", "--", "/bin/sh", "-c", command],
+        extra_env={"TERM": "xterm-ghostty"},
+    )
+    try:
+        session.wait_for(b"SCREEN_IMAGE_CLOSE_DONE", timeout=8.0)
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+        output = session.output
+        managed_upload = f"a=t,t=d,f=24,s=1,v=1,i={outer_id}".encode()
+        managed_delete = f"a=d,d=I,i={outer_id}".encode()
+
+        assert output.count(managed_upload) == 2, (
+            "primary and alternate buffers did not receive independent compositor images"
+        )
+        assert output.count(managed_delete) == 2, (
+            "compositor images were not deleted from both outer screen buffers"
+        )
+        assert output.count(b"a=p,i=81,p=31") == 1
+        assert output.count(b"a=p,i=82,p=32") == 1
+    finally:
+        session.close()
+
+
 def test_split_close_switches_to_raw_main(tinymux: str) -> None:
     session = Session(
         [
@@ -2237,6 +2314,8 @@ def main() -> int:
         test_split_close_preserves_primary_terminal_without_whitespace,
         test_in_place_split_resizes_main_like_tmux,
         test_split_close_reconciles_application_alternate_screen,
+        test_persistent_split_hands_kitty_placements_back_to_raw_mode,
+        test_persistent_split_keeps_kitty_images_screen_local,
         test_direnv_instant_wrapper_outputs_hooks,
         test_persistent_main_preserves_host_integration_but_auxiliary_scrubs_it,
         test_tmux_compat_env_and_private_shim,
@@ -2281,6 +2360,8 @@ def main() -> int:
         test_split_close_preserves_primary_terminal_without_whitespace,
         test_in_place_split_resizes_main_like_tmux,
         test_split_close_reconciles_application_alternate_screen,
+        test_persistent_split_hands_kitty_placements_back_to_raw_mode,
+        test_persistent_split_keeps_kitty_images_screen_local,
         test_raw_output_is_tracked_for_reopened_split,
         test_tmux_compat_env_and_private_shim,
         test_real_direnv_instant_daemon_opens_tmux_split,

@@ -31,6 +31,18 @@ The main application may enter or leave its own alternate screen while a split
 is visible. Those application-owned switches are mirrored to the outer
 terminal, and both touched buffers are reconciled before raw handoff.
 
+Kitty graphics have the same ownership boundary. Before composition Tinymux
+removes app-owned images from each outer screen using their application image
+ID or image number, while retaining the decoded image in the shadow model.
+Composition uses a private image-ID range and independent primary/alternate
+screen caches. On close, those private images are deleted and the application
+images and placements are restored under their original references before raw
+passthrough resumes. The restored physical references are retained per screen
+for the next ownership transition, including the distinct handling required
+when an image number has multiple historical images. Implicit-ID images, which
+have no stable protocol reference on the first transition, are removed by
+their visible placement cell and thereafter use a remembered shadow-owned ID.
+
 ## Scrollback and host effects
 
 Native scrollback is guaranteed in raw mode. While composed, Tinymux emits only
