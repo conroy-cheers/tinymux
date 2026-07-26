@@ -203,6 +203,16 @@ pub fn main() !void {
         return;
     }
 
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "pane")) {
+        const code = runNativeControlClient(alloc, args[1..]) catch |err| blk: {
+            var stderr = std.fs.File.stderr().writer(&.{});
+            try stderr.interface.print("tinymux: control request failed: {s}\n", .{@errorName(err)});
+            break :blk 1;
+        };
+        if (code != 0) std.process.exit(code);
+        return;
+    }
+
     if (args.len >= 2 and std.mem.eql(u8, args[1], "init")) {
         try runInit(args[2..]);
         return;
@@ -232,6 +242,10 @@ fn printUsage(err: anyerror) !void {
         \\tinymux: {s}
         \\
         \\usage:
+        \\  tinymux session [--no-tmux-compat] -- <main-argv...>
+        \\  tinymux pane run [--role direnv|manual] [--replace=same-role] [--rows <n>] -- <argv...>
+        \\  tinymux pane close <generation>
+        \\  tinymux pane status
         \\  tinymux --split <split-cmd> [--split-rows <n>] [--split-term auto|xterm-256color|xterm-direct|xterm-kitty|xterm-ghostty] -- <main-argv...>
         \\  tinymux --seamless [--handoff-state <dir>] -- <main-argv...>
         \\  tinymux -- <main-argv...>
@@ -241,6 +255,7 @@ fn printUsage(err: anyerror) !void {
         \\
         \\options:
         \\  --no-tmux-compat    do not expose a private tmux shim to child processes
+        \\  session             run one seamless multiplexer for the main process lifetime
         \\  --seamless          avoid raw-mode terminal cleanup/redraw bytes unless a split is opened
         \\
     , .{@errorName(err)});
@@ -316,6 +331,7 @@ const Config = struct {
     split_term: TermChoice = .auto,
     tmux_compat: bool = true,
     seamless: bool = false,
+    session: bool = false,
     handoff_state: ?[]const u8 = null,
     main_argv: []const []const u8,
 };
@@ -323,6 +339,11 @@ const Config = struct {
 fn parseArgs(args: []const []const u8) !Config {
     var config: Config = .{ .main_argv = &.{} };
     var i: usize = 1;
+    if (i < args.len and std.mem.eql(u8, args[i], "session")) {
+        config.session = true;
+        config.seamless = true;
+        i += 1;
+    }
     var saw_separator = false;
     while (i < args.len) {
         const arg = args[i];
@@ -359,6 +380,7 @@ fn parseArgs(args: []const []const u8) !Config {
     }
     if (!saw_separator) return error.MissingCommandSeparator;
     if (i >= args.len) return error.MissingMainCommand;
+    if (config.session and config.handoff_state != null) return error.SessionDoesNotUseHandoff;
     config.main_argv = args[i..];
     return config;
 }
@@ -754,13 +776,47 @@ fn writeJsonString(out: *std.Io.Writer, bytes: []const u8) !void {
 }
 
 const tmux_control_magic = "TINYMUX_TMUX_CONTROL_1";
+const native_control_magic = "TINYMUX_CONTROL_2";
 const max_control_line: usize = 128;
 const max_control_frame: usize = 1024 * 1024;
 const max_control_items: usize = 4096;
+const max_control_request: usize = 16 * 1024 * 1024;
+const max_control_connections: usize = 16;
+const control_connection_timeout_ns: i128 = 2 * std.time.ns_per_s;
 
 const SplitWindowCommand = struct {
     rows: u16,
     argv: []const []const u8,
+};
+
+const PaneRole = enum {
+    direnv,
+    manual,
+    tmux_compat,
+
+    fn parse(value: []const u8) !PaneRole {
+        if (std.mem.eql(u8, value, "direnv")) return .direnv;
+        if (std.mem.eql(u8, value, "manual")) return .manual;
+        return error.UnsupportedPaneRole;
+    }
+};
+
+const ReplacePolicy = enum {
+    reject,
+    same_role,
+};
+
+const PaneRunCommand = struct {
+    rows: u16,
+    role: PaneRole,
+    replace: ReplacePolicy,
+    argv: []const []const u8,
+};
+
+const NativeCommand = union(enum) {
+    pane_run: PaneRunCommand,
+    pane_close: u64,
+    pane_status,
 };
 
 const KillPaneCommand = struct {
@@ -782,6 +838,54 @@ fn parseTmuxCommand(args: []const []const u8) !TmuxCommand {
         return .{ .kill_pane = try parseTmuxKillPane(args[1..]) };
     }
     return error.UnsupportedTmuxCommand;
+}
+
+fn parseNativeCommand(args: []const []const u8) !NativeCommand {
+    if (args.len < 2 or !std.mem.eql(u8, args[0], "pane")) return error.UnsupportedControlCommand;
+    if (std.mem.eql(u8, args[1], "run")) {
+        var rows = default_split_rows;
+        var role: PaneRole = .manual;
+        var replace: ReplacePolicy = .reject;
+        var i: usize = 2;
+        while (i < args.len) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--")) {
+                i += 1;
+                break;
+            } else if (std.mem.eql(u8, arg, "--rows")) {
+                i += 1;
+                if (i >= args.len) return error.MissingSplitRows;
+                rows = try parseTmuxRows(args[i]);
+                i += 1;
+            } else if (std.mem.eql(u8, arg, "--role")) {
+                i += 1;
+                if (i >= args.len) return error.MissingPaneRole;
+                role = try PaneRole.parse(args[i]);
+                i += 1;
+            } else if (std.mem.eql(u8, arg, "--replace=same-role")) {
+                replace = .same_role;
+                i += 1;
+            } else {
+                return error.UnsupportedPaneOption;
+            }
+        }
+        if (i >= args.len) return error.MissingSplitCommand;
+        return .{ .pane_run = .{
+            .rows = rows,
+            .role = role,
+            .replace = replace,
+            .argv = args[i..],
+        } };
+    }
+    if (std.mem.eql(u8, args[1], "close")) {
+        if (args.len != 3) return error.MissingPaneGeneration;
+        return .{ .pane_close = try std.fmt.parseUnsigned(u64, args[2], 10) };
+    }
+    if (std.mem.eql(u8, args[1], "status")) {
+        if (args.len != 2) return error.UnsupportedPaneOption;
+        return .pane_status;
+    }
+    return error.UnsupportedControlCommand;
 }
 
 fn parseTmuxSplitWindow(args: []const []const u8) !SplitWindowCommand {
@@ -843,6 +947,7 @@ fn parseTmuxKillPane(args: []const []const u8) !KillPaneCommand {
 }
 
 const TmuxRuntime = struct {
+    session_id: []const u8,
     dir_path: []const u8,
     socket_path: []const u8,
     shim_path: []const u8,
@@ -850,14 +955,30 @@ const TmuxRuntime = struct {
 
     fn init(alloc: std.mem.Allocator) !TmuxRuntime {
         const tmp = posix.getenv("TMPDIR") orelse "/tmp";
-        const dir_path = try std.fmt.allocPrint(
-            alloc,
-            "{s}/tinymux-{d}-{d}",
-            .{ tmp, std.c.getpid(), std.time.milliTimestamp() },
-        );
+        var runtime_root = try alloc.dupe(u8, tmp);
+        defer alloc.free(runtime_root);
+        if (posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime| {
+            const candidate = try std.fs.path.join(alloc, &.{ xdg_runtime, "tinymux" });
+            if (ensurePrivateRuntimeDir(candidate)) {
+                alloc.free(runtime_root);
+                runtime_root = candidate;
+            } else {
+                alloc.free(candidate);
+            }
+        }
+
+        const session_id = try std.fmt.allocPrint(alloc, "{d}-{x}", .{
+            std.c.getpid(),
+            std.crypto.random.int(u64),
+        });
+        errdefer alloc.free(session_id);
+
+        const dir_name = try std.fmt.allocPrint(alloc, "tinymux-{s}", .{session_id});
+        defer alloc.free(dir_name);
+        const dir_path = try std.fs.path.join(alloc, &.{ runtime_root, dir_name });
         errdefer alloc.free(dir_path);
 
-        try std.fs.makeDirAbsolute(dir_path);
+        try posix.mkdir(dir_path, 0o700);
         errdefer std.fs.deleteTreeAbsolute(dir_path) catch {};
 
         const socket_path = try std.fs.path.join(alloc, &.{ dir_path, "control.sock" });
@@ -875,6 +996,7 @@ const TmuxRuntime = struct {
         errdefer server.deinit();
 
         return .{
+            .session_id = session_id,
             .dir_path = dir_path,
             .socket_path = socket_path,
             .shim_path = shim_path,
@@ -888,8 +1010,26 @@ const TmuxRuntime = struct {
         alloc.free(self.shim_path);
         alloc.free(self.socket_path);
         alloc.free(self.dir_path);
+        alloc.free(self.session_id);
         self.* = undefined;
     }
+};
+
+fn ensurePrivateRuntimeDir(path: []const u8) bool {
+    posix.mkdir(path, 0o700) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return false,
+    };
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return false;
+    defer dir.close();
+    dir.chmod(0o700) catch return false;
+    return true;
+}
+
+const TinymuxEnvRole = enum {
+    main_session,
+    nested_main,
+    auxiliary,
 };
 
 fn applyTinymuxEnv(
@@ -897,10 +1037,23 @@ fn applyTinymuxEnv(
     env: *std.process.EnvMap,
     runtime: ?*const TmuxRuntime,
     pane_id: []const u8,
+    role: TinymuxEnvRole,
 ) !void {
     try env.put("TINYMUX", "1");
+
+    if (role != .main_session) {
+        // Host integration belongs only to the persistent main shell. Nested
+        // legacy shells and auxiliary panes must not publish host prompt/cwd
+        // state through the main terminal.
+        _ = env.remove("GHOSTTY_RESOURCES_DIR");
+        _ = env.remove("GHOSTTY_SHELL_INTEGRATION_XDG_DIR");
+    }
+
     if (runtime) |rt| {
+        try env.put("TINYMUX_SESSION_ID", rt.session_id);
+        try env.put("TINYMUX_CONTROL", rt.socket_path);
         try env.put("TINYMUX_TMUX_SOCKET", rt.socket_path);
+        try env.put("TINYMUX_SHIM_DIR", rt.dir_path);
         try env.put("TMUX_PANE", pane_id);
         const tmux_value = try std.fmt.allocPrint(
             alloc,
@@ -983,7 +1136,10 @@ const SocketReader = struct {
     }
 };
 
+const ControlProtocol = enum { tmux_v1, native_v2 };
+
 const ControlRequest = struct {
+    protocol: ControlProtocol,
     cwd: ?[]u8,
     argv: [][]u8,
     env: std.process.EnvMap,
@@ -992,7 +1148,13 @@ const ControlRequest = struct {
         var reader: SocketReader = .{ .fd = fd };
         const magic = try reader.readLineAlloc(alloc, max_control_line);
         defer alloc.free(magic);
-        if (!std.mem.eql(u8, magic, tmux_control_magic)) return error.InvalidControlMagic;
+        const control_protocol: ControlProtocol =
+            if (std.mem.eql(u8, magic, tmux_control_magic))
+                .tmux_v1
+            else if (std.mem.eql(u8, magic, native_control_magic))
+                .native_v2
+            else
+                return error.InvalidControlMagic;
 
         const cwd_frame = try reader.readFrame(alloc);
         const cwd: ?[]u8 = if (cwd_frame.len == 0) cwd: {
@@ -1023,7 +1185,49 @@ const ControlRequest = struct {
             try env.putMove(key, value);
         }
 
-        return .{ .cwd = cwd, .argv = argv, .env = env };
+        return .{ .protocol = control_protocol, .cwd = cwd, .argv = argv, .env = env };
+    }
+
+    fn readBuffer(alloc: std.mem.Allocator, data: []const u8) !ControlRequest {
+        var reader: ControlBufferReader = .{ .data = data };
+        const magic = try reader.readLine(max_control_line);
+        const control_protocol: ControlProtocol =
+            if (std.mem.eql(u8, magic, tmux_control_magic))
+                .tmux_v1
+            else if (std.mem.eql(u8, magic, native_control_magic))
+                .native_v2
+            else
+                return error.InvalidControlMagic;
+
+        const cwd_frame = try reader.readFrame();
+        const cwd: ?[]u8 = if (cwd_frame.len == 0)
+            null
+        else
+            try alloc.dupe(u8, cwd_frame);
+        errdefer if (cwd) |path| alloc.free(path);
+
+        const argc = try reader.readCount();
+        var argv = try alloc.alloc([]u8, argc);
+        errdefer alloc.free(argv);
+        var argv_len: usize = 0;
+        errdefer for (argv[0..argv_len]) |arg| alloc.free(arg);
+        while (argv_len < argc) : (argv_len += 1) {
+            argv[argv_len] = try alloc.dupe(u8, try reader.readFrame());
+        }
+
+        const env_count = try reader.readCount();
+        var env = std.process.EnvMap.init(alloc);
+        errdefer env.deinit();
+        for (0..env_count) |_| {
+            const key = try alloc.dupe(u8, try reader.readFrame());
+            errdefer alloc.free(key);
+            const value = try alloc.dupe(u8, try reader.readFrame());
+            errdefer alloc.free(value);
+            try env.putMove(key, value);
+        }
+        if (reader.index != data.len) return error.TrailingControlData;
+
+        return .{ .protocol = control_protocol, .cwd = cwd, .argv = argv, .env = env };
     }
 
     fn deinit(self: *ControlRequest, alloc: std.mem.Allocator) void {
@@ -1031,6 +1235,51 @@ const ControlRequest = struct {
         for (self.argv) |arg| alloc.free(arg);
         alloc.free(self.argv);
         self.env.deinit();
+        self.* = undefined;
+    }
+};
+
+const ControlBufferReader = struct {
+    data: []const u8,
+    index: usize = 0,
+
+    fn readLine(self: *ControlBufferReader, max_len: usize) ![]const u8 {
+        const end = std.mem.indexOfScalarPos(u8, self.data, self.index, '\n') orelse
+            return error.IncompleteControlRequest;
+        if (end - self.index > max_len) return error.ControlLineTooLong;
+        const line = self.data[self.index..end];
+        self.index = end + 1;
+        return line;
+    }
+
+    fn readNumber(self: *ControlBufferReader) !usize {
+        return try std.fmt.parseUnsigned(usize, try self.readLine(max_control_line), 10);
+    }
+
+    fn readCount(self: *ControlBufferReader) !usize {
+        const count = try self.readNumber();
+        if (count > max_control_items) return error.ControlRequestTooLarge;
+        return count;
+    }
+
+    fn readFrame(self: *ControlBufferReader) ![]const u8 {
+        const len = try self.readNumber();
+        if (len > max_control_frame) return error.ControlFrameTooLarge;
+        if (len > self.data.len - self.index) return error.IncompleteControlRequest;
+        const frame = self.data[self.index .. self.index + len];
+        self.index += len;
+        return frame;
+    }
+};
+
+const ControlConnection = struct {
+    fd: posix.fd_t,
+    input: std.ArrayList(u8) = .empty,
+    accepted_ns: i128,
+
+    fn deinit(self: *ControlConnection, alloc: std.mem.Allocator) void {
+        posix.close(self.fd);
+        self.input.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1071,8 +1320,14 @@ fn writeControlResponse(fd: posix.fd_t, ok: bool, message: []const u8) void {
     writeFrame(fd, message) catch return;
 }
 
-fn writeShimRequest(alloc: std.mem.Allocator, fd: posix.fd_t, args: []const []const u8) !void {
-    try protocol.writeAll(fd, tmux_control_magic ++ "\n");
+fn writeControlRequest(
+    alloc: std.mem.Allocator,
+    fd: posix.fd_t,
+    magic: []const u8,
+    args: []const []const u8,
+) !void {
+    try protocol.writeAll(fd, magic);
+    try protocol.writeAll(fd, "\n");
 
     const cwd = std.fs.cwd().realpathAlloc(alloc, ".") catch try alloc.dupe(u8, "");
     defer alloc.free(cwd);
@@ -1103,7 +1358,7 @@ fn runTmuxShim(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
     const stream = try std.net.connectUnixSocket(socket_path);
     defer stream.close();
 
-    try writeShimRequest(alloc, stream.handle, args);
+    try writeControlRequest(alloc, stream.handle, tmux_control_magic, args);
     var response = try ControlResponse.read(alloc, stream.handle);
     defer response.deinit(alloc);
 
@@ -1111,6 +1366,33 @@ fn runTmuxShim(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
         var stderr = std.fs.File.stderr().writer(&.{});
         try stderr.interface.print("tmux: {s}\n", .{response.message});
         return 1;
+    }
+    return 0;
+}
+
+fn runNativeControlClient(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
+    const socket_path = posix.getenv("TINYMUX_CONTROL") orelse
+        posix.getenv("TINYMUX_TMUX_SOCKET") orelse {
+        var stderr = std.fs.File.stderr().writer(&.{});
+        try stderr.interface.writeAll("tinymux: no persistent session control socket\n");
+        return 1;
+    };
+    const stream = try std.net.connectUnixSocket(socket_path);
+    defer stream.close();
+
+    try writeControlRequest(alloc, stream.handle, native_control_magic, args);
+    var response = try ControlResponse.read(alloc, stream.handle);
+    defer response.deinit(alloc);
+    if (!response.ok) {
+        var stderr = std.fs.File.stderr().writer(&.{});
+        try stderr.interface.print("tinymux: {s}\n", .{response.message});
+        return 1;
+    }
+    if (response.message.len > 0) {
+        var stdout = std.fs.File.stdout().writer(&.{});
+        try stdout.interface.writeAll(response.message);
+        try stdout.interface.writeByte('\n');
+        try stdout.interface.flush();
     }
     return 0;
 }
@@ -2878,6 +3160,9 @@ const App = struct {
     main_pane: *Pane,
     split_pane: ?*Pane,
     split_autoclose: bool = false,
+    split_generation: ?u64 = null,
+    split_role: ?PaneRole = null,
+    next_split_generation: u64 = 1,
     raw_terminal: RawTerminal,
     compositor: Compositor,
     render_scheduler: RenderScheduler = .{},
@@ -2896,12 +3181,20 @@ const App = struct {
     cell_size: CellSize,
     split_replay_anchor: ?*vt.Pin = null,
     tmux_runtime: ?TmuxRuntime = null,
+    control_connections: std.ArrayList(ControlConnection) = .empty,
     outer_canvas_active: bool = false,
     terminal_restore_needed: bool = false,
 
     fn init(alloc: std.mem.Allocator, config: Config) !App {
         var tmux_runtime: ?TmuxRuntime = if (config.tmux_compat)
-            try TmuxRuntime.init(alloc)
+            TmuxRuntime.init(alloc) catch |err| blk: {
+                var stderr = std.fs.File.stderr().writer(&.{});
+                stderr.interface.print(
+                    "tinymux: control socket unavailable ({s}); continuing without pane control\n",
+                    .{@errorName(err)},
+                ) catch {};
+                break :blk null;
+            }
         else
             null;
         errdefer if (tmux_runtime) |*runtime| runtime.deinit(alloc);
@@ -2925,7 +3218,13 @@ const App = struct {
             try main_env.put("TINYMUX_HANDOFF_STATE", state);
             try main_env.put("TINYMUX_SEAMLESS", "1");
         }
-        try applyTinymuxEnv(alloc, &main_env, if (tmux_runtime) |*runtime| runtime else null, "%0");
+        try applyTinymuxEnv(
+            alloc,
+            &main_env,
+            if (tmux_runtime) |*runtime| runtime else null,
+            "%0",
+            if (config.session) .main_session else .nested_main,
+        );
         const main_pane = try Pane.create(
             alloc,
             config.main_argv,
@@ -2966,6 +3265,9 @@ const App = struct {
             .main_pane = main_pane,
             .split_pane = split_pane,
             .split_autoclose = false,
+            .split_generation = if (split_pane != null) 1 else null,
+            .split_role = if (split_pane != null) .manual else null,
+            .next_split_generation = if (split_pane != null) 2 else 1,
             .raw_terminal = raw_terminal,
             .compositor = .{ .alloc = alloc },
             .render_scheduler = .{},
@@ -2974,6 +3276,7 @@ const App = struct {
             .active_split_rows = config.split_rows,
             .cell_size = cell_size,
             .tmux_runtime = tmux_runtime,
+            .control_connections = .empty,
             .terminal_restore_needed = !config.seamless,
         };
     }
@@ -2987,6 +3290,8 @@ const App = struct {
         self.input_buffer.deinit(self.alloc);
         self.deferred_main_state.deinit(self.alloc);
         self.compositor.deinit();
+        for (self.control_connections.items) |*connection| connection.deinit(self.alloc);
+        self.control_connections.deinit(self.alloc);
         if (self.tmux_runtime) |*runtime| runtime.deinit(self.alloc);
     }
 
@@ -3012,7 +3317,7 @@ const App = struct {
             try self.checkResize(std.time.nanoTimestamp());
             try self.renderIfDue();
 
-            var fds_storage: [4]posix.pollfd = undefined;
+            var fds_storage: [4 + max_control_connections]posix.pollfd = undefined;
             var count: usize = 0;
             const stdin_index = count;
             fds_storage[count] = .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 };
@@ -3041,17 +3346,38 @@ const App = struct {
                 }
             }
 
+            const control_connections_start = count;
+            const polled_control_connections = self.control_connections.items.len;
+            for (self.control_connections.items) |connection| {
+                fds_storage[count] = .{
+                    .fd = connection.fd,
+                    .events = posix.POLL.IN,
+                    .revents = 0,
+                };
+                count += 1;
+            }
+
             const now = std.time.nanoTimestamp();
             const timeout = self.pollTimeoutMs(now);
             _ = try posix.poll(fds_storage[0..count], timeout);
 
             if (control_index) |index| {
-                if (fds_storage[index].revents != 0) {
-                    try self.readControl();
+                if (fds_storage[index].revents & posix.POLL.IN != 0) {
+                    try self.acceptControlConnections();
                 }
             }
 
-            if (fds_storage[stdin_index].revents != 0) {
+            var control_offset = polled_control_connections;
+            while (control_offset > 0) {
+                control_offset -= 1;
+                const poll_index = control_connections_start + control_offset;
+                if (fds_storage[poll_index].revents != 0) {
+                    try self.readControlConnection(control_offset);
+                }
+            }
+            self.expireControlConnections(std.time.nanoTimestamp());
+
+            if (fds_storage[stdin_index].revents & posix.POLL.IN != 0) {
                 if (try self.readInput(&running)) {
                     self.render_scheduler.noteInput(std.time.nanoTimestamp());
                 }
@@ -3182,6 +3508,7 @@ const App = struct {
     fn readInput(self: *App, running: *bool) !bool {
         var buf: [8192]u8 = undefined;
         const n = posix.read(stdin_fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => return false,
             error.InputOutput => {
                 running.* = false;
                 return false;
@@ -3585,46 +3912,156 @@ const App = struct {
         return if (self.tmux_runtime) |*runtime| runtime else null;
     }
 
-    fn readControl(self: *App) !void {
+    fn acceptControlConnections(self: *App) !void {
         const runtime = if (self.tmux_runtime) |*runtime| runtime else return;
-        const connection = runtime.server.accept() catch |err| switch (err) {
-            error.WouldBlock => return,
-            else => return err,
-        };
-        defer connection.stream.close();
+        while (true) {
+            const accepted = runtime.server.accept() catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            };
+            const fd = accepted.stream.handle;
+            if (self.control_connections.items.len >= max_control_connections) {
+                accepted.stream.close();
+                continue;
+            }
 
-        var request = ControlRequest.read(self.alloc, connection.stream.handle) catch |err| {
-            writeControlResponse(connection.stream.handle, false, @errorName(err));
+            const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+            const nonblock = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+            if (flags & nonblock == 0) {
+                _ = try posix.fcntl(fd, posix.F.SETFL, flags | nonblock);
+            }
+            try self.control_connections.append(self.alloc, .{
+                .fd = fd,
+                .accepted_ns = std.time.nanoTimestamp(),
+            });
+        }
+    }
+
+    fn readControlConnection(self: *App, index: usize) !void {
+        var closed = false;
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = posix.read(self.control_connections.items[index].fd, &buf) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => {
+                    self.removeControlConnection(index);
+                    return;
+                },
+            };
+            if (n == 0) {
+                closed = true;
+                break;
+            }
+            const connection = &self.control_connections.items[index];
+            if (connection.input.items.len + n > max_control_request) {
+                writeControlResponse(connection.fd, false, "ControlRequestTooLarge");
+                self.removeControlConnection(index);
+                return;
+            }
+            try connection.input.appendSlice(self.alloc, buf[0..n]);
+        }
+
+        const connection = &self.control_connections.items[index];
+        var request = ControlRequest.readBuffer(self.alloc, connection.input.items) catch |err| {
+            if (err == error.IncompleteControlRequest and !closed) return;
+            writeControlResponse(connection.fd, false, @errorName(err));
+            self.removeControlConnection(index);
             return;
         };
         defer request.deinit(self.alloc);
 
-        self.executeControlRequest(&request) catch |err| {
-            writeControlResponse(connection.stream.handle, false, @errorName(err));
+        var response_buf: [128]u8 = undefined;
+        const response = self.executeControlRequest(&request, &response_buf) catch |err| {
+            writeControlResponse(connection.fd, false, @errorName(err));
+            self.removeControlConnection(index);
             return;
         };
-        writeControlResponse(connection.stream.handle, true, "");
+        writeControlResponse(connection.fd, true, response);
+        self.removeControlConnection(index);
     }
 
-    fn executeControlRequest(self: *App, request: *ControlRequest) !void {
-        const command = try parseTmuxCommand(request.argv);
-        switch (command) {
-            .split_window => |split| {
-                const outer_term = posix.getenv("TERM");
-                const colorterm = posix.getenv("COLORTERM");
-                try request.env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
-                try applyTinymuxEnv(self.alloc, &request.env, self.tmuxRuntimePtr(), "%1");
-                try self.openSplitWith(split.argv, &request.env, request.cwd, split.rows, true);
-            },
-            .kill_pane => |kill| {
-                if (kill.target) |target| {
-                    if (std.mem.eql(u8, target, "%0")) return error.CannotKillMainPane;
-                    if (!std.mem.eql(u8, target, "%1")) return error.UnsupportedTargetPane;
+    fn expireControlConnections(self: *App, now_ns: i128) void {
+        var index = self.control_connections.items.len;
+        while (index > 0) {
+            index -= 1;
+            const connection = &self.control_connections.items[index];
+            if (now_ns - connection.accepted_ns < control_connection_timeout_ns) continue;
+            writeControlResponse(connection.fd, false, "ControlRequestTimeout");
+            self.removeControlConnection(index);
+        }
+    }
+
+    fn removeControlConnection(self: *App, index: usize) void {
+        var connection = self.control_connections.swapRemove(index);
+        connection.deinit(self.alloc);
+    }
+
+    fn executeControlRequest(
+        self: *App,
+        request: *ControlRequest,
+        response_buf: []u8,
+    ) ![]const u8 {
+        switch (request.protocol) {
+            .tmux_v1 => {
+                const command = try parseTmuxCommand(request.argv);
+                switch (command) {
+                    .split_window => |split| {
+                        try self.prepareAuxiliaryEnv(&request.env);
+                        _ = try self.openSplitWith(
+                            split.argv,
+                            &request.env,
+                            request.cwd,
+                            split.rows,
+                            true,
+                            .tmux_compat,
+                            .reject,
+                        );
+                    },
+                    .kill_pane => |kill| {
+                        if (kill.target) |target| {
+                            if (std.mem.eql(u8, target, "%0")) return error.CannotKillMainPane;
+                            if (!std.mem.eql(u8, target, "%1")) return error.UnsupportedTargetPane;
+                        }
+                        if (self.split_pane == null) return error.NoSplitPane;
+                        try self.closeSplit();
+                    },
                 }
-                if (self.split_pane == null) return error.NoSplitPane;
-                try self.closeSplit();
+                return "";
+            },
+            .native_v2 => {
+                const command = try parseNativeCommand(request.argv);
+                switch (command) {
+                    .pane_run => |pane| {
+                        try self.prepareAuxiliaryEnv(&request.env);
+                        const generation = try self.openSplitWith(
+                            pane.argv,
+                            &request.env,
+                            request.cwd,
+                            pane.rows,
+                            true,
+                            pane.role,
+                            pane.replace,
+                        );
+                        return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
+                    },
+                    .pane_close => |generation| {
+                        if (self.split_generation == generation) try self.closeSplit();
+                        return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
+                    },
+                    .pane_status => {
+                        const generation = self.split_generation orelse return "none";
+                        return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
+                    },
+                }
             },
         }
+    }
+
+    fn prepareAuxiliaryEnv(self: *App, env: *std.process.EnvMap) !void {
+        const outer_term = posix.getenv("TERM");
+        const colorterm = posix.getenv("COLORTERM");
+        try env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
+        try applyTinymuxEnv(self.alloc, env, self.tmuxRuntimePtr(), "%1", .auxiliary);
     }
 
     fn createSplitPaneFrom(
@@ -3676,14 +4113,22 @@ const App = struct {
         const outer_term = posix.getenv("TERM");
         const colorterm = posix.getenv("COLORTERM");
         try split_env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
-        try applyTinymuxEnv(self.alloc, &split_env, self.tmuxRuntimePtr(), "%1");
+        try applyTinymuxEnv(self.alloc, &split_env, self.tmuxRuntimePtr(), "%1", .auxiliary);
 
         const cwd = std.fs.cwd().realpathAlloc(self.alloc, ".") catch null;
         defer if (cwd) |path| self.alloc.free(path);
 
         const shell = posix.getenv("SHELL") orelse "/bin/sh";
         const split_argv = [_][]const u8{ shell, "-lc", cmd };
-        try self.openSplitWith(&split_argv, &split_env, cwd, self.config.split_rows, false);
+        _ = try self.openSplitWith(
+            &split_argv,
+            &split_env,
+            cwd,
+            self.config.split_rows,
+            false,
+            .manual,
+            .reject,
+        );
     }
 
     fn openSplitWith(
@@ -3693,27 +4138,40 @@ const App = struct {
         cwd: ?[]const u8,
         rows: u16,
         autoclose: bool,
-    ) !void {
-        if (self.split_pane != null) return error.SplitAlreadyOpen;
+        role: PaneRole,
+        replace: ReplacePolicy,
+    ) !u64 {
+        if (self.split_pane != null) {
+            if (replace != .same_role or self.split_role != role) return error.SplitAlreadyOpen;
+            try self.closeSplit();
+        }
 
         try self.drainMainForSplitTransition();
         self.flushDeferredMainState();
-        try self.recordSplitReplayAnchor();
 
         self.active_split_rows = rows;
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, true, self.active_split_rows);
         self.scrollbar_drag = null;
         try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
+        // Resizing into split mode can move otherwise unchanged rows into
+        // history. Anchor after the resize so close only replays lines that
+        // genuinely scrolled while the split was active.
+        try self.recordSplitReplayAnchor();
         const pane = try self.createSplitPaneFrom(argv, env, cwd, self.layout.split_rows);
         errdefer pane.destroy();
 
         try self.enterOuterCanvas();
         self.split_pane = pane;
         self.split_autoclose = autoclose;
+        const generation = self.next_split_generation;
+        self.next_split_generation = if (generation == std.math.maxInt(u64)) 1 else generation + 1;
+        self.split_generation = generation;
+        self.split_role = role;
         self.composed = true;
         self.main_pane.passthrough = false;
         self.compositor.invalidate();
         self.render_scheduler.markDirty(.urgent);
+        return generation;
     }
 
     fn closeSplit(self: *App) !void {
@@ -3722,6 +4180,8 @@ const App = struct {
         pane.destroy();
         self.split_pane = null;
         self.split_autoclose = false;
+        self.split_generation = null;
+        self.split_role = null;
         try self.endComposedMainPassthrough();
         try self.drainMainForRawTransition();
         self.flushDeferredMainState();
@@ -3744,7 +4204,11 @@ const App = struct {
         try protocol.writeAll(stdout_fd, leave.items);
         if (history_replay) |bytes| {
             try protocol.writeAll(stdout_fd, bytes);
-            try self.flushReplayIntoParentScrollback();
+            // A formatter selection does not terminate its final row. Finish
+            // it like ordinary terminal output so the parent advances by the
+            // exact replayed line count, without scrolling a whole blank
+            // viewport into native history.
+            if (bytes.len > 0) try protocol.writeAll(stdout_fd, "\r\n");
         }
         try protocol.writeAll(stdout_fd, synchronized_update_begin);
         const repaint = try self.main_pane.repaint(self.alloc);
@@ -3774,14 +4238,6 @@ const App = struct {
         const pane = self.split_pane orelse return;
         if (pane.pty_fd >= 0) return;
         try self.closeSplit();
-    }
-
-    fn flushReplayIntoParentScrollback(self: *App) !void {
-        if (self.layout.rows == 0) return;
-        var buf: [64]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buf);
-        try writer.print("\x1b[r\x1b[{d}S", .{self.layout.rows});
-        try protocol.writeAll(stdout_fd, writer.buffered());
     }
 
     fn drainMainForRawTransition(self: *App) !void {
