@@ -706,23 +706,17 @@ def test_split_close_switches_to_raw_main(tinymux: str) -> None:
 def test_split_close_preserves_primary_terminal_without_whitespace(tinymux: str) -> None:
     tinymux_abs = os.path.abspath(tinymux)
     with tempfile.TemporaryDirectory() as root:
-        watcher = os.path.join(root, "fake-direnv-instant")
         ready = os.path.join(root, "watcher-finished")
-        os.symlink("/bin/sh", watcher)
+        line_count = 30
+        lines = "".join(f"printf 'PRIMARY_{i:02d}\\n'; " for i in range(line_count))
         command = (
-            "printf 'PRIMARY_00\\n\\033]133;A\\033\\\\PRIMARY_PROMPT>"
-            "\\033]133;B\\033\\\\'; "
+            f"{lines}"
+            "printf 'PRIMARY_PROMPT>'; "
             "tmux split-window -d -l 5 "
-            f"{shlex.quote(watcher)} -c "
-            f"{shlex.quote(f'printf BOTTOM_WHITESPACE_TEST; sleep 0.4; touch {shlex.quote(ready)}')}; "
+            f"/bin/sh -lc {shlex.quote(f'printf BOTTOM_WHITESPACE_TEST; sleep 0.2; touch {shlex.quote(ready)}')}; "
             f"while test ! -e {shlex.quote(ready)}; do sleep 0.02; done; "
-            # Make the main-shell output happen after Tinymux has observed
-            # watcher EOF, matching direnv-instant's real completion order.
-            "sleep 2.5; "
-            "printf 'DIRENV_PROGRESS_00\\nDIRENV_PROGRESS_01\\n'; "
-            "printf '\\033]0;~/project\\033\\\\"
-            "\\033]133;A;click_events=1\\033\\\\\\033[J\\r\\n"
-            "PRIMARY_PROMPT_AFTER>\\033]133;B\\033\\\\'; "
+            "sleep 0.5; "
+            "printf '\\nPRIMARY_NOTICE\\nPRIMARY_PROMPT_AFTER>'; "
             "sleep 10"
         )
         session = Session(
@@ -731,17 +725,12 @@ def test_split_close_preserves_primary_terminal_without_whitespace(tinymux: str)
         )
         try:
             session.wait_for(b"BOTTOM_WHITESPACE_TEST", timeout=5.0)
-            close_start = len(session.output)
-            session.wait_for_after(b"\x1b[?1049l", close_start, timeout=5.0)
+            session.wait_for(b"PRIMARY_PROMPT_AFTER", timeout=5.0)
             session.drain_until_idle(idle=0.3, timeout=3.0)
 
-            expected_stream = (
-                b"PRIMARY_00\r\n\x1b]133;A\x1b\\PRIMARY_PROMPT>"
-                b"\x1b]133;B\x1b\\"
-                b"\x1b]0;~/project\x1b\\"
-                b"\x1b]133;A;click_events=1\x1b\\\x1b[J\r\n"
-                b"PRIMARY_PROMPT_AFTER>\x1b]133;B\x1b\\"
-            )
+            expected_stream = b"".join(
+                f"PRIMARY_{i:02d}\r\n".encode() for i in range(line_count)
+            ) + b"PRIMARY_PROMPT>\r\nPRIMARY_NOTICE\r\nPRIMARY_PROMPT_AFTER>"
             expected = terminal_state(
                 expected_stream,
                 respect_alternate_screen=True,
@@ -750,12 +739,8 @@ def test_split_close_preserves_primary_terminal_without_whitespace(tinymux: str)
                 session.output,
                 respect_alternate_screen=True,
             )
-            close_output = session.output[
-                session.output.find(b"\x1b[?1049l", close_start) :
-            ]
-            assert b"DIRENV_PROGRESS" not in close_output, (
-                "direnv progress was replayed from the closed auxiliary pane"
-            )
+            assert b"\x1b[?1049h" not in session.output
+            assert b"\x1b[?1049l" not in session.output
             assert actual == expected, (
                 "opening and closing an idle split changed the primary terminal; "
                 f"expected_history={expected[0][-10:]!r} "
@@ -766,263 +751,51 @@ def test_split_close_preserves_primary_terminal_without_whitespace(tinymux: str)
             session.close()
 
 
-def test_split_close_replays_main_history_to_parent_scrollback(tinymux: str) -> None:
-    session = Session(
-        [
-            tinymux,
-            "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 5",
-            "--",
-            "/bin/sh",
-            "-lc",
-            "i=0; while [ $i -lt 40 ]; do printf 'HIST_%02d\\n' \"$i\"; i=$((i+1)); done; cat",
-        ]
+def test_in_place_split_resizes_main_like_tmux(tinymux: str) -> None:
+    script = (
+        "import os, subprocess, time; "
+        "print('SIZE_INITIAL_%d_%d' % os.get_terminal_size(0), flush=True); "
+        "subprocess.run(['tmux', 'split-window', '-d', '-l', '5', '/bin/sh', '-lc', "
+        "'printf SIZE_SPLIT_READY; sleep 0.2'], check=True); "
+        "print('SIZE_OPEN_%d_%d' % os.get_terminal_size(0), flush=True); "
+        "time.sleep(1); "
+        "print('SIZE_CLOSE_%d_%d' % os.get_terminal_size(0), flush=True); "
+        "time.sleep(5)"
     )
+    session = Session([tinymux, "session", "--", sys.executable, "-c", script])
     try:
-        session.wait_for(b"HIST_39")
-        session.drain_until_idle()
-        close_start = len(session.output)
-        session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start)
-        session.drain_until_idle()
-        post_close = session.output[close_start:]
-        assert b"HIST_00" in post_close, (
-            "split-era main history was not replayed into the parent stream; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
+        session.wait_for(b"SIZE_INITIAL_80_24")
+        session.wait_for(b"SIZE_OPEN_79_18")
+        session.wait_for(b"SIZE_CLOSE_80_24")
+        assert b"\x1b[?1049h" not in session.output
+        assert b"\x1b[?1049l" not in session.output
     finally:
         session.close()
 
 
-def test_split_close_replays_history_without_blank_scrollback(tinymux: str) -> None:
-    session = Session(
-        [
-            tinymux,
-            "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 5",
-            "--",
-            "/bin/sh",
-            "-lc",
-            "i=0; while [ $i -lt 20 ]; do printf 'SPLIT_ONLY_HIST_%02d\\n' \"$i\"; i=$((i+1)); done; cat",
-        ]
+def test_split_close_reconciles_application_alternate_screen(tinymux: str) -> None:
+    command = (
+        "printf 'PRIMARY_BEFORE>'; "
+        "tmux split-window -d -l 5 /bin/sh -lc 'printf BOTTOM_ALT_TEST; sleep 0.2'; "
+        "printf '\\033[?1049hALT_ACTIVE>'; "
+        "sleep 1; "
+        "printf '\\033[?1049lPRIMARY_AFTER>'; "
+        "sleep 5"
     )
+    session = Session([tinymux, "session", "--", "/bin/sh", "-c", command])
     try:
-        session.wait_for(b"SPLIT_ONLY_HIST_19")
+        session.wait_for(b"ALT_ACTIVE")
+        session.wait_for(b"PRIMARY_AFTER")
         session.drain_until_idle()
-        close_start = len(session.output)
-        session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start)
-        session.drain_until_idle()
-        post_close = session.output[close_start:]
-        assert b"SPLIT_ONLY_HIST_00" in post_close, (
-            "genuine split-era history was not replayed; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-        expected_stream = b"".join(
-            f"SPLIT_ONLY_HIST_{i:02d}\r\n".encode() for i in range(20)
-        )
-        expected = terminal_state(expected_stream, respect_alternate_screen=True)
-        actual = terminal_state(session.output, respect_alternate_screen=True)
-        assert actual == expected, (
-            "closing a startup split did not reconstruct the unsplit primary terminal; "
-            f"expected={expected!r} actual={actual!r}"
-        )
-        repaint_start = post_close.find(b"\x1b[?2026h")
-        replay_end = len(post_close) if repaint_start < 0 else repaint_start
-        assert b"\x1b[24S" not in post_close[:replay_end], (
-            "split close forced a full blank viewport into native scrollback"
-        )
-        assert_marker_before_first_synchronized_update(post_close, b"SPLIT_ONLY_HIST_00")
-    finally:
-        session.close()
-
-
-def test_csi_u_split_close_replays_main_history_to_parent_scrollback(tinymux: str) -> None:
-    session = Session(
-        [
-            tinymux,
-            "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 5",
-            "--",
-            "/bin/sh",
-            "-lc",
-            "i=0; while [ $i -lt 40 ]; do printf 'CSI_HIST_%02d\\n' \"$i\"; i=$((i+1)); done; cat",
-        ]
-    )
-    try:
-        session.wait_for(b"CSI_HIST_39")
-        session.drain_until_idle()
-        close_start = len(session.output)
-        session.write(b"\x1b[98;5ux")
-        session.wait_for_after(b"\x1b[?1049l", close_start)
-        session.drain_until_idle()
-        post_close = session.output[close_start:]
-        assert b"CSI_HIST_00" in post_close, (
-            "split-era main history was not replayed into the parent stream after CSI-u close; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-    finally:
-        session.close()
-
-
-def test_split_close_replays_history_beyond_old_small_scrollback_cap(tinymux: str) -> None:
-    session = Session(
-        [
-            tinymux,
-            "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 30",
-            "--",
-            "/bin/sh",
-            "-lc",
-            (
-                "i=0; "
-                "while [ $i -lt 9000 ]; do "
-                "printf 'BIG_HIST_%05d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; "
-                "i=$((i+1)); "
-                "done; "
-                "cat"
-            ),
-        ]
-    )
-    try:
-        session.wait_for(b"BIG_HIST_08999", timeout=10.0)
-        session.drain_until_idle(timeout=5.0)
-        close_start = len(session.output)
-        session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=30.0)
-        session.drain_until_idle(timeout=10.0)
-        post_close = session.output[close_start:]
-        assert b"BIG_HIST_00000" in post_close, (
-            "history older than the old 512 KiB cap was not replayed; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-        assert terminal_scrollback_contains(post_close, b"BIG_HIST_00000"), (
-            "large replay was written but not retained by parent native scrollback; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-        assert_marker_before_first_synchronized_update(post_close, b"BIG_HIST_00000")
-    finally:
-        session.close()
-
-
-def test_split_close_replays_long_history_outside_synchronized_repaint(tinymux: str) -> None:
-    line_count = 420
-    fish = shutil.which("fish")
-    if fish:
-        main_argv = [
-            fish,
-            "-c",
-            (
-                f"for i in (seq 0 {line_count - 1}); "
-                "printf 'SYNC_REPLAY_%04d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' $i; "
-                "end; "
-                "cat"
-            ),
-        ]
-    else:
-        main_argv = [
-            "/bin/sh",
-            "-lc",
-            (
-                "i=0; "
-                f"while [ $i -lt {line_count} ]; do "
-                "printf 'SYNC_REPLAY_%04d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; "
-                "i=$((i+1)); "
-                "done; "
-                "cat"
-            ),
-        ]
-
-    session = Session(
-        [
-            tinymux,
-            "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 30",
-            "--",
-            *main_argv,
-        ]
-    )
-    try:
-        session.wait_for(f"SYNC_REPLAY_{line_count - 1:04d}".encode(), timeout=10.0)
-        session.drain_until_idle(timeout=5.0)
-        close_start = len(session.output)
-        session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=30.0)
-        session.drain_until_idle(timeout=10.0)
-        post_close = session.output[close_start:]
-
-        first_marker = b"SYNC_REPLAY_0000"
-        deep_history_marker = f"SYNC_REPLAY_{line_count - DEFAULT_ROWS - 10:04d}".encode()
-        last_marker = f"SYNC_REPLAY_{line_count - 1:04d}".encode()
-        assert first_marker in post_close, (
-            "beginning of long split-era history was not replayed after close; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-        assert deep_history_marker in post_close, (
-            "deep split-era history was not replayed after close; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-        assert last_marker in post_close, (
-            "end of long split-era history was not replayed after close; "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-        assert_marker_before_first_synchronized_update(post_close, first_marker)
-        assert_marker_before_first_synchronized_update(post_close, deep_history_marker)
-
-        retained_lines = terminal_scrollback_marker_count(post_close, b"SYNC_REPLAY_")
-        # The replay is emitted normally from the parent's restored cursor.
-        # Up to one full viewport can remain visible until the final repaint;
-        # forcing it out with CSI S also forces blank rows into scrollback.
-        assert retained_lines >= line_count - 2 * DEFAULT_ROWS, (
-            "long split-era replay did not become native parent scrollback; "
-            f"retained_lines={retained_lines} line_count={line_count} "
-            f"post-close tail={post_close[-1000:]!r}"
-        )
-    finally:
-        session.close()
-
-
-def test_split_close_replays_retained_history_after_anchor_pruned(tinymux: str) -> None:
-    line_count = 24000
-    retained_index = line_count - 1000
-    session = Session(
-        [
-            tinymux,
-            "--split",
-            "printf 'SPLIT_STAYS\\n'; sleep 30",
-            "--",
-            "/bin/sh",
-            "-lc",
-            (
-                "i=0; "
-                f"while [ $i -lt {line_count} ]; do "
-                "printf 'PRUNED_ANCHOR_%05d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; "
-                "i=$((i+1)); "
-                "done; "
-                "printf 'PRUNED_ANCHOR_DONE\\n'; "
-                "cat"
-            ),
-        ],
-        cols=1000,
-    )
-    try:
-        session.wait_for(b"PRUNED_ANCHOR_DONE", timeout=20.0)
-        session.drain_until_idle(timeout=5.0)
-        close_start = len(session.output)
-        session.write(b"\x02x")
-        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=30.0)
-        session.drain_until_idle(timeout=10.0)
-        post_close = session.output[close_start:]
-
-        retained_marker = f"PRUNED_ANCHOR_{retained_index:05d}".encode()
-        assert retained_marker in post_close, (
-            "closing split mode did not replay retained history after the split-start anchor was pruned; "
-            f"marker={retained_marker!r} post-close tail={post_close[-1000:]!r}"
-        )
-        assert_marker_before_first_synchronized_update(post_close, retained_marker)
-        assert terminal_scrollback_contains(post_close, retained_marker), (
-            "retained split-era history was replayed but did not become parent native scrollback; "
-            f"marker={retained_marker!r} post-close tail={post_close[-1000:]!r}"
+        assert session.output.count(b"\x1b[?1049h") == 1
+        assert session.output.count(b"\x1b[?1049l") == 1
+        alt_start = session.output.index(b"ALT_ACTIVE")
+        alt_leave = session.output.rindex(b"\x1b[?1049l")
+        handoff = session.output[alt_start:alt_leave]
+        primary_select = handoff.rfind(b"\x1b[?1047l")
+        assert primary_select >= 0, "split close did not visit the touched primary buffer"
+        assert b"PRIMARY_BEFORE" in handoff[primary_select:], (
+            "split close did not repaint the inactive primary buffer before raw handoff"
         )
     finally:
         session.close()
@@ -1043,45 +816,20 @@ def test_raw_output_is_tracked_for_reopened_split(tinymux: str) -> None:
     try:
         session.wait_for(b"SPLIT_READY")
         session.write(b"\x02x")
-        session.wait_for(b"\x1b[?1049l")
-        session.drain_until_idle()
-
         session.write(b"RAW_TRACKED\n")
         session.wait_for(b"RAW_TRACKED")
+        session.drain_until_idle()
         open_start = len(session.output)
         session.write(b"\x02")
         time.sleep(0.2)
         session.write(b"s")
-        session.wait_for_after(b"\x1b[?1049h", open_start)
-        session.wait_for_after(b"RAW_TRACKED", open_start)
-    finally:
-        session.close()
-
-
-def test_csi_u_prefix_reopens_split_after_raw_mode(tinymux: str) -> None:
-    session = Session(
-        [
-            tinymux,
-            "--split",
-            "printf 'SPLIT_READY\\n'; sleep 5",
-            "--",
-            "/bin/sh",
-            "-lc",
-            "printf 'MAIN_READY\\n'; cat",
-        ]
-    )
-    try:
-        session.wait_for(b"SPLIT_READY")
-        session.write(b"\x1b[98;5ux")
-        session.wait_for(b"\x1b[?1049l")
-        session.drain_until_idle()
-
-        open_start = len(session.output)
-        session.write(b"\x1b[98;5u")
-        time.sleep(0.2)
-        session.write(b"s")
-        session.wait_for_after(b"\x1b[?1049h", open_start)
         session.wait_for_after(b"SPLIT_READY", open_start)
+        session.drain_until_idle()
+        assert terminal_screen_contains(session.output, b"RAW_TRACKED"), (
+            "budgeted raw shadow state was not present when the split reopened"
+        )
+        assert b"\x1b[?1049h" not in session.output
+        assert b"\x1b[?1049l" not in session.output
     finally:
         session.close()
 
@@ -2138,7 +1886,10 @@ def test_real_direnv_instant_fish_is_usable_after_split_closes(tinymux: str) -> 
             session.wait_for(b"TINYMUX_REAL_FISH_PROGRESS", timeout=15.0)
             done_offset = len(session.output)
             session.wait_for(b"TINYMUX_REAL_FISH_DONE", timeout=10.0)
-            session.wait_for_after(b"\x1b[?1049l", done_offset, timeout=30.0)
+            done_end = session.output.rfind(b"TINYMUX_REAL_FISH_DONE") + len(
+                b"TINYMUX_REAL_FISH_DONE"
+            )
+            session.wait_for_after(b"TINYMUX_OUTER_FISH>", done_end, timeout=30.0)
             session.drain_until_idle(idle=0.3, timeout=3.0)
 
             command_offset = len(session.output)
@@ -2213,7 +1964,7 @@ def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str)
             )
 
         session = Session(
-            [tinymux_abs, "session", "--", fish, "--no-config", "--interactive"],
+            [tinymux_abs, "session", "--", fish, "--interactive"],
             extra_env=env,
             cwd=outside,
             controlling_terminal=True,
@@ -2233,7 +1984,8 @@ def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str)
                 context = wait_file_contains(
                     context_files[name], f"{name}_PERSISTENT_CTX|", timeout=15.0
                 )
-                session.wait_for_after(b"\x1b[?1049l", offset, timeout=30.0)
+                done_end = session.output.rfind(done) + len(done)
+                session.wait_for_after(b"TINYMUX_PERSISTENT>", done_end, timeout=30.0)
                 session.drain_until_idle(idle=0.3, timeout=4.0)
                 contexts.append(context.strip().encode())
 
@@ -2350,9 +2102,6 @@ def test_native_pane_generations_ignore_stale_close(tinymux: str) -> None:
             old_generation = run_client(
                 "pane",
                 "run",
-                "--role",
-                "direnv",
-                "--replace=same-role",
                 "--rows",
                 "4",
                 "--",
@@ -2362,14 +2111,12 @@ def test_native_pane_generations_ignore_stale_close(tinymux: str) -> None:
             )
             session.wait_for(b"PANE_GENERATION_ONE", timeout=5.0)
             session.drain_until_idle(idle=0.4, timeout=4.0)
+            run_client("pane", "close", old_generation)
 
             second_offset = len(session.output)
             new_generation = run_client(
                 "pane",
                 "run",
-                "--role",
-                "direnv",
-                "--replace=same-role",
                 "--rows",
                 "4",
                 "--",
@@ -2417,9 +2164,11 @@ def test_tmux_kill_pane_closes_split(tinymux: str) -> None:
         )
         session.wait_for(b"TMUX_KILL_READY")
         close_start = len(session.output)
-        session.write(b"tmux kill-pane\n")
-        session.wait_for_after(b"\x1b[?1049l", close_start)
+        session.write(b"tmux kill-pane; printf TMUX_KILL_RETURNED\\n\n")
+        session.wait_for_after(b"TMUX_KILL_RETURNED", close_start)
         session.drain_until_idle()
+        assert b"\x1b[?1049h" not in session.output[close_start:]
+        assert b"\x1b[?1049l" not in session.output[close_start:]
 
         session.write(b"printf AFTER_TMUX_KILL\\n\n")
         session.wait_for(b"AFTER_TMUX_KILL")
@@ -2438,8 +2187,10 @@ def test_tmux_split_window_auto_closes_after_child_exit(tinymux: str) -> None:
         )
         session.wait_for(b"TMUX_AUTO_CLOSE_ONE")
         close_start = len(session.output)
-        session.wait_for_after(b"\x1b[?1049l", close_start, timeout=5.0)
-        session.drain_until_idle()
+        time.sleep(1.0)
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+        assert b"\x1b[?1049h" not in session.output[close_start:]
+        assert b"\x1b[?1049l" not in session.output[close_start:]
 
         reopen_start = len(session.output)
         session.write(
@@ -2484,6 +2235,8 @@ def main() -> int:
     persistent_tests = [
         test_split_close_then_dirty_main_exit_restores_parent_shell,
         test_split_close_preserves_primary_terminal_without_whitespace,
+        test_in_place_split_resizes_main_like_tmux,
+        test_split_close_reconciles_application_alternate_screen,
         test_direnv_instant_wrapper_outputs_hooks,
         test_persistent_main_preserves_host_integration_but_auxiliary_scrubs_it,
         test_tmux_compat_env_and_private_shim,
@@ -2526,14 +2279,9 @@ def main() -> int:
         test_split_replays_kitty_png_graphics,
         test_split_close_switches_to_raw_main,
         test_split_close_preserves_primary_terminal_without_whitespace,
-        test_split_close_replays_main_history_to_parent_scrollback,
-        test_split_close_replays_history_without_blank_scrollback,
-        test_csi_u_split_close_replays_main_history_to_parent_scrollback,
-        test_split_close_replays_history_beyond_old_small_scrollback_cap,
-        test_split_close_replays_long_history_outside_synchronized_repaint,
-        test_split_close_replays_retained_history_after_anchor_pruned,
+        test_in_place_split_resizes_main_like_tmux,
+        test_split_close_reconciles_application_alternate_screen,
         test_raw_output_is_tracked_for_reopened_split,
-        test_csi_u_prefix_reopens_split_after_raw_mode,
         test_tmux_compat_env_and_private_shim,
         test_real_direnv_instant_daemon_opens_tmux_split,
         test_real_direnv_instant_fish_is_usable_after_split_closes,

@@ -5,6 +5,11 @@ This document is the normative v1 contract for tinymux. Behavior marked
 parity suite. Behavior marked `EXTENDED` may be tested for tmux compatibility
 but is not required for v1.
 
+The fixed two-pane CLI described below is the original v1 surface. Persistent
+`tinymux session` operation starts with one raw-passthrough main pane and creates
+one auxiliary pane through the control API. Its composition and handoff
+contract is defined in `persistent-session.md`.
+
 ## Layout
 
 - `LAYOUT-001` REQUIRED: tinymux starts with exactly two panes.
@@ -69,6 +74,12 @@ but is not required for v1.
   contents or route output to the wrong pane.
 - `TERM-011` REQUIRED: both panes retain scrollback and can be scrolled without
   leaking wheel input to child shells when mouse reporting is disabled.
+- `TERM-012` REQUIRED for persistent sessions: opening or closing an auxiliary
+  pane does not create or destroy an outer alternate screen for that pane;
+  application-owned primary/alternate transitions remain mirrored.
+- `TERM-013` REQUIRED for persistent sessions: closing an auxiliary pane uses
+  cursor-addressed reconciliation and does not replay pane history or emit
+  linefeeds to manufacture outer scrollback.
 
 ## Terminal Profiles
 

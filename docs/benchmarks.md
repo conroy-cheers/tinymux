@@ -85,3 +85,22 @@ Timeouts, nonzero exits, cadence, and echo latency are checked whenever
 
 Use threshold mode for local regression detection after recording a known-good
 baseline on the same machine.
+
+## Before/After Raw-Mode Gate
+
+Architectural changes to the raw path should be measured against the previous
+binary on the same machine. Record both runs with identical full-profile
+arguments, then compare them:
+
+```sh
+python3 tests/benchmarks/tinymux_bench.py --tinymux ./tinymux-before \
+  --profile full --modes raw --json /tmp/tinymux-before.json
+python3 tests/benchmarks/tinymux_bench.py --tinymux ./tinymux-after \
+  --profile full --modes raw --json /tmp/tinymux-after.json
+python3 tests/benchmarks/compare_raw.py \
+  /tmp/tinymux-before.json /tmp/tinymux-after.json
+```
+
+The gate rejects a raw throughput median more than 5% slower than baseline, or
+a worst cadence gap/input-echo latency more than 2 ms above baseline. Both JSON
+files must contain the same raw workloads; missing candidate results also fail.

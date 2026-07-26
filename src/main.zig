@@ -13,8 +13,6 @@ const stdout_fd: posix.fd_t = 1;
 
 const default_split_rows: u16 = 9;
 const exit_drain_ms: i64 = 50;
-const raw_transition_drain_ms: i64 = 120;
-const raw_transition_idle_ms: i32 = 10;
 const termination_poll_ns: u64 = 1 * std.time.ns_per_ms;
 const termination_grace_polls: usize = 100;
 const composed_idle_poll_ms: i32 = 50;
@@ -35,9 +33,13 @@ const wheel_scroll_rows: isize = 3;
 const max_sgr_mouse_sequence: usize = 64;
 const scrollback_bytes: usize = 256 * 1024 * 1024;
 const deferred_raw_state_limit: usize = 64 * 1024 * 1024;
-const split_main_output_limit: usize = 64 * 1024 * 1024;
-const direnv_prompt_wait_timeout_ns: i128 = 2 * std.time.ns_per_s;
-const prompt_protocol_prefix = "\x1b]133;";
+const deferred_raw_catchup_bytes: usize = 1024 * 1024;
+const deferred_raw_catchup_ns: i128 = 1 * std.time.ns_per_ms;
+const deferred_raw_catchup_delay_ns: i128 = 25 * std.time.ns_per_ms;
+const deferred_raw_catchup_slice: usize = 256 * 1024;
+const deferred_raw_bulk_threshold: usize = 16 * 1024 * 1024;
+const deferred_raw_bulk_catchup_bytes: usize = 8 * 1024 * 1024;
+const deferred_raw_bulk_catchup_ns: i128 = 6 * std.time.ns_per_ms;
 const deferred_raw_bulk_prealloc_trigger: usize = 32 * 1024;
 const deferred_raw_bulk_prealloc_bytes: usize = 16 * 1024 * 1024;
 const kitty_image_storage_limit: usize = 320 * 1024 * 1024;
@@ -51,8 +53,7 @@ const sgr_reset = "\x1b[0m";
 const style_dim = "\x1b[2m";
 const synchronized_update_begin = "\x1b[?2026h";
 const synchronized_update_end = "\x1b[?2026l";
-const enter_canvas = "\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?25l\x1b[H\x1b[2J";
-const leave_canvas = restore_terminal_sequence ++ "\x1b[?1049l";
+const mux_mouse_enable = "\x1b[?1002h\x1b[?1006h";
 const scrollbar_track = "│";
 const scrollbar_thumb = "█";
 
@@ -246,7 +247,7 @@ fn printUsage(err: anyerror) !void {
         \\
         \\usage:
         \\  tinymux session [--no-tmux-compat] -- <main-argv...>
-        \\  tinymux pane run [--role direnv|manual] [--replace=same-role] [--rows <n>] -- <argv...>
+        \\  tinymux pane run [--rows <n>] -- <argv...>
         \\  tinymux pane close <generation>
         \\  tinymux pane status
         \\  tinymux --split <split-cmd> [--split-rows <n>] [--split-term auto|xterm-256color|xterm-direct|xterm-kitty|xterm-ghostty] -- <main-argv...>
@@ -790,38 +791,10 @@ const control_connection_timeout_ns: i128 = 2 * std.time.ns_per_s;
 const SplitWindowCommand = struct {
     rows: u16,
     argv: []const []const u8,
-
-    fn paneRole(self: SplitWindowCommand) PaneRole {
-        for (self.argv) |arg| {
-            if (std.mem.indexOf(u8, std.fs.path.basename(arg), "direnv-instant") != null) {
-                return .direnv;
-            }
-        }
-        return .tmux_compat;
-    }
-};
-
-const PaneRole = enum {
-    direnv,
-    manual,
-    tmux_compat,
-
-    fn parse(value: []const u8) !PaneRole {
-        if (std.mem.eql(u8, value, "direnv")) return .direnv;
-        if (std.mem.eql(u8, value, "manual")) return .manual;
-        return error.UnsupportedPaneRole;
-    }
-};
-
-const ReplacePolicy = enum {
-    reject,
-    same_role,
 };
 
 const PaneRunCommand = struct {
     rows: u16,
-    role: PaneRole,
-    replace: ReplacePolicy,
     argv: []const []const u8,
 };
 
@@ -856,8 +829,6 @@ fn parseNativeCommand(args: []const []const u8) !NativeCommand {
     if (args.len < 2 or !std.mem.eql(u8, args[0], "pane")) return error.UnsupportedControlCommand;
     if (std.mem.eql(u8, args[1], "run")) {
         var rows = default_split_rows;
-        var role: PaneRole = .manual;
-        var replace: ReplacePolicy = .reject;
         var i: usize = 2;
         while (i < args.len) {
             const arg = args[i];
@@ -869,14 +840,6 @@ fn parseNativeCommand(args: []const []const u8) !NativeCommand {
                 if (i >= args.len) return error.MissingSplitRows;
                 rows = try parseTmuxRows(args[i]);
                 i += 1;
-            } else if (std.mem.eql(u8, arg, "--role")) {
-                i += 1;
-                if (i >= args.len) return error.MissingPaneRole;
-                role = try PaneRole.parse(args[i]);
-                i += 1;
-            } else if (std.mem.eql(u8, arg, "--replace=same-role")) {
-                replace = .same_role;
-                i += 1;
             } else {
                 return error.UnsupportedPaneOption;
             }
@@ -884,8 +847,6 @@ fn parseNativeCommand(args: []const []const u8) !NativeCommand {
         if (i >= args.len) return error.MissingSplitCommand;
         return .{ .pane_run = .{
             .rows = rows,
-            .role = role,
-            .replace = replace,
             .argv = args[i..],
         } };
     }
@@ -1555,6 +1516,175 @@ const PlainCursorState = struct {
     pending_wrap: bool = false,
 };
 
+const ScreenSwitchMirror = struct {
+    const State = enum { ground, escape, csi };
+
+    state: State = .ground,
+    bytes: [32]u8 = undefined,
+    len: usize = 0,
+
+    fn reset(self: *ScreenSwitchMirror) void {
+        self.state = .ground;
+        self.len = 0;
+    }
+
+    fn startEscape(self: *ScreenSwitchMirror) void {
+        self.state = .escape;
+        self.len = 1;
+        self.bytes[0] = 0x1b;
+    }
+
+    fn feed(
+        self: *ScreenSwitchMirror,
+        alloc: std.mem.Allocator,
+        input: []const u8,
+        out: *std.ArrayList(u8),
+        primary_touched: *bool,
+        alternate_touched: *bool,
+    ) !void {
+        for (input) |byte| {
+            switch (self.state) {
+                .ground => if (byte == 0x1b) self.startEscape(),
+                .escape => {
+                    if (byte == '[') {
+                        self.bytes[1] = byte;
+                        self.len = 2;
+                        self.state = .csi;
+                    } else if (byte == 0x1b) {
+                        self.startEscape();
+                    } else {
+                        self.reset();
+                    }
+                },
+                .csi => {
+                    if (self.len >= self.bytes.len) {
+                        self.reset();
+                        if (byte == 0x1b) self.startEscape();
+                        continue;
+                    }
+                    self.bytes[self.len] = byte;
+                    self.len += 1;
+                    if (byte < 0x40 or byte > 0x7e) continue;
+
+                    const sequence = self.bytes[0..self.len];
+                    const target: ?bool = if (std.mem.eql(u8, sequence, "\x1b[?47h") or
+                        std.mem.eql(u8, sequence, "\x1b[?1047h") or
+                        std.mem.eql(u8, sequence, "\x1b[?1049h"))
+                        true
+                    else if (std.mem.eql(u8, sequence, "\x1b[?47l") or
+                        std.mem.eql(u8, sequence, "\x1b[?1047l") or
+                        std.mem.eql(u8, sequence, "\x1b[?1049l"))
+                        false
+                    else
+                        null;
+                    if (target) |alternate| {
+                        try out.appendSlice(alloc, sequence);
+                        if (alternate) alternate_touched.* = true else primary_touched.* = true;
+                    }
+                    self.reset();
+                },
+            }
+        }
+    }
+};
+
+const HostEffectMirror = struct {
+    const State = enum { ground, escape, osc, osc_escape, osc_discard, osc_discard_escape };
+
+    state: State = .ground,
+    bytes: [4096]u8 = undefined,
+    len: usize = 0,
+
+    fn reset(self: *HostEffectMirror) void {
+        self.state = .ground;
+        self.len = 0;
+    }
+
+    fn startEscape(self: *HostEffectMirror) void {
+        self.state = .escape;
+        self.len = 1;
+        self.bytes[0] = 0x1b;
+    }
+
+    fn append(self: *HostEffectMirror, byte: u8) bool {
+        if (self.len >= self.bytes.len) return false;
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        return true;
+    }
+
+    fn forwardOsc(self: *HostEffectMirror, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        if (self.len < 4) return;
+        const body_end = if (self.bytes[self.len - 1] == 0x07) self.len - 1 else self.len - 2;
+        const body = self.bytes[2..body_end];
+        const separator = std.mem.indexOfScalar(u8, body, ';') orelse return;
+        const selector = body[0..separator];
+        if (std.mem.eql(u8, selector, "0") or
+            std.mem.eql(u8, selector, "2") or
+            std.mem.eql(u8, selector, "7") or
+            std.mem.eql(u8, selector, "133"))
+        {
+            try out.appendSlice(alloc, self.bytes[0..self.len]);
+        }
+    }
+
+    fn feed(self: *HostEffectMirror, alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList(u8)) !void {
+        for (input) |byte| {
+            switch (self.state) {
+                .ground => if (byte == 0x07) {
+                    try out.append(alloc, byte);
+                } else if (byte == 0x1b) {
+                    self.startEscape();
+                },
+                .escape => {
+                    if (byte == ']') {
+                        _ = self.append(byte);
+                        self.state = .osc;
+                    } else if (byte == 0x1b) {
+                        self.startEscape();
+                    } else {
+                        self.reset();
+                    }
+                },
+                .osc => {
+                    if (!self.append(byte)) {
+                        self.state = .osc_discard;
+                        continue;
+                    }
+                    if (byte == 0x07) {
+                        try self.forwardOsc(alloc, out);
+                        self.reset();
+                    } else if (byte == 0x1b) {
+                        self.state = .osc_escape;
+                    }
+                },
+                .osc_escape => {
+                    if (!self.append(byte)) {
+                        self.state = .osc_discard;
+                        continue;
+                    }
+                    if (byte == '\\') {
+                        try self.forwardOsc(alloc, out);
+                        self.reset();
+                    } else if (byte != 0x1b) {
+                        self.state = .osc;
+                    }
+                },
+                .osc_discard => if (byte == 0x07) {
+                    self.reset();
+                } else if (byte == 0x1b) {
+                    self.state = .osc_discard_escape;
+                },
+                .osc_discard_escape => if (byte == '\\') {
+                    self.reset();
+                } else if (byte != 0x1b) {
+                    self.state = .osc_discard;
+                },
+            }
+        }
+    }
+};
+
 fn plainPassthroughEndState(bytes: []const u8, pane_cols: u16, start: PlainCursorState) ?PlainCursorState {
     if (pane_cols == 0) return null;
     var state = start;
@@ -1974,13 +2104,10 @@ const Pane = struct {
         return alloc.dupe(u8, out.writer.buffered());
     }
 
-    fn terminalStateWithoutCursor(self: *Pane, alloc: std.mem.Allocator) ![]u8 {
+    fn terminalModes(self: *Pane, alloc: std.mem.Allocator) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        // Restoring tab stops and margins may move the cursor. Keep the
-        // position established by replaying the main shell's raw bytes.
-        try out.writer.writeAll("\x1b7");
         var terminal_formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
         terminal_formatter.content = .none;
         terminal_formatter.extra = .{
@@ -1993,31 +2120,22 @@ const Pane = struct {
             .screen = .none,
         };
         try out.writer.print("{f}", .{terminal_formatter});
-        try out.writer.writeAll("\x1b8");
+        var filtered: std.ArrayList(u8) = .empty;
+        defer filtered.deinit(alloc);
+        try appendWithoutScreenSwitchModes(alloc, &filtered, out.writer.buffered());
+        return alloc.dupe(u8, filtered.items);
+    }
+
+    fn screenState(self: *Pane, alloc: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
 
         var screen_formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
         screen_formatter.content = .none;
         screen_formatter.extra = .none;
-        screen_formatter.extra.screen = .{
-            .cursor = false,
-            .style = true,
-            .hyperlink = true,
-            .protection = true,
-            .kitty_keyboard = true,
-            .charsets = true,
-        };
+        screen_formatter.extra.screen = .all;
         try out.writer.print("{f}", .{screen_formatter});
         return alloc.dupe(u8, out.writer.buffered());
-    }
-
-    fn replayHistory(self: *Pane, alloc: std.mem.Allocator, selection: vt.Selection) ![]u8 {
-        var raw: std.Io.Writer.Allocating = .init(alloc);
-        defer raw.deinit();
-        var formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
-        formatter.content = .{ .selection = selection };
-        formatter.extra = .styles;
-        try raw.writer.print("{f}", .{formatter});
-        return alloc.dupe(u8, raw.writer.buffered());
     }
 
     fn screenSelection(self: *Pane) ?vt.Selection {
@@ -2041,6 +2159,32 @@ const Pane = struct {
         try writePaneCursorState(writer, &self.term, row, col);
     }
 };
+
+fn appendWithoutScreenSwitchModes(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    input: []const u8,
+) !void {
+    const sequences = [_][]const u8{
+        "\x1b[?47h",   "\x1b[?47l",
+        "\x1b[?1047h", "\x1b[?1047l",
+        "\x1b[?1049h", "\x1b[?1049l",
+    };
+    var offset: usize = 0;
+    while (offset < input.len) {
+        var skipped = false;
+        for (sequences) |sequence| {
+            if (std.mem.startsWith(u8, input[offset..], sequence)) {
+                offset += sequence.len;
+                skipped = true;
+                break;
+            }
+        }
+        if (skipped) continue;
+        try out.append(alloc, input[offset]);
+        offset += 1;
+    }
+}
 
 const reset_state_sequence = "\x0f\x1b(B" ++
     "\x1b[0m\x1b[0 q\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?7h" ++
@@ -2598,7 +2742,6 @@ const Compositor = struct {
     }
 
     fn render(self: *Compositor, layout: Layout, main_pane: *Pane, split_pane: ?*Pane) !void {
-        if (!layout.split_visible) return;
         while (self.row_cache.items.len < layout.rows) try self.row_cache.append(self.alloc, .empty);
         while (self.row_cache.items.len > layout.rows) {
             var row = self.row_cache.pop() orelse break;
@@ -3209,7 +3352,6 @@ const App = struct {
     split_pane: ?*Pane,
     split_autoclose: bool = false,
     split_generation: ?u64 = null,
-    split_role: ?PaneRole = null,
     next_split_generation: u64 = 1,
     raw_terminal: RawTerminal,
     compositor: Compositor,
@@ -3217,13 +3359,12 @@ const App = struct {
     prefix: PrefixParser = .{},
     input_buffer: std.ArrayList(u8) = .empty,
     deferred_main_state: std.ArrayList(u8) = .empty,
-    split_main_output: std.ArrayList(u8) = .empty,
-    split_main_output_complete: bool = true,
-    direnv_prompt_wait_started_ns: ?i128 = null,
-    direnv_prompt_wait_offset: usize = 0,
-    direnv_closing: bool = false,
-    main_prompt_protocol_seen: bool = false,
-    main_prompt_prefix_match: usize = 0,
+    deferred_main_offset: usize = 0,
+    deferred_catchup_due_ns: ?i128 = null,
+    screen_switch_mirror: ScreenSwitchMirror = .{},
+    host_effect_mirror: HostEffectMirror = .{},
+    outer_primary_touched: bool = false,
+    outer_alternate_touched: bool = false,
     direct_main_painted_bytes: usize = 0,
     main_passthrough_cursor: PlainCursorState = .{},
     main_passthrough_outer_active: bool = false,
@@ -3234,10 +3375,8 @@ const App = struct {
     pending_resize: ?ptypkg.Winsize = null,
     resize_due_ns: ?i128 = null,
     cell_size: CellSize,
-    split_replay_anchor: ?*vt.Pin = null,
     tmux_runtime: ?TmuxRuntime = null,
     control_connections: std.ArrayList(ControlConnection) = .empty,
-    outer_canvas_active: bool = false,
     terminal_restore_needed: bool = false,
 
     fn init(alloc: std.mem.Allocator, config: Config) !App {
@@ -3321,7 +3460,6 @@ const App = struct {
             .split_pane = split_pane,
             .split_autoclose = false,
             .split_generation = if (split_pane != null) 1 else null,
-            .split_role = if (split_pane != null) .manual else null,
             .next_split_generation = if (split_pane != null) 2 else 1,
             .raw_terminal = raw_terminal,
             .compositor = .{ .alloc = alloc },
@@ -3339,12 +3477,10 @@ const App = struct {
     fn deinit(self: *App) void {
         self.restoreOuterTerminal();
         self.raw_terminal.restore();
-        self.clearSplitReplayAnchor();
         if (self.split_pane) |pane| pane.destroy();
         self.main_pane.destroy();
         self.input_buffer.deinit(self.alloc);
         self.deferred_main_state.deinit(self.alloc);
-        self.split_main_output.deinit(self.alloc);
         self.compositor.deinit();
         for (self.control_connections.items) |*connection| connection.deinit(self.alloc);
         self.control_connections.deinit(self.alloc);
@@ -3354,10 +3490,12 @@ const App = struct {
     fn run(self: *App) !void {
         self.main_pane.passthrough = !self.composed;
         if (self.composed) {
-            try self.recordSplitReplayAnchor();
-            try self.enterOuterCanvas();
-            try self.writeInitialComposedCanvas();
+            self.beginOuterComposition();
+            try protocol.writeAll(stdout_fd, mux_mouse_enable);
+            self.terminal_restore_needed = true;
             self.compositor.invalidate();
+            try self.compositor.render(self.layout, self.main_pane, self.split_pane);
+            self.render_scheduler.rendered(std.time.nanoTimestamp());
         }
 
         var running = true;
@@ -3369,7 +3507,6 @@ const App = struct {
             }
             if (self.split_pane) |pane| pane.reapIfExited();
             try self.closeAutoSplitIfExited();
-            try self.finishDirenvCloseIfReady();
 
             try self.checkResize(std.time.nanoTimestamp());
             try self.renderIfDue();
@@ -3473,8 +3610,11 @@ const App = struct {
                     }
                 }
             }
+            // Raw output wins the current turn. Catch the shadow model up on
+            // the next otherwise-idle turn so sustained passthrough retains
+            // direct-path throughput and interactive gaps still converge.
+            if (pane_stats.bytes == 0) self.advanceDeferredMainState();
             try self.closeAutoSplitIfExited();
-            try self.finishDirenvCloseIfReady();
 
             if (self.composed) {
                 try self.renderIfDue();
@@ -3492,11 +3632,33 @@ const App = struct {
         self.render_scheduler.rendered(std.time.nanoTimestamp());
     }
 
+    fn beginOuterComposition(self: *App) void {
+        self.screen_switch_mirror.reset();
+        self.host_effect_mirror.reset();
+        self.outer_primary_touched = false;
+        self.outer_alternate_touched = false;
+        switch (self.main_pane.term.screens.active_key) {
+            .primary => self.outer_primary_touched = true,
+            .alternate => self.outer_alternate_touched = true,
+        }
+    }
+
     fn pollTimeoutMs(self: *const App, now_ns: i128) i32 {
         var timeout: i32 = if (self.composed)
             self.render_scheduler.pollTimeoutMs(now_ns)
         else
             50;
+
+        if (!self.composed and self.deferredMainStateLen() > 0) {
+            const due = self.deferred_catchup_due_ns orelse now_ns;
+            if (now_ns >= due) return 0;
+            const remaining_ns = due - now_ns;
+            const remaining_ms: i32 = @intCast(@max(
+                @as(i128, 1),
+                @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+            ));
+            timeout = @min(timeout, remaining_ms);
+        }
 
         if (self.pending_resize != null) {
             const due_ns = self.resize_due_ns orelse return timeout;
@@ -3514,53 +3676,11 @@ const App = struct {
         defer out.deinit(self.alloc);
         self.endComposedMainPassthrough() catch {};
         self.compositor.graphics.deleteAll(self.alloc, &out) catch {};
-        if (self.outer_canvas_active) {
-            out.appendSlice(self.alloc, leave_canvas) catch {};
-            self.outer_canvas_active = false;
-            self.terminal_restore_needed = false;
-        } else if (self.terminal_restore_needed) {
+        if (self.terminal_restore_needed) {
             out.appendSlice(self.alloc, restore_terminal_sequence) catch {};
             self.terminal_restore_needed = false;
         }
         protocol.writeAll(stdout_fd, out.items) catch {};
-    }
-
-    fn enterOuterCanvas(self: *App) !void {
-        try protocol.writeAll(stdout_fd, enter_canvas);
-        self.outer_canvas_active = true;
-        self.terminal_restore_needed = true;
-    }
-
-    fn leaveOuterCanvas(self: *App, out: *std.ArrayList(u8)) !void {
-        try out.appendSlice(self.alloc, leave_canvas);
-        self.outer_canvas_active = false;
-        self.terminal_restore_needed = true;
-    }
-
-    fn writeInitialComposedCanvas(self: *App) !void {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(self.alloc);
-        try out.appendSlice(self.alloc, synchronized_update_begin);
-        try out.appendSlice(self.alloc, "\x1b[?25l");
-        if (self.layout.border_row) |border| {
-            try out.print(self.alloc, "\x1b[{d};1H{s}", .{ border + 1, style_dim });
-            for (0..self.layout.paneCols()) |_| try out.appendSlice(self.alloc, "─");
-            try out.appendSlice(self.alloc, sgr_reset);
-        }
-        if (self.layout.scrollbarCol()) |col| {
-            try out.appendSlice(self.alloc, style_dim);
-            for (0..self.layout.rows) |row| {
-                try out.print(self.alloc, "\x1b[{d};{d}H{s}", .{ row + 1, col, scrollbar_track });
-            }
-            try out.appendSlice(self.alloc, sgr_reset);
-        }
-        {
-            var aw: std.Io.Writer.Allocating = .fromArrayList(self.alloc, &out);
-            defer out = aw.toArrayList();
-            try writeComposedCursor(&aw.writer, self.layout, self.main_pane);
-        }
-        try out.appendSlice(self.alloc, synchronized_update_end);
-        try protocol.writeAll(stdout_fd, out.items);
     }
 
     fn readInput(self: *App, running: *bool) !bool {
@@ -3799,15 +3919,14 @@ const App = struct {
             return 0;
         }
         const bytes = buf[0..n];
-        if (which == .main) self.observeMainOutput(bytes);
         if (!self.composed and which == .main) {
             try protocol.writeAll(stdout_fd, bytes);
             if (self.rawModeNeedsPaneState()) try self.deferMainState(bytes);
         } else if (self.composed and which == .main) {
-            try self.recordSplitMainOutput(bytes);
             if (try self.tryComposedMainPassthrough(bytes)) return n;
             try self.endComposedMainPassthrough();
             self.flushDeferredMainState();
+            try self.mirrorMainScreenSwitches(bytes);
             pane.feed(bytes);
             self.syncMainPassthroughCursor();
         } else {
@@ -3816,83 +3935,124 @@ const App = struct {
         return n;
     }
 
+    fn mirrorMainScreenSwitches(self: *App, bytes: []const u8) !void {
+        var mirrored: std.ArrayList(u8) = .empty;
+        defer mirrored.deinit(self.alloc);
+        try self.screen_switch_mirror.feed(
+            self.alloc,
+            bytes,
+            &mirrored,
+            &self.outer_primary_touched,
+            &self.outer_alternate_touched,
+        );
+        try self.host_effect_mirror.feed(self.alloc, bytes, &mirrored);
+        if (mirrored.items.len == 0) return;
+        try protocol.writeAll(stdout_fd, mirrored.items);
+        self.compositor.invalidate();
+    }
+
     fn rawModeNeedsPaneState(self: *const App) bool {
         return self.config.split_cmd != null or self.tmux_runtime != null;
     }
 
-    fn recordSplitMainOutput(self: *App, bytes: []const u8) !void {
-        if (!self.split_main_output_complete or bytes.len == 0) return;
-        if (bytes.len > split_main_output_limit -| self.split_main_output.items.len) {
-            self.split_main_output.clearRetainingCapacity();
-            self.split_main_output_complete = false;
-            return;
-        }
-        try self.split_main_output.appendSlice(self.alloc, bytes);
-    }
-
-    fn observeMainOutput(self: *App, bytes: []const u8) void {
-        if (self.main_prompt_protocol_seen) return;
-        for (bytes) |byte| {
-            if (byte == prompt_protocol_prefix[self.main_prompt_prefix_match]) {
-                self.main_prompt_prefix_match += 1;
-                if (self.main_prompt_prefix_match == prompt_protocol_prefix.len) {
-                    self.main_prompt_protocol_seen = true;
-                    self.main_prompt_prefix_match = 0;
-                    return;
-                }
-            } else {
-                self.main_prompt_prefix_match = if (byte == prompt_protocol_prefix[0]) 1 else 0;
-            }
-        }
-    }
-
-    fn splitMainOutputForClose(self: *const App, role: PaneRole) []const u8 {
-        const bytes = self.split_main_output.items;
-        if (role != .direnv) return bytes;
-
-        // Direnv progress belongs to the auxiliary pane. Shell integrations
-        // delimit the final prompt with OSC 133, so retain only that final
-        // redraw when returning to the primary screen. This keeps evaluation
-        // output from being replayed a second time into the main scrollback.
-        const prompt = std.mem.lastIndexOf(u8, bytes, "\x1b]133;A") orelse return bytes;
-        const title = std.mem.lastIndexOf(u8, bytes[0..prompt], "\x1b]0;") orelse prompt;
-        return bytes[title..];
-    }
-
     fn deferMainState(self: *App, bytes: []const u8) !void {
         if (bytes.len == 0) return;
-        var required = self.deferred_main_state.items.len + bytes.len;
-        if (required > deferred_raw_state_limit) {
+        if (self.deferred_main_offset > 0 and
+            self.deferred_main_state.items.len + bytes.len > deferred_raw_state_limit)
+        {
+            self.compactDeferredMainState();
+        }
+        if (self.deferredMainStateLen() + bytes.len > deferred_raw_state_limit) {
             self.flushDeferredMainState();
-            required = bytes.len;
         }
         if (bytes.len > deferred_raw_state_limit) {
             self.main_pane.feed(bytes);
             return;
         }
-        if (bytes.len >= deferred_raw_bulk_prealloc_trigger and self.deferred_main_state.capacity < required) {
+        const total_required = self.deferred_main_state.items.len + bytes.len;
+        if (bytes.len >= deferred_raw_bulk_prealloc_trigger and self.deferred_main_state.capacity < total_required) {
             try self.deferred_main_state.ensureTotalCapacity(
                 self.alloc,
-                @min(deferred_raw_state_limit, @max(required, deferred_raw_bulk_prealloc_bytes)),
+                @min(deferred_raw_state_limit, @max(total_required, deferred_raw_bulk_prealloc_bytes)),
             );
         }
         try self.deferred_main_state.appendSlice(self.alloc, bytes);
+        self.deferred_catchup_due_ns = std.time.nanoTimestamp() + deferred_raw_catchup_delay_ns;
+    }
+
+    fn deferredMainStateLen(self: *const App) usize {
+        return self.deferred_main_state.items.len - self.deferred_main_offset;
+    }
+
+    fn compactDeferredMainState(self: *App) void {
+        if (self.deferred_main_offset == 0) return;
+        const remaining = self.deferredMainStateLen();
+        if (remaining > 0) {
+            std.mem.copyForwards(
+                u8,
+                self.deferred_main_state.items[0..remaining],
+                self.deferred_main_state.items[self.deferred_main_offset..],
+            );
+        }
+        self.deferred_main_state.shrinkRetainingCapacity(remaining);
+        self.deferred_main_offset = 0;
+    }
+
+    fn advanceDeferredMainState(self: *App) void {
+        if (self.composed or self.deferredMainStateLen() == 0) return;
+        const now = std.time.nanoTimestamp();
+        if (self.deferred_catchup_due_ns) |due| {
+            if (now < due) return;
+        }
+        const bulk = self.deferredMainStateLen() >= deferred_raw_bulk_threshold;
+        const byte_budget = if (bulk) deferred_raw_bulk_catchup_bytes else deferred_raw_catchup_bytes;
+        const time_budget = if (bulk) deferred_raw_bulk_catchup_ns else deferred_raw_catchup_ns;
+        const started = std.time.nanoTimestamp();
+        var processed: usize = 0;
+        while (self.deferredMainStateLen() > 0 and processed < byte_budget) {
+            const n = @min(
+                self.deferredMainStateLen(),
+                @min(deferred_raw_catchup_slice, byte_budget - processed),
+            );
+            const end = self.deferred_main_offset + n;
+            self.main_pane.feed(self.deferred_main_state.items[self.deferred_main_offset..end]);
+            self.deferred_main_offset = end;
+            processed += n;
+            if (std.time.nanoTimestamp() - started >= time_budget) break;
+        }
+        if (self.deferredMainStateLen() == 0) {
+            self.deferred_main_state.clearRetainingCapacity();
+            self.deferred_main_offset = 0;
+            self.deferred_catchup_due_ns = null;
+        } else if (self.deferred_main_offset >= deferred_raw_bulk_prealloc_bytes and
+            self.deferred_main_offset >= self.deferredMainStateLen())
+        {
+            self.compactDeferredMainState();
+        }
+        if (self.deferredMainStateLen() > 0) self.deferred_catchup_due_ns = std.time.nanoTimestamp();
+        self.syncMainPassthroughCursor();
     }
 
     fn flushDeferredMainState(self: *App) void {
-        if (self.deferred_main_state.items.len == 0) return;
-        self.main_pane.feed(self.deferred_main_state.items);
+        if (self.deferredMainStateLen() == 0) return;
+        self.main_pane.feed(self.deferred_main_state.items[self.deferred_main_offset..]);
         self.deferred_main_state.clearRetainingCapacity();
+        self.deferred_main_offset = 0;
+        self.deferred_catchup_due_ns = null;
         self.syncMainPassthroughCursor();
     }
 
     fn tryComposedMainPassthrough(self: *App, bytes: []const u8) !bool {
         if (!self.main_pane.ascii_fast_feed_enabled) return false;
         if (!self.mainPaneLiveBottom()) return false;
+        // A PTY read can end in the middle of a terminal sequence. Until both
+        // incremental mirrors return to ground, the continuation must pass
+        // through the VT model rather than being mistaken for printable text.
+        if (self.screen_switch_mirror.state != .ground or self.host_effect_mirror.state != .ground) return false;
         if (self.compositor.graphics.uploaded.count() != 0) return false;
         if (self.compositor.graphics.needsUpdate(self.main_pane, self.split_pane)) return false;
 
-        if (!self.main_passthrough_outer_active and self.deferred_main_state.items.len == 0) {
+        if (!self.main_passthrough_outer_active and self.deferredMainStateLen() == 0) {
             self.syncMainPassthroughCursor();
         }
         const cursor = plainPassthroughEndState(bytes, self.layout.paneCols(), self.main_passthrough_cursor) orelse return false;
@@ -4071,12 +4231,36 @@ const App = struct {
 
         var response_buf: [128]u8 = undefined;
         const response = self.executeControlRequest(&request, &response_buf) catch |err| {
+            if (!isControlClientError(err)) return err;
             writeControlResponse(connection.fd, false, @errorName(err));
             self.removeControlConnection(index);
             return;
         };
         writeControlResponse(connection.fd, true, response);
         self.removeControlConnection(index);
+    }
+
+    fn isControlClientError(err: anyerror) bool {
+        return switch (err) {
+            error.MissingTmuxCommand,
+            error.UnsupportedTmuxCommand,
+            error.MissingSplitRows,
+            error.InvalidCharacter,
+            error.Overflow,
+            error.InvalidSplitRows,
+            error.UnsupportedTmuxOption,
+            error.MissingSplitCommand,
+            error.UnsupportedControlCommand,
+            error.UnsupportedPaneOption,
+            error.MissingPaneGeneration,
+            error.CannotKillMainPane,
+            error.UnsupportedTargetPane,
+            error.NoSplitPane,
+            error.SplitAlreadyOpen,
+            error.TerminalTooSmall,
+            => true,
+            else => false,
+        };
     }
 
     fn expireControlConnections(self: *App, now_ns: i128) void {
@@ -4112,8 +4296,6 @@ const App = struct {
                             request.cwd,
                             split.rows,
                             true,
-                            split.paneRole(),
-                            .reject,
                         );
                     },
                     .kill_pane => |kill| {
@@ -4138,8 +4320,6 @@ const App = struct {
                             request.cwd,
                             pane.rows,
                             true,
-                            pane.role,
-                            pane.replace,
                         );
                         return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
                     },
@@ -4181,28 +4361,6 @@ const App = struct {
         );
     }
 
-    fn clearSplitReplayAnchor(self: *App) void {
-        const anchor = self.split_replay_anchor orelse return;
-        self.main_pane.term.screens.active.pages.untrackPin(anchor);
-        self.split_replay_anchor = null;
-    }
-
-    fn recordSplitReplayAnchor(self: *App) !void {
-        self.clearSplitReplayAnchor();
-        const pages = &self.main_pane.term.screens.active.pages;
-        self.split_replay_anchor = try pages.trackPin(pages.getTopLeft(.active));
-    }
-
-    fn splitHistorySelection(self: *App) ?vt.Selection {
-        const anchor = self.split_replay_anchor orelse return null;
-        const pages = &self.main_pane.term.screens.active.pages;
-        const bottom = pages.getBottomRight(.history) orelse return null;
-        var start = if (anchor.garbage) pages.getTopLeft(.history) else anchor.*;
-        start.x = 0;
-        if (!start.eql(bottom) and bottom.before(start)) return null;
-        return vt.Selection.init(start, bottom, false);
-    }
-
     fn openSplit(self: *App) !void {
         const cmd = self.config.split_cmd orelse return;
         if (self.split_pane != null) return;
@@ -4225,8 +4383,6 @@ const App = struct {
             cwd,
             self.config.split_rows,
             false,
-            .manual,
-            .reject,
         );
     }
 
@@ -4237,202 +4393,126 @@ const App = struct {
         cwd: ?[]const u8,
         rows: u16,
         autoclose: bool,
-        role: PaneRole,
-        replace: ReplacePolicy,
     ) !u64 {
-        if (self.direnv_closing) return error.SplitAlreadyOpen;
-        if (self.split_pane != null) {
-            if (replace != .same_role or self.split_role != role) return error.SplitAlreadyOpen;
-            try self.closeSplit();
-        }
+        if (self.split_pane != null) return error.SplitAlreadyOpen;
 
         try self.drainMainForSplitTransition();
         self.flushDeferredMainState();
-        self.split_main_output.clearRetainingCapacity();
-        self.split_main_output_complete = true;
-        self.direnv_prompt_wait_started_ns = null;
-        self.direnv_prompt_wait_offset = 0;
-        self.direnv_closing = false;
 
         self.active_split_rows = rows;
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, true, self.active_split_rows);
+        if (!self.layout.split_visible) return error.TerminalTooSmall;
         self.scrollbar_drag = null;
-        try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
-        // Resizing into split mode can move otherwise unchanged rows into
-        // history. Anchor after the resize so close only replays lines that
-        // genuinely scrolled while the split was active.
-        try self.recordSplitReplayAnchor();
         const pane = try self.createSplitPaneFrom(argv, env, cwd, self.layout.split_rows);
         errdefer pane.destroy();
+        try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
 
-        try self.enterOuterCanvas();
         self.split_pane = pane;
         self.split_autoclose = autoclose;
         const generation = self.next_split_generation;
         self.next_split_generation = if (generation == std.math.maxInt(u64)) 1 else generation + 1;
         self.split_generation = generation;
-        self.split_role = role;
         self.composed = true;
         self.main_pane.passthrough = false;
+        self.beginOuterComposition();
+        try protocol.writeAll(stdout_fd, mux_mouse_enable);
+        self.terminal_restore_needed = true;
         self.compositor.invalidate();
-        self.render_scheduler.markDirty(.urgent);
+        try self.compositor.render(self.layout, self.main_pane, self.split_pane);
+        self.render_scheduler.rendered(std.time.nanoTimestamp());
         return generation;
     }
 
     fn closeSplit(self: *App) !void {
         const pane = self.split_pane orelse return;
-        const closing_role = self.split_role orelse .manual;
-        pane.terminate();
-        pane.destroy();
-        self.split_pane = null;
-        self.split_autoclose = false;
-        self.split_generation = null;
-        self.split_role = null;
-        try self.finishSplitClose(closing_role);
-    }
-
-    fn beginDirenvClose(self: *App) !void {
-        const pane = self.split_pane orelse return;
         try self.endComposedMainPassthrough();
-        pane.terminate();
-        pane.destroy();
-        self.split_pane = null;
-        self.split_autoclose = false;
-        self.split_generation = null;
-        self.split_role = null;
-        self.direnv_closing = true;
-        self.direnv_prompt_wait_started_ns = std.time.nanoTimestamp();
-        self.direnv_prompt_wait_offset = self.split_main_output.items.len;
-
-        // Direnv-instant updates an already-visible prompt asynchronously.
-        // Closing the tmux pane normally resizes the shell and makes it redraw
-        // that prompt. Resize the PTY now, but retain the alternate canvas
-        // until the redraw is complete so none of the transition reaches the
-        // physical terminal's primary scrollback.
-        self.layout = Layout.compute(self.last_size.row, self.last_size.col, false, self.active_split_rows);
-        self.scrollbar_drag = null;
-        try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
-        self.compositor.invalidate();
-        self.render_scheduler.markDirty(.urgent);
-    }
-
-    fn finishSplitClose(self: *App, closing_role: PaneRole) !void {
-        self.direnv_closing = false;
-        self.direnv_prompt_wait_started_ns = null;
-        self.direnv_prompt_wait_offset = 0;
+        try self.drainMainForSplitTransition();
         try self.endComposedMainPassthrough();
-        try self.drainMainForRawTransition();
         self.flushDeferredMainState();
-        const history_replay = if (!self.split_main_output_complete)
-            if (self.splitHistorySelection()) |selection|
-                try self.main_pane.replayHistory(self.alloc, selection)
-            else
-                null
-        else
-            null;
-        defer if (history_replay) |bytes| self.alloc.free(bytes);
-        self.clearSplitReplayAnchor();
+
+        pane.terminate();
+        pane.destroy();
+        self.split_pane = null;
+        self.split_autoclose = false;
+        self.split_generation = null;
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, false, self.active_split_rows);
         self.scrollbar_drag = null;
         try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
         self.active_split_rows = self.config.split_rows;
+
+        var reset: std.ArrayList(u8) = .empty;
+        defer reset.deinit(self.alloc);
+        try self.compositor.graphics.deleteAll(self.alloc, &reset);
+        try reset.appendSlice(self.alloc, reset_state_sequence);
+        try protocol.writeAll(stdout_fd, reset.items);
+        try self.reconcileMainToOuter();
+
         self.composed = false;
         self.main_pane.passthrough = true;
-        var leave: std.ArrayList(u8) = .empty;
-        defer leave.deinit(self.alloc);
-        try self.compositor.graphics.deleteAll(self.alloc, &leave);
-        try self.leaveOuterCanvas(&leave);
-        try protocol.writeAll(stdout_fd, leave.items);
-        if (self.split_main_output_complete) {
-            try protocol.writeAll(stdout_fd, self.splitMainOutputForClose(closing_role));
-            const state = try self.main_pane.terminalStateWithoutCursor(self.alloc);
-            defer self.alloc.free(state);
-            try protocol.writeAll(stdout_fd, state);
-        } else {
-            if (history_replay) |bytes| {
-                try protocol.writeAll(stdout_fd, bytes);
-                if (bytes.len > 0) try protocol.writeAll(stdout_fd, "\r\n");
+        self.render_scheduler.rendered(std.time.nanoTimestamp());
+    }
+
+    fn reconcileMainToOuter(self: *App) !void {
+        const active_key = self.main_pane.term.screens.active_key;
+        if (active_key == .primary) {
+            if (self.outer_alternate_touched and self.main_pane.term.screens.get(.alternate) != null) {
+                try self.renderMainOnOuterScreen(.alternate, false);
             }
-            try protocol.writeAll(stdout_fd, synchronized_update_begin);
-            const repaint = try self.main_pane.repaint(self.alloc);
-            defer self.alloc.free(repaint);
-            try protocol.writeAll(stdout_fd, repaint);
-            try protocol.writeAll(stdout_fd, synchronized_update_end);
+            try self.renderMainOnOuterScreen(.primary, true);
+        } else {
+            if (self.outer_primary_touched) try self.renderMainOnOuterScreen(.primary, false);
+            try self.renderMainOnOuterScreen(.alternate, true);
         }
-        self.split_main_output.clearRetainingCapacity();
-        self.split_main_output_complete = true;
+        self.main_pane.term.screens.switchTo(active_key);
+        self.outer_primary_touched = false;
+        self.outer_alternate_touched = false;
+        self.screen_switch_mirror.reset();
+        self.host_effect_mirror.reset();
+    }
+
+    fn renderMainOnOuterScreen(
+        self: *App,
+        key: vt.ScreenSet.Key,
+        restore_terminal_state: bool,
+    ) !void {
+        if (self.main_pane.term.screens.get(key) == null) return;
+        self.main_pane.term.screens.switchTo(key);
+        try protocol.writeAll(stdout_fd, switch (key) {
+            .primary => "\x1b[?1047l",
+            .alternate => "\x1b[?1047h",
+        });
+
+        if (restore_terminal_state) {
+            const modes = try self.main_pane.terminalModes(self.alloc);
+            defer self.alloc.free(modes);
+            try protocol.writeAll(stdout_fd, modes);
+        }
+        self.compositor.invalidate();
+        try self.compositor.render(self.layout, self.main_pane, null);
+        if (restore_terminal_state) {
+            const screen_state = try self.main_pane.screenState(self.alloc);
+            defer self.alloc.free(screen_state);
+            try protocol.writeAll(stdout_fd, screen_state);
+        }
     }
 
     fn closeAutoSplitIfExited(self: *App) !void {
         if (!self.split_autoclose) return;
         const pane = self.split_pane orelse return;
         if (pane.pty_fd >= 0) return;
-        if (self.split_role == .direnv) {
-            try self.beginDirenvClose();
-            return;
-        }
         try self.closeSplit();
     }
 
-    fn finishDirenvCloseIfReady(self: *App) !void {
-        if (!self.direnv_closing) return;
-        const offset = @min(self.direnv_prompt_wait_offset, self.split_main_output.items.len);
-        const output = self.split_main_output.items[offset..];
-        // A trailing prompt-end marker can still be queued from the prompt
-        // that submitted `cd`. Do not restore the primary canvas until a
-        // complete new prompt has started and finished after watcher exit.
-        const prompt_finished = if (std.mem.indexOf(u8, output, "\x1b]133;A")) |prompt_start|
-            std.mem.indexOf(u8, output[prompt_start..], "\x1b]133;B") != null
-        else
-            false;
-        const started = self.direnv_prompt_wait_started_ns orelse std.time.nanoTimestamp();
-        // Shells that have already advertised prompt boundaries give us an
-        // exact completion signal, even if direnv takes a long time. The
-        // timeout is only a compatibility fallback for uninstrumented shells.
-        const timed_out = !self.main_prompt_protocol_seen and
-            std.time.nanoTimestamp() - started >= direnv_prompt_wait_timeout_ns;
-        if (!prompt_finished and !timed_out) return;
-        try self.finishSplitClose(.direnv);
-    }
-
-    fn drainMainForRawTransition(self: *App) !void {
-        const deadline = std.time.milliTimestamp() + raw_transition_drain_ms;
-        while (self.main_pane.pty_fd >= 0 and std.time.milliTimestamp() < deadline) {
-            var fds = [_]posix.pollfd{.{
-                .fd = self.main_pane.pty_fd,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try posix.poll(&fds, raw_transition_idle_ms);
-            if (ready == 0) break;
-            if (fds[0].revents == 0) continue;
-
-            var buf: [64 * 1024]u8 = undefined;
-            const n = posix.read(self.main_pane.pty_fd, &buf) catch {
-                self.main_pane.markDead();
-                return;
-            };
-            if (n == 0) {
-                self.main_pane.markDead();
-                return;
-            }
-            self.observeMainOutput(buf[0..n]);
-            try self.recordSplitMainOutput(buf[0..n]);
-            self.main_pane.feed(buf[0..n]);
-        }
-    }
-
     fn drainMainForSplitTransition(self: *App) !void {
-        const deadline = std.time.milliTimestamp() + raw_transition_drain_ms;
-        while (self.main_pane.pty_fd >= 0 and std.time.milliTimestamp() < deadline) {
+        while (self.main_pane.pty_fd >= 0) {
             var fds = [_]posix.pollfd{.{
                 .fd = self.main_pane.pty_fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = try posix.poll(&fds, raw_transition_idle_ms);
+            const ready = try posix.poll(&fds, 0);
             if (ready == 0) break;
-            if (fds[0].revents == 0) continue;
+            if (fds[0].revents == 0) break;
 
             var buf: [64 * 1024]u8 = undefined;
             _ = try self.readPaneInto(self.main_pane, .main, &buf);
@@ -4447,7 +4527,7 @@ const App = struct {
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = try posix.poll(&fds, raw_transition_idle_ms);
+            const ready = try posix.poll(&fds, 10);
             if (ready == 0) break;
             if (fds[0].revents == 0) continue;
 
@@ -4552,7 +4632,7 @@ test "CLI parsing can disable tmux compatibility" {
     try std.testing.expectEqualStrings("vim", cfg.main_argv[0]);
 }
 
-test "tmux parser accepts direnv-instant split-window shape" {
+test "tmux parser treats split-window argv as opaque" {
     const args = [_][]const u8{
         "split-window",
         "-d",
@@ -4569,7 +4649,6 @@ test "tmux parser accepts direnv-instant split-window shape" {
             try std.testing.expectEqual(@as(u16, 10), split.rows);
             try std.testing.expectEqualStrings("/bin/direnv-instant", split.argv[0]);
             try std.testing.expectEqualStrings("watch", split.argv[1]);
-            try std.testing.expectEqual(PaneRole.direnv, split.paneRole());
         },
         else => return error.UnexpectedTmuxCommand,
     }
@@ -4600,6 +4679,55 @@ test "tmux parser accepts kill-pane target" {
 test "tmux parser rejects unsupported commands" {
     const args = [_][]const u8{ "display-message", "hello" };
     try std.testing.expectError(error.UnsupportedTmuxCommand, parseTmuxCommand(&args));
+}
+
+test "control request failures distinguish client errors from transition failures" {
+    try std.testing.expect(App.isControlClientError(error.SplitAlreadyOpen));
+    try std.testing.expect(App.isControlClientError(error.UnsupportedPaneOption));
+    try std.testing.expect(!App.isControlClientError(error.OutOfMemory));
+    try std.testing.expect(!App.isControlClientError(error.InputOutput));
+}
+
+test "screen switch mirror forwards only application buffer changes" {
+    const alloc = std.testing.allocator;
+    var mirror: ScreenSwitchMirror = .{};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var primary = false;
+    var alternate = false;
+
+    try mirror.feed(alloc, "before\x1b[?104", &out, &primary, &alternate);
+    try mirror.feed(alloc, "9hafter\x1b[31m\x1b[?1049l", &out, &primary, &alternate);
+
+    try std.testing.expectEqualStrings("\x1b[?1049h\x1b[?1049l", out.items);
+    try std.testing.expect(primary);
+    try std.testing.expect(alternate);
+}
+
+test "host effect mirror forwards generic main terminal semantics" {
+    const alloc = std.testing.allocator;
+    var mirror: HostEffectMirror = .{};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try mirror.feed(alloc, "\x1b]133;A\x1b", &out);
+    try mirror.feed(alloc, "\\\x1b]52;c;secret\x07\x1b]7;file:///tmp\x07", &out);
+
+    try std.testing.expectEqualStrings("\x1b]133;A\x1b\\\x1b]7;file:///tmp\x07", out.items);
+}
+
+test "host effect mirror discards oversized OSC through its terminator" {
+    const alloc = std.testing.allocator;
+    var mirror: HostEffectMirror = .{};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try mirror.feed(alloc, "\x1b]52;c;", &out);
+    const oversized: [5000]u8 = @splat('x');
+    try mirror.feed(alloc, &oversized, &out);
+    try mirror.feed(alloc, "\x07\x1b]7;file:///after\x07", &out);
+
+    try std.testing.expectEqualStrings("\x1b]7;file:///after\x07", out.items);
 }
 
 test "layout clamps split while preserving rows when possible" {
