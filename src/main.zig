@@ -35,6 +35,9 @@ const wheel_scroll_rows: isize = 3;
 const max_sgr_mouse_sequence: usize = 64;
 const scrollback_bytes: usize = 256 * 1024 * 1024;
 const deferred_raw_state_limit: usize = 64 * 1024 * 1024;
+const split_main_output_limit: usize = 64 * 1024 * 1024;
+const direnv_prompt_wait_timeout_ns: i128 = 2 * std.time.ns_per_s;
+const prompt_protocol_prefix = "\x1b]133;";
 const deferred_raw_bulk_prealloc_trigger: usize = 32 * 1024;
 const deferred_raw_bulk_prealloc_bytes: usize = 16 * 1024 * 1024;
 const kitty_image_storage_limit: usize = 320 * 1024 * 1024;
@@ -787,6 +790,15 @@ const control_connection_timeout_ns: i128 = 2 * std.time.ns_per_s;
 const SplitWindowCommand = struct {
     rows: u16,
     argv: []const []const u8,
+
+    fn paneRole(self: SplitWindowCommand) PaneRole {
+        for (self.argv) |arg| {
+            if (std.mem.indexOf(u8, std.fs.path.basename(arg), "direnv-instant") != null) {
+                return .direnv;
+            }
+        }
+        return .tmux_compat;
+    }
 };
 
 const PaneRole = enum {
@@ -1959,6 +1971,42 @@ const Pane = struct {
         try out.writer.writeAll(sanitize_sequence);
         try out.writer.writeAll(raw.writer.buffered());
         try self.writeCursorPos(&out.writer);
+        return alloc.dupe(u8, out.writer.buffered());
+    }
+
+    fn terminalStateWithoutCursor(self: *Pane, alloc: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        // Restoring tab stops and margins may move the cursor. Keep the
+        // position established by replaying the main shell's raw bytes.
+        try out.writer.writeAll("\x1b7");
+        var terminal_formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
+        terminal_formatter.content = .none;
+        terminal_formatter.extra = .{
+            .palette = false,
+            .modes = true,
+            .scrolling_region = true,
+            .tabstops = true,
+            .pwd = true,
+            .keyboard = true,
+            .screen = .none,
+        };
+        try out.writer.print("{f}", .{terminal_formatter});
+        try out.writer.writeAll("\x1b8");
+
+        var screen_formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
+        screen_formatter.content = .none;
+        screen_formatter.extra = .none;
+        screen_formatter.extra.screen = .{
+            .cursor = false,
+            .style = true,
+            .hyperlink = true,
+            .protection = true,
+            .kitty_keyboard = true,
+            .charsets = true,
+        };
+        try out.writer.print("{f}", .{screen_formatter});
         return alloc.dupe(u8, out.writer.buffered());
     }
 
@@ -3169,6 +3217,13 @@ const App = struct {
     prefix: PrefixParser = .{},
     input_buffer: std.ArrayList(u8) = .empty,
     deferred_main_state: std.ArrayList(u8) = .empty,
+    split_main_output: std.ArrayList(u8) = .empty,
+    split_main_output_complete: bool = true,
+    direnv_prompt_wait_started_ns: ?i128 = null,
+    direnv_prompt_wait_offset: usize = 0,
+    direnv_closing: bool = false,
+    main_prompt_protocol_seen: bool = false,
+    main_prompt_prefix_match: usize = 0,
     direct_main_painted_bytes: usize = 0,
     main_passthrough_cursor: PlainCursorState = .{},
     main_passthrough_outer_active: bool = false,
@@ -3289,6 +3344,7 @@ const App = struct {
         self.main_pane.destroy();
         self.input_buffer.deinit(self.alloc);
         self.deferred_main_state.deinit(self.alloc);
+        self.split_main_output.deinit(self.alloc);
         self.compositor.deinit();
         for (self.control_connections.items) |*connection| connection.deinit(self.alloc);
         self.control_connections.deinit(self.alloc);
@@ -3313,6 +3369,7 @@ const App = struct {
             }
             if (self.split_pane) |pane| pane.reapIfExited();
             try self.closeAutoSplitIfExited();
+            try self.finishDirenvCloseIfReady();
 
             try self.checkResize(std.time.nanoTimestamp());
             try self.renderIfDue();
@@ -3417,6 +3474,7 @@ const App = struct {
                 }
             }
             try self.closeAutoSplitIfExited();
+            try self.finishDirenvCloseIfReady();
 
             if (self.composed) {
                 try self.renderIfDue();
@@ -3741,10 +3799,12 @@ const App = struct {
             return 0;
         }
         const bytes = buf[0..n];
+        if (which == .main) self.observeMainOutput(bytes);
         if (!self.composed and which == .main) {
             try protocol.writeAll(stdout_fd, bytes);
             if (self.rawModeNeedsPaneState()) try self.deferMainState(bytes);
         } else if (self.composed and which == .main) {
+            try self.recordSplitMainOutput(bytes);
             if (try self.tryComposedMainPassthrough(bytes)) return n;
             try self.endComposedMainPassthrough();
             self.flushDeferredMainState();
@@ -3758,6 +3818,45 @@ const App = struct {
 
     fn rawModeNeedsPaneState(self: *const App) bool {
         return self.config.split_cmd != null or self.tmux_runtime != null;
+    }
+
+    fn recordSplitMainOutput(self: *App, bytes: []const u8) !void {
+        if (!self.split_main_output_complete or bytes.len == 0) return;
+        if (bytes.len > split_main_output_limit -| self.split_main_output.items.len) {
+            self.split_main_output.clearRetainingCapacity();
+            self.split_main_output_complete = false;
+            return;
+        }
+        try self.split_main_output.appendSlice(self.alloc, bytes);
+    }
+
+    fn observeMainOutput(self: *App, bytes: []const u8) void {
+        if (self.main_prompt_protocol_seen) return;
+        for (bytes) |byte| {
+            if (byte == prompt_protocol_prefix[self.main_prompt_prefix_match]) {
+                self.main_prompt_prefix_match += 1;
+                if (self.main_prompt_prefix_match == prompt_protocol_prefix.len) {
+                    self.main_prompt_protocol_seen = true;
+                    self.main_prompt_prefix_match = 0;
+                    return;
+                }
+            } else {
+                self.main_prompt_prefix_match = if (byte == prompt_protocol_prefix[0]) 1 else 0;
+            }
+        }
+    }
+
+    fn splitMainOutputForClose(self: *const App, role: PaneRole) []const u8 {
+        const bytes = self.split_main_output.items;
+        if (role != .direnv) return bytes;
+
+        // Direnv progress belongs to the auxiliary pane. Shell integrations
+        // delimit the final prompt with OSC 133, so retain only that final
+        // redraw when returning to the primary screen. This keeps evaluation
+        // output from being replayed a second time into the main scrollback.
+        const prompt = std.mem.lastIndexOf(u8, bytes, "\x1b]133;A") orelse return bytes;
+        const title = std.mem.lastIndexOf(u8, bytes[0..prompt], "\x1b]0;") orelse prompt;
+        return bytes[title..];
     }
 
     fn deferMainState(self: *App, bytes: []const u8) !void {
@@ -4013,7 +4112,7 @@ const App = struct {
                             request.cwd,
                             split.rows,
                             true,
-                            .tmux_compat,
+                            split.paneRole(),
                             .reject,
                         );
                     },
@@ -4141,6 +4240,7 @@ const App = struct {
         role: PaneRole,
         replace: ReplacePolicy,
     ) !u64 {
+        if (self.direnv_closing) return error.SplitAlreadyOpen;
         if (self.split_pane != null) {
             if (replace != .same_role or self.split_role != role) return error.SplitAlreadyOpen;
             try self.closeSplit();
@@ -4148,6 +4248,11 @@ const App = struct {
 
         try self.drainMainForSplitTransition();
         self.flushDeferredMainState();
+        self.split_main_output.clearRetainingCapacity();
+        self.split_main_output_complete = true;
+        self.direnv_prompt_wait_started_ns = null;
+        self.direnv_prompt_wait_offset = 0;
+        self.direnv_closing = false;
 
         self.active_split_rows = rows;
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, true, self.active_split_rows);
@@ -4176,17 +4281,53 @@ const App = struct {
 
     fn closeSplit(self: *App) !void {
         const pane = self.split_pane orelse return;
+        const closing_role = self.split_role orelse .manual;
         pane.terminate();
         pane.destroy();
         self.split_pane = null;
         self.split_autoclose = false;
         self.split_generation = null;
         self.split_role = null;
+        try self.finishSplitClose(closing_role);
+    }
+
+    fn beginDirenvClose(self: *App) !void {
+        const pane = self.split_pane orelse return;
+        try self.endComposedMainPassthrough();
+        pane.terminate();
+        pane.destroy();
+        self.split_pane = null;
+        self.split_autoclose = false;
+        self.split_generation = null;
+        self.split_role = null;
+        self.direnv_closing = true;
+        self.direnv_prompt_wait_started_ns = std.time.nanoTimestamp();
+        self.direnv_prompt_wait_offset = self.split_main_output.items.len;
+
+        // Direnv-instant updates an already-visible prompt asynchronously.
+        // Closing the tmux pane normally resizes the shell and makes it redraw
+        // that prompt. Resize the PTY now, but retain the alternate canvas
+        // until the redraw is complete so none of the transition reaches the
+        // physical terminal's primary scrollback.
+        self.layout = Layout.compute(self.last_size.row, self.last_size.col, false, self.active_split_rows);
+        self.scrollbar_drag = null;
+        try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
+        self.compositor.invalidate();
+        self.render_scheduler.markDirty(.urgent);
+    }
+
+    fn finishSplitClose(self: *App, closing_role: PaneRole) !void {
+        self.direnv_closing = false;
+        self.direnv_prompt_wait_started_ns = null;
+        self.direnv_prompt_wait_offset = 0;
         try self.endComposedMainPassthrough();
         try self.drainMainForRawTransition();
         self.flushDeferredMainState();
-        const history_replay = if (self.splitHistorySelection()) |selection|
-            try self.main_pane.replayHistory(self.alloc, selection)
+        const history_replay = if (!self.split_main_output_complete)
+            if (self.splitHistorySelection()) |selection|
+                try self.main_pane.replayHistory(self.alloc, selection)
+            else
+                null
         else
             null;
         defer if (history_replay) |bytes| self.alloc.free(bytes);
@@ -4202,42 +4343,56 @@ const App = struct {
         try self.compositor.graphics.deleteAll(self.alloc, &leave);
         try self.leaveOuterCanvas(&leave);
         try protocol.writeAll(stdout_fd, leave.items);
-        if (history_replay) |bytes| {
-            try protocol.writeAll(stdout_fd, bytes);
-            // A formatter selection does not terminate its final row. Finish
-            // it like ordinary terminal output so the parent advances by the
-            // exact replayed line count, without scrolling a whole blank
-            // viewport into native history.
-            if (bytes.len > 0) try protocol.writeAll(stdout_fd, "\r\n");
+        if (self.split_main_output_complete) {
+            try protocol.writeAll(stdout_fd, self.splitMainOutputForClose(closing_role));
+            const state = try self.main_pane.terminalStateWithoutCursor(self.alloc);
+            defer self.alloc.free(state);
+            try protocol.writeAll(stdout_fd, state);
+        } else {
+            if (history_replay) |bytes| {
+                try protocol.writeAll(stdout_fd, bytes);
+                if (bytes.len > 0) try protocol.writeAll(stdout_fd, "\r\n");
+            }
+            try protocol.writeAll(stdout_fd, synchronized_update_begin);
+            const repaint = try self.main_pane.repaint(self.alloc);
+            defer self.alloc.free(repaint);
+            try protocol.writeAll(stdout_fd, repaint);
+            try protocol.writeAll(stdout_fd, synchronized_update_end);
         }
-        try protocol.writeAll(stdout_fd, synchronized_update_begin);
-        const repaint = try self.main_pane.repaint(self.alloc);
-        defer self.alloc.free(repaint);
-        var raw_repaint: std.ArrayList(u8) = .empty;
-        defer raw_repaint.deinit(self.alloc);
-        try raw_repaint.appendSlice(self.alloc, repaint);
-        try self.compositor.graphics.render(
-            self.alloc,
-            &raw_repaint,
-            self.layout,
-            self.main_pane,
-            null,
-            true,
-        );
-        {
-            var aw: std.Io.Writer.Allocating = .fromArrayList(self.alloc, &raw_repaint);
-            defer raw_repaint = aw.toArrayList();
-            try self.main_pane.writeCursorPos(&aw.writer);
-        }
-        try raw_repaint.appendSlice(self.alloc, synchronized_update_end);
-        try protocol.writeAll(stdout_fd, raw_repaint.items);
+        self.split_main_output.clearRetainingCapacity();
+        self.split_main_output_complete = true;
     }
 
     fn closeAutoSplitIfExited(self: *App) !void {
         if (!self.split_autoclose) return;
         const pane = self.split_pane orelse return;
         if (pane.pty_fd >= 0) return;
+        if (self.split_role == .direnv) {
+            try self.beginDirenvClose();
+            return;
+        }
         try self.closeSplit();
+    }
+
+    fn finishDirenvCloseIfReady(self: *App) !void {
+        if (!self.direnv_closing) return;
+        const offset = @min(self.direnv_prompt_wait_offset, self.split_main_output.items.len);
+        const output = self.split_main_output.items[offset..];
+        // A trailing prompt-end marker can still be queued from the prompt
+        // that submitted `cd`. Do not restore the primary canvas until a
+        // complete new prompt has started and finished after watcher exit.
+        const prompt_finished = if (std.mem.indexOf(u8, output, "\x1b]133;A")) |prompt_start|
+            std.mem.indexOf(u8, output[prompt_start..], "\x1b]133;B") != null
+        else
+            false;
+        const started = self.direnv_prompt_wait_started_ns orelse std.time.nanoTimestamp();
+        // Shells that have already advertised prompt boundaries give us an
+        // exact completion signal, even if direnv takes a long time. The
+        // timeout is only a compatibility fallback for uninstrumented shells.
+        const timed_out = !self.main_prompt_protocol_seen and
+            std.time.nanoTimestamp() - started >= direnv_prompt_wait_timeout_ns;
+        if (!prompt_finished and !timed_out) return;
+        try self.finishSplitClose(.direnv);
     }
 
     fn drainMainForRawTransition(self: *App) !void {
@@ -4261,6 +4416,8 @@ const App = struct {
                 self.main_pane.markDead();
                 return;
             }
+            self.observeMainOutput(buf[0..n]);
+            try self.recordSplitMainOutput(buf[0..n]);
             self.main_pane.feed(buf[0..n]);
         }
     }
@@ -4412,6 +4569,7 @@ test "tmux parser accepts direnv-instant split-window shape" {
             try std.testing.expectEqual(@as(u16, 10), split.rows);
             try std.testing.expectEqualStrings("/bin/direnv-instant", split.argv[0]);
             try std.testing.expectEqualStrings("watch", split.argv[1]);
+            try std.testing.expectEqual(PaneRole.direnv, split.paneRole());
         },
         else => return error.UnexpectedTmuxCommand,
     }
