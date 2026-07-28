@@ -502,6 +502,42 @@ def test_split_reserves_scrollbar_column_for_child_ptys(tinymux: str) -> None:
         session.close()
 
 
+def test_alternate_screen_scroll_does_not_scroll_outer_terminal(tinymux: str) -> None:
+    child = (
+        "import os,sys,time;"
+        "os.write(1,b'\\x1b[?1049h\\x1b[2J\\x1b[HALT_SCROLL_READY');"
+        "sys.stdin.buffer.read(1);"
+        "os.write(1,b'\\x1b[1S\\x1b[18;1HALT_SCROLL_DONE');"
+        "time.sleep(5)"
+    )
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "sleep 5",
+            "--split-rows",
+            "5",
+            "--",
+            sys.executable,
+            "-c",
+            child,
+        ]
+    )
+    try:
+        session.wait_for(b"ALT_SCROLL_READY")
+        session.drain_until_idle()
+        scroll_start = len(session.output)
+        session.write(b"x\n")
+        session.wait_for_after(b"ALT_SCROLL_DONE", scroll_start)
+        delta = session.output[scroll_start:]
+        assert b"\x1b[1S" not in delta, (
+            "alternate-screen child scroll escaped into an outer-terminal scroll; "
+            f"delta={delta!r}"
+        )
+    finally:
+        session.close()
+
+
 def test_mouse_wheel_scrolls_main_pane_viewport(tinymux: str) -> None:
     session = Session(
         [
@@ -2428,6 +2464,7 @@ def main() -> int:
         test_split_close_then_dirty_main_exit_restores_parent_shell,
         test_split_close_preserves_primary_terminal_without_whitespace,
         test_in_place_split_resizes_main_like_tmux,
+        test_alternate_screen_scroll_does_not_scroll_outer_terminal,
         test_split_close_reconciles_application_alternate_screen,
         test_persistent_split_hands_kitty_placements_back_to_raw_mode,
         test_persistent_split_keeps_kitty_images_screen_local,
@@ -2469,6 +2506,7 @@ def main() -> int:
         test_raw_only_does_not_parse_prefix,
         test_split_renders_and_main_gets_input,
         test_split_reserves_scrollbar_column_for_child_ptys,
+        test_alternate_screen_scroll_does_not_scroll_outer_terminal,
         test_mouse_wheel_scrolls_main_pane_viewport,
         test_mouse_drag_scrollbar_scrolls_main_pane_viewport,
         test_mouse_wheel_scrolls_split_pane_viewport,

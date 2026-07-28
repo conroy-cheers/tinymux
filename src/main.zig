@@ -1456,6 +1456,7 @@ const Layout = struct {
 };
 
 const PendingScrollUp = struct {
+    screen: vt.ScreenSet.Key,
     top: u16,
     bottom: u16,
     count: usize,
@@ -1929,6 +1930,7 @@ const Pane = struct {
             };
             if (count == 0) return null;
             return .{
+                .screen = term.screens.active_key,
                 .top = term.scrolling_region.top,
                 .bottom = term.scrolling_region.bottom,
                 .count = count,
@@ -2119,6 +2121,7 @@ const Pane = struct {
                     } else {
                         if (terminalCursorWillScrollUp(&self.term)) {
                             self.noteScrollUp(.{
+                                .screen = self.term.screens.active_key,
                                 .top = self.term.scrolling_region.top,
                                 .bottom = self.term.scrolling_region.bottom,
                                 .count = 1,
@@ -2140,7 +2143,10 @@ const Pane = struct {
         if (self.pending_scroll_overflow) return;
 
         for (self.pending_scrolls[0..self.pending_scroll_count]) |*pending| {
-            if (pending.top == scroll.top and pending.bottom == scroll.bottom) {
+            if (pending.screen == scroll.screen and
+                pending.top == scroll.top and
+                pending.bottom == scroll.bottom)
+            {
                 pending.count = std.math.add(usize, pending.count, scroll.count) catch std.math.maxInt(usize);
                 return;
             }
@@ -3149,8 +3155,19 @@ const Compositor = struct {
         const pending_main_scrolls = main_pane.takePendingScrolls();
         const pending_split_scrolls = if (split_pane) |pane| pane.takePendingScrolls() else PendingScrollBatch{};
         try self.main_rows.ensure(self.alloc, main_pane.term.rows);
-        if (self.canPaneScrollFastPath(graphics, layout.main_rows, graphics_dirty)) {
-            try self.applyPendingScrolls(&self.main_rows, 0, layout.main_rows, pending_main_scrolls);
+        if (self.canPaneScrollFastPath(
+            graphics,
+            main_pane.term.screens.active_key,
+            layout.main_rows,
+            graphics_dirty,
+        )) {
+            try self.applyPendingScrolls(
+                &self.main_rows,
+                main_pane.term.screens.active_key,
+                0,
+                layout.main_rows,
+                pending_main_scrolls,
+            );
             if (pending_main_scrolls.len == 0 and !pending_main_scrolls.overflow) {
                 const main_scroll_delta = self.main_rows.detectScrollUp(&main_pane.term, layout.main_rows, false);
                 if (main_scroll_delta > 0) {
@@ -3163,9 +3180,15 @@ const Compositor = struct {
 
         if (split_pane) |pane| {
             try self.split_rows.ensure(self.alloc, pane.term.rows);
-            if (self.canPaneScrollFastPath(graphics, layout.split_rows, graphics_dirty)) {
+            if (self.canPaneScrollFastPath(
+                graphics,
+                pane.term.screens.active_key,
+                layout.split_rows,
+                graphics_dirty,
+            )) {
                 try self.applyPendingScrolls(
                     &self.split_rows,
+                    pane.term.screens.active_key,
                     layout.splitTop(),
                     layout.split_rows,
                     pending_split_scrolls,
@@ -3227,10 +3250,12 @@ const Compositor = struct {
     fn canPaneScrollFastPath(
         self: *Compositor,
         graphics: *const GraphicsState,
+        screen: vt.ScreenSet.Key,
         visible_rows: u16,
         graphics_dirty: bool,
     ) bool {
         if (self.full_render or graphics_dirty) return false;
+        if (screen == .alternate) return false;
         if (graphics.uploaded.count() != 0) return false;
         if (visible_rows < 3) return false;
         return true;
@@ -3239,12 +3264,14 @@ const Compositor = struct {
     fn applyPendingScrolls(
         self: *Compositor,
         cache: *PaneRowCache,
+        screen: vt.ScreenSet.Key,
         outer_top: u16,
         pane_visible_rows: u16,
         pending: PendingScrollBatch,
     ) !void {
         if (pending.overflow) return;
         for (pending.items[0..pending.len]) |scroll| {
+            if (scroll.screen != screen) continue;
             if (scroll.top >= pane_visible_rows or scroll.bottom >= pane_visible_rows) continue;
             const height = scroll.height();
             if (height < 2) continue;
@@ -6181,9 +6208,40 @@ test "pane stream handler records full-pane upward scrolls" {
     const pending = pane.takePendingScrolls();
     try std.testing.expect(!pending.overflow);
     try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(vt.ScreenSet.Key.primary, pending.items[0].screen);
     try std.testing.expectEqual(@as(u16, 0), pending.items[0].top);
     try std.testing.expectEqual(@as(u16, 2), pending.items[0].bottom);
     try std.testing.expectEqual(@as(usize, 2), pending.items[0].count);
+}
+
+test "pane stream handler keeps alternate-screen scrolls separate" {
+    const alloc = std.testing.allocator;
+
+    var pane: Pane = undefined;
+    pane.alloc = alloc;
+    pane.pty_fd = -1;
+    pane.child_pid = 0;
+    pane.alive = false;
+    pane.reaped = true;
+    pane.command_title = "test";
+    pane.reply_route = .discard;
+    pane.cell_size = .{};
+    pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    defer pane.term.deinit(alloc);
+    pane.pending_scroll_count = 0;
+    pane.pending_scroll_overflow = false;
+    pane.stream = .initAlloc(alloc, Pane.StreamHandler.init(&pane));
+    defer pane.stream.deinit();
+
+    pane.feed("\x1b[?1049h\x1b[1S");
+
+    const pending = pane.takePendingScrolls();
+    try std.testing.expect(!pending.overflow);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(vt.ScreenSet.Key.alternate, pending.items[0].screen);
+    try std.testing.expectEqual(@as(u16, 0), pending.items[0].top);
+    try std.testing.expectEqual(@as(u16, 2), pending.items[0].bottom);
+    try std.testing.expectEqual(@as(usize, 1), pending.items[0].count);
 }
 
 test "pane stream handler records partial-region upward scrolls" {
@@ -6210,6 +6268,7 @@ test "pane stream handler records partial-region upward scrolls" {
     const pending = pane.takePendingScrolls();
     try std.testing.expect(!pending.overflow);
     try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(vt.ScreenSet.Key.primary, pending.items[0].screen);
     try std.testing.expectEqual(@as(u16, 1), pending.items[0].top);
     try std.testing.expectEqual(@as(u16, 4), pending.items[0].bottom);
     try std.testing.expectEqual(@as(usize, 1), pending.items[0].count);
@@ -6337,6 +6396,20 @@ test "split pane scroll fast path emits split scroll region" {
     try compositor.emitScrollUp(layout.splitTop(), layout.split_rows, 1);
 
     try std.testing.expectEqualStrings("\x1b[5;6r\x1b[1S\x1b[r", compositor.body.items);
+}
+
+test "alternate-screen panes do not use the outer scroll fast path" {
+    const alloc = std.testing.allocator;
+
+    var compositor: Compositor = .{ .alloc = alloc };
+    defer compositor.deinit();
+    compositor.full_render = false;
+
+    var graphics: GraphicsState = .{};
+    defer graphics.deinit(alloc);
+
+    try std.testing.expect(compositor.canPaneScrollFastPath(&graphics, .primary, 3, false));
+    try std.testing.expect(!compositor.canPaneScrollFastPath(&graphics, .alternate, 3, false));
 }
 
 test "term selection preserves graphics-capable outer terminals" {
