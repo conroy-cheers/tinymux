@@ -1778,6 +1778,117 @@ def test_raw_only_passthrough(tinymux: str) -> None:
         session.close()
 
 
+def test_parser_warnings_do_not_touch_outer_terminal(tinymux: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="tinymux-log-") as directory:
+        log_path = os.path.join(directory, "tinymux.log")
+        session = Session(
+            [tinymux, "session", "--", "/bin/sh", "-lc", "printf '\\003'; sleep 0.2"],
+            extra_env={"TINYMUX_LOG": log_path},
+        )
+        try:
+            session.drain_until_idle(idle=0.3, timeout=2.0)
+            assert b"warning(stream)" not in session.output
+            assert b"invalid C0 character" not in session.output
+            with open(log_path, "rb") as log:
+                logged = log.read()
+            assert b"invalid C0 character, ignoring: 0x3" in logged, logged
+        finally:
+            session.close()
+
+
+def test_raw_size_query_is_answered_without_outer_round_trip(tinymux: str) -> None:
+    script = """
+import os
+import select
+import termios
+import time
+import tty
+
+old = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    for byte in b"\\x1b[18t":
+        os.write(1, bytes([byte]))
+        time.sleep(0.001)
+    data = b""
+    deadline = time.monotonic() + 2
+    while not data.endswith(b"t") and time.monotonic() < deadline:
+        ready, _, _ = select.select([0], [], [], 0.1)
+        if ready:
+            data += os.read(0, 128)
+    os.write(1, b"SIZE_QUERY_REPLY_" + data.hex().encode() + b"\\r\\n")
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, old)
+"""
+    session = Session([tinymux, "session", "--", sys.executable, "-c", script])
+    try:
+        session.wait_for(b"SIZE_QUERY_REPLY_1b5b383b32343b383074")
+        assert b"\x1b[18t" not in session.output
+        assert b"\x1b[8;24;80t" not in session.output
+    finally:
+        session.close()
+
+
+def test_mode_2048_is_virtual_and_reports_resizes_to_owner(tinymux: str) -> None:
+    script = """
+import os
+import select
+import termios
+import time
+import tty
+
+def report():
+    data = b""
+    deadline = time.monotonic() + 3
+    while not data.endswith(b"t") and time.monotonic() < deadline:
+        ready, _, _ = select.select([0], [], [], 0.1)
+        if ready:
+            data += os.read(0, 128)
+    return data
+
+old = termios.tcgetattr(0)
+try:
+    tty.setraw(0)
+    os.write(1, b"\\x1b[?2048h")
+    first = report()
+    os.write(1, b"MODE2048_INITIAL_" + first.hex().encode() + b"\\r\\n")
+    os.write(1, b"MODE2048_RESIZE_READY\\r\\n")
+    second = report()
+    os.write(1, b"MODE2048_RESIZED_" + second.hex().encode() + b"\\r\\n")
+    os.write(1, b"\\x1b[?2048l")
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, old)
+"""
+    session = Session([tinymux, "session", "--", sys.executable, "-c", script])
+    try:
+        session.wait_for(b"MODE2048_INITIAL_1b5b34383b32343b38303b3338343b36343074")
+        session.wait_for(b"MODE2048_RESIZE_READY")
+        set_winsize(session.master, 30, 100)
+        session.wait_for(b"MODE2048_RESIZED_1b5b34383b33303b3130303b3438303b38303074")
+        assert b"\x1b[?2048h" not in session.output
+        assert b"\x1b[48;" not in session.output
+    finally:
+        session.close()
+
+
+def test_unsolicited_size_reports_are_not_keyboard_input(tinymux: str) -> None:
+    session = Session([tinymux, "session", "--", "/bin/sh", "-lc", "printf FILTER_READY; cat"])
+    try:
+        session.wait_for(b"FILTER_READY")
+        start = len(session.output)
+        session.write(b"\x1b[48;24;80;384;640t")
+        session.write(b"FILTER_AFTER\n")
+        session.wait_for(b"FILTER_AFTER")
+        assert b"\x1b[48;24;80;384;640t" not in session.output[start:]
+
+        pasted = b"\x1b[200~\x1b[8;24;80t\x1b[201~\n"
+        paste_start = len(session.output)
+        session.write(pasted)
+        session.wait_for_after(b"\x1b[8;24;80t", paste_start)
+    finally:
+        session.close()
+
+
 def test_raw_only_does_not_parse_prefix(tinymux: str) -> None:
     session = Session(
         [
@@ -2310,6 +2421,10 @@ def main() -> int:
     args = parser.parse_args()
 
     persistent_tests = [
+        test_parser_warnings_do_not_touch_outer_terminal,
+        test_raw_size_query_is_answered_without_outer_round_trip,
+        test_mode_2048_is_virtual_and_reports_resizes_to_owner,
+        test_unsolicited_size_reports_are_not_keyboard_input,
         test_split_close_then_dirty_main_exit_restores_parent_shell,
         test_split_close_preserves_primary_terminal_without_whitespace,
         test_in_place_split_resizes_main_like_tmux,
@@ -2333,6 +2448,10 @@ def main() -> int:
         test_tmux_split_window_fails_when_split_already_open,
     ]
     tests = persistent_tests if args.persistent_only else [
+        test_parser_warnings_do_not_touch_outer_terminal,
+        test_raw_size_query_is_answered_without_outer_round_trip,
+        test_mode_2048_is_virtual_and_reports_resizes_to_owner,
+        test_unsolicited_size_reports_are_not_keyboard_input,
         test_split_close_then_dirty_main_exit_restores_parent_shell,
         test_seamless_raw_only_has_no_terminal_redraw,
         test_handoff_apply_emits_safe_shell_state,

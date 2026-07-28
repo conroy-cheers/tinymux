@@ -5,11 +5,26 @@ const vt = @import("ghostty-vt");
 const ptypkg = @import("pty.zig");
 const protocol = @import("protocol.zig");
 const shell_scripts = @import("shell_scripts.zig");
+const diagnostics = @import("diagnostics.zig");
+
+pub const std_options: std.Options = .{
+    .logFn = diagnostics.logFn,
+};
 
 pub const version = "0.1.0";
 
 const stdin_fd: posix.fd_t = 0;
 const stdout_fd: posix.fd_t = 1;
+
+const OuterTerminal = struct {
+    fd: posix.fd_t,
+
+    fn write(self: OuterTerminal, bytes: []const u8) !void {
+        try protocol.writeAll(self.fd, bytes);
+    }
+};
+
+const outer_terminal: OuterTerminal = .{ .fd = stdout_fd };
 
 const default_split_rows: u16 = 9;
 const exit_drain_ms: i64 = 50;
@@ -20,6 +35,7 @@ const composed_frame_interval_ns: i128 = 4 * std.time.ns_per_ms;
 const bulk_frame_interval_ns: i128 = 8 * std.time.ns_per_ms;
 const bulk_sticky_window_ns: i128 = 120 * std.time.ns_per_ms;
 const resize_quiet_ns: i128 = 80 * std.time.ns_per_ms;
+const control_sequence_timeout_ns: i128 = 20 * std.time.ns_per_ms;
 const interactive_input_window_ns: i128 = 50 * std.time.ns_per_ms;
 const interactive_pty_drain_budget_ns: i128 = 1 * std.time.ns_per_ms;
 const bulk_pty_drain_budget_ns: i128 = 6 * std.time.ns_per_ms;
@@ -58,6 +74,7 @@ const scrollbar_track = "│";
 const scrollbar_thumb = "█";
 
 extern "c" fn cfmakeraw(termios_p: *posix.termios) void;
+extern "c" fn tcgetpgrp(fd: c_int) posix.pid_t;
 
 const RenderScheduler = struct {
     const DirtyKind = enum { normal, urgent, bulk };
@@ -180,6 +197,16 @@ const DrainStats = struct {
 };
 
 pub fn main() !void {
+    diagnostics.initFromEnv() catch |err| {
+        var stderr = std.fs.File.stderr().writer(&.{});
+        try stderr.interface.print(
+            "tinymux: unable to open TINYMUX_LOG: {s}\n",
+            .{@errorName(err)},
+        );
+        return err;
+    };
+    defer diagnostics.deinit();
+
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer {
         if (builtin.mode == .Debug) _ = debug_allocator.deinit();
@@ -1013,6 +1040,12 @@ fn applyTinymuxEnv(
     role: TinymuxEnvRole,
 ) !void {
     try env.put("TINYMUX", "1");
+    _ = env.remove("TINYMUX_SESSION_ID");
+    _ = env.remove("TINYMUX_CONTROL");
+    _ = env.remove("TINYMUX_TMUX_SOCKET");
+    _ = env.remove("TINYMUX_SHIM_DIR");
+    _ = env.remove("TMUX_PANE");
+    _ = env.remove("TMUX");
 
     if (role != .main_session) {
         // Host integration belongs only to the persistent main shell. Nested
@@ -1438,6 +1471,80 @@ const PendingScrollBatch = struct {
     overflow: bool = false,
 };
 
+const ReplyRoute = union(enum) {
+    pane: ?posix.pid_t,
+    discard,
+};
+
+const RawControlScanner = struct {
+    const State = enum { ground, escape, csi };
+
+    state: State = .ground,
+    bytes: [512]u8 = undefined,
+    len: usize = 0,
+    due_ns: ?i128 = null,
+
+    fn start(self: *RawControlScanner, now_ns: i128) void {
+        self.state = .escape;
+        self.bytes[0] = 0x1b;
+        self.len = 1;
+        self.due_ns = now_ns + control_sequence_timeout_ns;
+    }
+
+    fn append(self: *RawControlScanner, byte: u8, now_ns: i128) bool {
+        if (self.len >= self.bytes.len) return false;
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        self.due_ns = now_ns + control_sequence_timeout_ns;
+        return true;
+    }
+
+    fn reset(self: *RawControlScanner) void {
+        self.state = .ground;
+        self.len = 0;
+        self.due_ns = null;
+    }
+
+    fn buffered(self: *const RawControlScanner) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+const OuterInputFilter = struct {
+    const State = enum { ground, escape, csi };
+
+    state: State = .ground,
+    bytes: [128]u8 = undefined,
+    len: usize = 0,
+    due_ns: ?i128 = null,
+    bracketed_paste: bool = false,
+
+    fn start(self: *OuterInputFilter, now_ns: i128) void {
+        self.state = .escape;
+        self.bytes[0] = 0x1b;
+        self.len = 1;
+        self.due_ns = now_ns + control_sequence_timeout_ns;
+    }
+
+    fn append(self: *OuterInputFilter, byte: u8, now_ns: i128) bool {
+        if (self.len >= self.bytes.len) return false;
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        self.due_ns = now_ns + control_sequence_timeout_ns;
+        return true;
+    }
+
+    fn resetSequence(self: *OuterInputFilter) void {
+        self.state = .ground;
+        self.len = 0;
+        self.due_ns = null;
+    }
+
+    fn buffered(self: *const OuterInputFilter) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 const RawTerminal = struct {
     fd: posix.fd_t,
     original: posix.termios,
@@ -1739,8 +1846,8 @@ const Pane = struct {
     alive: bool = true,
     reaped: bool = false,
     command_title: []const u8,
-    passthrough: bool = false,
-    feeding_discarded: bool = false,
+    reply_route: ReplyRoute = .discard,
+    in_band_size_owner: ?posix.pid_t = null,
     ascii_fast_feed_enabled: bool = true,
     cell_size: CellSize,
     term: vt.Terminal,
@@ -1789,6 +1896,23 @@ const Pane = struct {
         ) void {
             const scroll_up = self.scrollUp(action, value);
             self.terminal_handler.vt(action, value);
+            if (comptime action == .set_mode) {
+                if (value.mode == .in_band_size_reports) {
+                    self.pane.in_band_size_owner = switch (self.pane.reply_route) {
+                        .pane => |owner| owner,
+                        else => null,
+                    };
+                    self.pane.sendInBandSizeReport();
+                }
+            }
+            if (comptime action == .reset_mode) {
+                if (value.mode == .in_band_size_reports) {
+                    self.pane.in_band_size_owner = null;
+                }
+            }
+            if (comptime action == .full_reset) {
+                self.pane.in_band_size_owner = null;
+            }
             if (scroll_up) |scroll| self.pane.noteScrollUp(scroll);
         }
 
@@ -1904,9 +2028,10 @@ const Pane = struct {
 
     fn effectWritePty(handler: *TerminalHandler, data: [:0]const u8) void {
         const self = fromHandler(handler);
-        if (self.passthrough and !self.feeding_discarded) return;
-        if (self.pty_fd < 0) return;
-        protocol.writeAll(self.pty_fd, data) catch {};
+        switch (self.reply_route) {
+            .discard => return,
+            .pane => |owner| self.writeTerminalReply(data, owner),
+        }
     }
 
     fn effectDeviceAttributes(handler: *TerminalHandler) DeviceAttributes {
@@ -1940,6 +2065,47 @@ const Pane = struct {
             }
         }
         self.stream.nextSlice(bytes);
+    }
+
+    fn feedWithReplies(self: *Pane, bytes: []const u8, owner: ?posix.pid_t) void {
+        const previous = self.reply_route;
+        self.reply_route = .{ .pane = owner };
+        defer self.reply_route = previous;
+        self.feed(bytes);
+    }
+
+    fn foregroundPgrp(self: *const Pane) ?posix.pid_t {
+        if (self.pty_fd < 0) return null;
+        const result = tcgetpgrp(self.pty_fd);
+        return if (result < 0) null else result;
+    }
+
+    fn terminalReplySafe(self: *const Pane, owner: ?posix.pid_t) bool {
+        if (self.pty_fd < 0) return false;
+        const expected = owner orelse return false;
+        const current = self.foregroundPgrp() orelse return false;
+        if (current != expected) return false;
+        const attrs = posix.tcgetattr(self.pty_fd) catch return false;
+        return !attrs.lflag.ECHO;
+    }
+
+    fn writeTerminalReply(self: *Pane, bytes: []const u8, owner: ?posix.pid_t) void {
+        if (!self.terminalReplySafe(owner)) return;
+        protocol.writeAll(self.pty_fd, bytes) catch {};
+    }
+
+    fn sendInBandSizeReport(self: *Pane) void {
+        const owner = self.in_band_size_owner orelse return;
+        if (!self.term.modes.get(.in_band_size_reports)) return;
+        var storage: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&storage);
+        vt.size_report.encode(&writer, .mode_2048, .{
+            .rows = self.term.rows,
+            .columns = self.term.cols,
+            .cell_width = self.cell_size.width,
+            .cell_height = self.cell_size.height,
+        }) catch return;
+        self.writeTerminalReply(writer.buffered(), owner);
     }
 
     fn feedPlainAscii(self: *Pane, bytes: []const u8) bool {
@@ -2013,6 +2179,7 @@ const Pane = struct {
         if (self.pty_fd >= 0) {
             try ptypkg.Pty.setSize(self.pty_fd, self.cell_size.makeWinsize(rows, cols));
         }
+        self.sendInBandSizeReport();
     }
 
     fn closePty(self: *Pane) void {
@@ -2169,6 +2336,7 @@ fn appendWithoutScreenSwitchModes(
         "\x1b[?47h",   "\x1b[?47l",
         "\x1b[?1047h", "\x1b[?1047l",
         "\x1b[?1049h", "\x1b[?1049l",
+        "\x1b[?2048h", "\x1b[?2048l",
     };
     var offset: usize = 0;
     while (offset < input.len) {
@@ -2190,7 +2358,7 @@ const reset_state_sequence = "\x0f\x1b(B" ++
     "\x1b[0m\x1b[0 q\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?7h" ++
     "\x1b[4l\x1b[r\x1b[?69l\x1b[?25h" ++
     "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l" ++
-    "\x1b[?2004l\x1b[?1004l\x1b[>4;0m\x1b[=0;1u";
+    "\x1b[?2004l\x1b[?1004l\x1b[?2048l\x1b[>4;0m\x1b[=0;1u";
 const restore_terminal_sequence = reset_state_sequence ++ "\x1b[?2026l\x1b[?2031l";
 const sanitize_sequence = reset_state_sequence ++ "\x1b[H\x1b[2J";
 
@@ -3041,7 +3209,7 @@ const Compositor = struct {
             }
             try self.frame.appendSlice(self.alloc, cursor_state);
             try self.frame.appendSlice(self.alloc, synchronized_update_end);
-            try protocol.writeAll(stdout_fd, self.frame.items);
+            try outer_terminal.write(self.frame.items);
         }
 
         self.cursor_valid = true;
@@ -3590,6 +3758,8 @@ const App = struct {
     deferred_catchup_due_ns: ?i128 = null,
     screen_switch_mirror: ScreenSwitchMirror = .{},
     host_effect_mirror: HostEffectMirror = .{},
+    raw_control_scanner: RawControlScanner = .{},
+    outer_input_filter: OuterInputFilter = .{},
     outer_primary_touched: bool = false,
     outer_alternate_touched: bool = false,
     outer_primary_graphics: RawGraphicsOwnership = .{},
@@ -3719,10 +3889,9 @@ const App = struct {
     }
 
     fn run(self: *App) !void {
-        self.main_pane.passthrough = !self.composed;
         if (self.composed) {
             self.beginOuterComposition();
-            try protocol.writeAll(stdout_fd, mux_mouse_enable);
+            try outer_terminal.write(mux_mouse_enable);
             self.terminal_restore_needed = true;
             self.compositor.invalidate();
             try self.compositor.render(self.layout, self.main_pane, self.split_pane, true);
@@ -3740,6 +3909,8 @@ const App = struct {
             try self.closeAutoSplitIfExited();
 
             try self.checkResize(std.time.nanoTimestamp());
+            try self.flushRawControlIfDue(std.time.nanoTimestamp());
+            try self.flushOuterInputIfDue(std.time.nanoTimestamp());
             try self.renderIfDue();
 
             var fds_storage: [4 + max_control_connections]posix.pollfd = undefined;
@@ -3931,7 +4102,7 @@ const App = struct {
         }
         try out.insertSlice(self.alloc, 0, synchronized_update_begin);
         try out.appendSlice(self.alloc, synchronized_update_end);
-        try protocol.writeAll(stdout_fd, out.items);
+        try outer_terminal.write(out.items);
         self.outer_primary_graphics.clear();
         self.outer_alternate_graphics.clear();
     }
@@ -3958,6 +4129,26 @@ const App = struct {
             if (now_ns >= due_ns) return 0;
             const remaining_ns = due_ns - now_ns;
             const remaining_ms: i32 = @intCast(@max(@as(i128, 1), @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            timeout = @min(timeout, remaining_ms);
+        }
+
+        if (self.raw_control_scanner.due_ns) |due_ns| {
+            if (now_ns >= due_ns) return 0;
+            const remaining_ns = due_ns - now_ns;
+            const remaining_ms: i32 = @intCast(@max(
+                @as(i128, 1),
+                @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+            ));
+            timeout = @min(timeout, remaining_ms);
+        }
+
+        if (self.outer_input_filter.due_ns) |due_ns| {
+            if (now_ns >= due_ns) return 0;
+            const remaining_ns = due_ns - now_ns;
+            const remaining_ms: i32 = @intCast(@max(
+                @as(i128, 1),
+                @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+            ));
             timeout = @min(timeout, remaining_ms);
         }
 
@@ -4002,7 +4193,7 @@ const App = struct {
             out.appendSlice(self.alloc, restore_terminal_sequence) catch {};
             self.terminal_restore_needed = false;
         }
-        protocol.writeAll(stdout_fd, out.items) catch {};
+        outer_terminal.write(out.items) catch {};
     }
 
     fn readInput(self: *App, running: *bool) !bool {
@@ -4020,14 +4211,135 @@ const App = struct {
             return false;
         }
 
+        var filtered: std.ArrayList(u8) = .empty;
+        defer filtered.deinit(self.alloc);
+        try self.filterOuterInput(buf[0..n], &filtered);
+        if (filtered.items.len == 0) return true;
+        try self.dispatchInput(filtered.items);
+        return true;
+    }
+
+    fn dispatchInput(self: *App, bytes: []const u8) !void {
         if (!self.composed) {
-            try self.forwardKeyboardInput(buf[0..n]);
-            return true;
+            try self.forwardKeyboardInput(bytes);
+            return;
         }
 
-        try self.input_buffer.appendSlice(self.alloc, buf[0..n]);
+        try self.input_buffer.appendSlice(self.alloc, bytes);
         try self.processComposedInputBuffer();
+    }
+
+    fn allDecimal(bytes: []const u8) bool {
+        if (bytes.len == 0) return false;
+        for (bytes) |byte| if (byte < '0' or byte > '9') return false;
         return true;
+    }
+
+    fn isSizeReportResponse(sequence: []const u8) bool {
+        if (sequence.len < 7 or
+            sequence[0] != 0x1b or
+            sequence[1] != '[' or
+            sequence[sequence.len - 1] != 't')
+        {
+            return false;
+        }
+        var fields = std.mem.splitScalar(u8, sequence[2 .. sequence.len - 1], ';');
+        const kind = fields.next() orelse return false;
+        const expected: usize = if (std.mem.eql(u8, kind, "4") or
+            std.mem.eql(u8, kind, "6") or
+            std.mem.eql(u8, kind, "8"))
+            2
+        else if (std.mem.eql(u8, kind, "48"))
+            4
+        else
+            return false;
+        var count: usize = 0;
+        while (fields.next()) |field| {
+            if (!allDecimal(field)) return false;
+            count += 1;
+        }
+        return count == expected;
+    }
+
+    fn finishOuterInputSequence(
+        self: *App,
+        out: *std.ArrayList(u8),
+    ) !void {
+        const sequence = self.outer_input_filter.buffered();
+        if (self.outer_input_filter.bracketed_paste) {
+            try out.appendSlice(self.alloc, sequence);
+            if (std.mem.eql(u8, sequence, "\x1b[201~")) {
+                self.outer_input_filter.bracketed_paste = false;
+            }
+        } else if (std.mem.eql(u8, sequence, "\x1b[200~")) {
+            try out.appendSlice(self.alloc, sequence);
+            self.outer_input_filter.bracketed_paste = true;
+        } else if (isSizeReportResponse(sequence)) {
+            std.log.scoped(.input).warn("discarded unsolicited terminal size report", .{});
+        } else {
+            try out.appendSlice(self.alloc, sequence);
+        }
+        self.outer_input_filter.resetSequence();
+    }
+
+    fn filterOuterInput(
+        self: *App,
+        bytes: []const u8,
+        out: *std.ArrayList(u8),
+    ) !void {
+        var direct_start: ?usize = if (self.outer_input_filter.state == .ground) 0 else null;
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 1) {
+            const byte = bytes[i];
+            switch (self.outer_input_filter.state) {
+                .ground => {
+                    if (byte != 0x1b) continue;
+                    if (direct_start) |start| try out.appendSlice(self.alloc, bytes[start..i]);
+                    self.outer_input_filter.start(std.time.nanoTimestamp());
+                    direct_start = null;
+                },
+                .escape => {
+                    if (!self.outer_input_filter.append(byte, std.time.nanoTimestamp())) {
+                        try out.appendSlice(self.alloc, self.outer_input_filter.buffered());
+                        try out.append(self.alloc, byte);
+                        self.outer_input_filter.resetSequence();
+                        direct_start = i + 1;
+                        continue;
+                    }
+                    if (byte == '[') {
+                        self.outer_input_filter.state = .csi;
+                    } else {
+                        try out.appendSlice(self.alloc, self.outer_input_filter.buffered());
+                        self.outer_input_filter.resetSequence();
+                        direct_start = i + 1;
+                    }
+                },
+                .csi => {
+                    if (!self.outer_input_filter.append(byte, std.time.nanoTimestamp())) {
+                        try out.appendSlice(self.alloc, self.outer_input_filter.buffered());
+                        try out.append(self.alloc, byte);
+                        self.outer_input_filter.resetSequence();
+                        direct_start = i + 1;
+                        continue;
+                    }
+                    if (byte >= 0x40 and byte <= 0x7e) {
+                        try self.finishOuterInputSequence(out);
+                        direct_start = i + 1;
+                    }
+                },
+            }
+        }
+        if (direct_start) |start| try out.appendSlice(self.alloc, bytes[start..]);
+    }
+
+    fn flushOuterInputIfDue(self: *App, now_ns: i128) !void {
+        const due_ns = self.outer_input_filter.due_ns orelse return;
+        if (now_ns < due_ns) return;
+        var pending: [128]u8 = undefined;
+        const len = self.outer_input_filter.len;
+        @memcpy(pending[0..len], self.outer_input_filter.buffered());
+        self.outer_input_filter.resetSequence();
+        try self.dispatchInput(pending[0..len]);
     }
 
     fn processComposedInputBuffer(self: *App) !void {
@@ -4242,17 +4554,16 @@ const App = struct {
         }
         const bytes = buf[0..n];
         if (!self.composed and which == .main) {
-            try protocol.writeAll(stdout_fd, bytes);
-            if (self.rawModeNeedsPaneState()) try self.deferMainState(bytes);
+            try self.forwardRawMainOutput(bytes);
         } else if (self.composed and which == .main) {
             if (try self.tryComposedMainPassthrough(bytes)) return n;
             try self.endComposedMainPassthrough();
             self.flushDeferredMainState();
             try self.mirrorMainScreenSwitches(bytes);
-            pane.feed(bytes);
+            pane.feedWithReplies(bytes, pane.foregroundPgrp());
             self.syncMainPassthroughCursor();
         } else {
-            pane.feed(bytes);
+            pane.feedWithReplies(bytes, pane.foregroundPgrp());
         }
         return n;
     }
@@ -4269,7 +4580,7 @@ const App = struct {
         );
         try self.host_effect_mirror.feed(self.alloc, bytes, &mirrored);
         if (mirrored.items.len == 0) return;
-        try protocol.writeAll(stdout_fd, mirrored.items);
+        try outer_terminal.write(mirrored.items);
         self.compositor.invalidate();
     }
 
@@ -4364,6 +4675,159 @@ const App = struct {
         self.syncMainPassthroughCursor();
     }
 
+    fn passRawMainBytes(self: *App, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try outer_terminal.write(bytes);
+        if (self.rawModeNeedsPaneState()) try self.deferMainState(bytes);
+    }
+
+    fn isLocalTerminalQuery(sequence: []const u8) bool {
+        if (std.mem.eql(u8, sequence, "\x1bZ")) return true;
+        if (sequence.len < 3 or
+            sequence[0] != 0x1b or
+            sequence[1] != '[')
+        {
+            return false;
+        }
+        const final = sequence[sequence.len - 1];
+        const body = sequence[2 .. sequence.len - 1];
+        return switch (final) {
+            'c' => std.mem.eql(u8, body, "") or
+                std.mem.eql(u8, body, "0") or
+                std.mem.eql(u8, body, ">") or
+                std.mem.eql(u8, body, ">0") or
+                std.mem.eql(u8, body, "=") or
+                std.mem.eql(u8, body, "=0"),
+            'n' => std.mem.eql(u8, body, "5") or
+                std.mem.eql(u8, body, "6") or
+                std.mem.eql(u8, body, "?6") or
+                std.mem.eql(u8, body, "?996") or
+                std.mem.eql(u8, body, "?997"),
+            'p' => std.mem.startsWith(u8, body, "?") and
+                std.mem.endsWith(u8, body, "$") and
+                body.len > 2,
+            'q' => std.mem.eql(u8, body, ">"),
+            't' => std.mem.eql(u8, body, "14") or
+                std.mem.eql(u8, body, "16") or
+                std.mem.eql(u8, body, "18") or
+                std.mem.eql(u8, body, "21"),
+            'u' => std.mem.eql(u8, body, "?"),
+            else => false,
+        };
+    }
+
+    fn shouldInterceptRawControlSequence(sequence: []const u8) bool {
+        return std.mem.eql(u8, sequence, "\x1b[?2048h") or
+            std.mem.eql(u8, sequence, "\x1b[?2048l") or
+            isLocalTerminalQuery(sequence);
+    }
+
+    fn noteRawControlSequence(self: *App, sequence: []const u8) void {
+        if (std.mem.eql(u8, sequence, "\x1bc")) {
+            self.main_pane.in_band_size_owner = null;
+        }
+    }
+
+    fn forwardRawMainOutput(self: *App, bytes: []const u8) !void {
+        const now_ns = std.time.nanoTimestamp();
+        var outer_start: ?usize = if (self.raw_control_scanner.state == .ground) 0 else null;
+        var sequence_start: ?usize = null;
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 1) {
+            const byte = bytes[i];
+            switch (self.raw_control_scanner.state) {
+                .ground => {
+                    if (byte != 0x1b) {
+                        const offset = std.mem.indexOfScalar(u8, bytes[i + 1 ..], 0x1b) orelse {
+                            i = bytes.len;
+                            break;
+                        };
+                        i += offset + 1;
+                    }
+                    self.raw_control_scanner.start(now_ns);
+                    sequence_start = i;
+                },
+                .escape => {
+                    if (!self.raw_control_scanner.append(byte, now_ns)) {
+                        if (sequence_start == null) {
+                            try self.passRawMainBytes(self.raw_control_scanner.buffered());
+                            outer_start = i;
+                        }
+                        self.raw_control_scanner.reset();
+                        sequence_start = null;
+                        continue;
+                    }
+                    if (byte == '[') {
+                        self.raw_control_scanner.state = .csi;
+                    } else {
+                        const sequence = self.raw_control_scanner.buffered();
+                        const intercepted = shouldInterceptRawControlSequence(sequence);
+                        if (intercepted) {
+                            if (sequence_start) |start| {
+                                if (outer_start) |outer| try self.passRawMainBytes(bytes[outer..start]);
+                            }
+                            self.flushDeferredMainState();
+                            self.main_pane.feedWithReplies(sequence, self.main_pane.foregroundPgrp());
+                            outer_start = i + 1;
+                        } else if (sequence_start == null) {
+                            try self.passRawMainBytes(sequence);
+                            outer_start = i + 1;
+                        }
+                        if (!intercepted) self.noteRawControlSequence(sequence);
+                        self.raw_control_scanner.reset();
+                        sequence_start = null;
+                    }
+                },
+                .csi => {
+                    if (!self.raw_control_scanner.append(byte, now_ns)) {
+                        if (sequence_start == null) {
+                            try self.passRawMainBytes(self.raw_control_scanner.buffered());
+                            outer_start = i;
+                        }
+                        self.raw_control_scanner.reset();
+                        sequence_start = null;
+                        continue;
+                    }
+                    if (byte >= 0x40 and byte <= 0x7e) {
+                        const sequence = self.raw_control_scanner.buffered();
+                        const intercepted = shouldInterceptRawControlSequence(sequence);
+                        if (intercepted) {
+                            if (sequence_start) |start| {
+                                if (outer_start) |outer| try self.passRawMainBytes(bytes[outer..start]);
+                            }
+                            self.flushDeferredMainState();
+                            self.main_pane.feedWithReplies(sequence, self.main_pane.foregroundPgrp());
+                            outer_start = i + 1;
+                        } else if (sequence_start == null) {
+                            try self.passRawMainBytes(sequence);
+                            outer_start = i + 1;
+                        }
+                        if (!intercepted) self.noteRawControlSequence(sequence);
+                        self.raw_control_scanner.reset();
+                        sequence_start = null;
+                    }
+                },
+            }
+        }
+        if (self.raw_control_scanner.state == .ground) {
+            if (outer_start) |start| try self.passRawMainBytes(bytes[start..]);
+        } else if (sequence_start) |start| {
+            if (outer_start) |outer| try self.passRawMainBytes(bytes[outer..start]);
+        }
+    }
+
+    fn flushRawControlPending(self: *App) !void {
+        if (self.raw_control_scanner.state == .ground) return;
+        try self.passRawMainBytes(self.raw_control_scanner.buffered());
+        self.raw_control_scanner.reset();
+    }
+
+    fn flushRawControlIfDue(self: *App, now_ns: i128) !void {
+        const due_ns = self.raw_control_scanner.due_ns orelse return;
+        if (now_ns < due_ns) return;
+        try self.flushRawControlPending();
+    }
+
     fn tryComposedMainPassthrough(self: *App, bytes: []const u8) !bool {
         if (!self.main_pane.ascii_fast_feed_enabled) return false;
         if (!self.mainPaneLiveBottom()) return false;
@@ -4402,7 +4866,7 @@ const App = struct {
     fn writeComposedMainPassthrough(self: *App, bytes: []const u8) !void {
         if (self.layout.main_rows == 0) return;
         try self.beginComposedMainPassthrough();
-        try protocol.writeAll(stdout_fd, bytes);
+        try outer_terminal.write(bytes);
     }
 
     fn beginComposedMainPassthrough(self: *App) !void {
@@ -4410,13 +4874,13 @@ const App = struct {
         var buf: [96]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buf);
         try writer.print("\x1b[?69h\x1b[1;{d}r\x1b[1;{d}s", .{ self.layout.main_rows, self.layout.paneCols() });
-        try protocol.writeAll(stdout_fd, writer.buffered());
+        try outer_terminal.write(writer.buffered());
         self.main_passthrough_outer_active = true;
     }
 
     fn endComposedMainPassthrough(self: *App) !void {
         if (!self.main_passthrough_outer_active) return;
-        try protocol.writeAll(stdout_fd, "\x1b[r\x1b[s\x1b[?69l");
+        try outer_terminal.write("\x1b[r\x1b[s\x1b[?69l");
         self.main_passthrough_outer_active = false;
     }
 
@@ -4720,6 +5184,7 @@ const App = struct {
         if (self.split_pane != null) return error.SplitAlreadyOpen;
 
         try self.drainMainForSplitTransition();
+        try self.flushRawControlPending();
         self.flushDeferredMainState();
 
         self.active_split_rows = rows;
@@ -4738,8 +5203,7 @@ const App = struct {
         self.next_split_generation = if (generation == std.math.maxInt(u64)) 1 else generation + 1;
         self.split_generation = generation;
         self.composed = true;
-        self.main_pane.passthrough = false;
-        try protocol.writeAll(stdout_fd, mux_mouse_enable);
+        try outer_terminal.write(mux_mouse_enable);
         self.terminal_restore_needed = true;
         self.compositor.invalidate();
         try self.compositor.render(self.layout, self.main_pane, self.split_pane, true);
@@ -4763,11 +5227,10 @@ const App = struct {
         self.scrollbar_drag = null;
         try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
         self.active_split_rows = self.config.split_rows;
-        try protocol.writeAll(stdout_fd, reset_state_sequence);
+        try outer_terminal.write(reset_state_sequence);
         try self.reconcileMainToOuter();
 
         self.composed = false;
-        self.main_pane.passthrough = true;
         self.render_scheduler.rendered(std.time.nanoTimestamp());
     }
 
@@ -4796,7 +5259,7 @@ const App = struct {
     ) !void {
         if (self.main_pane.term.screens.get(key) == null) return;
         self.main_pane.term.screens.switchTo(key);
-        try protocol.writeAll(stdout_fd, switch (key) {
+        try outer_terminal.write(switch (key) {
             .primary => "\x1b[?1047l",
             .alternate => "\x1b[?1047h",
         });
@@ -4804,12 +5267,12 @@ const App = struct {
         var graphics_handoff: std.ArrayList(u8) = .empty;
         defer graphics_handoff.deinit(self.alloc);
         try self.compositor.graphicsFor(key).deleteAll(self.alloc, &graphics_handoff);
-        if (graphics_handoff.items.len > 0) try protocol.writeAll(stdout_fd, graphics_handoff.items);
+        if (graphics_handoff.items.len > 0) try outer_terminal.write(graphics_handoff.items);
 
         if (restore_terminal_state) {
             const modes = try self.main_pane.terminalModes(self.alloc);
             defer self.alloc.free(modes);
-            try protocol.writeAll(stdout_fd, modes);
+            try outer_terminal.write(modes);
         }
         self.compositor.invalidate();
         try self.compositor.render(self.layout, self.main_pane, null, false);
@@ -4818,12 +5281,12 @@ const App = struct {
         try graphics_handoff.appendSlice(self.alloc, synchronized_update_begin);
         try appendRawGraphicsRestore(self.alloc, &graphics_handoff, self.main_pane);
         try graphics_handoff.appendSlice(self.alloc, synchronized_update_end);
-        try protocol.writeAll(stdout_fd, graphics_handoff.items);
+        try outer_terminal.write(graphics_handoff.items);
         try self.rawGraphicsFor(key).capture(self.alloc, self.main_pane);
 
         const screen_state = try self.main_pane.screenState(self.alloc);
         defer self.alloc.free(screen_state);
-        try protocol.writeAll(stdout_fd, screen_state);
+        try outer_terminal.write(screen_state);
     }
 
     fn closeAutoSplitIfExited(self: *App) !void {
@@ -4867,11 +5330,12 @@ const App = struct {
 
             const bytes = buf[0..n];
             if (!self.composed) {
-                try protocol.writeAll(stdout_fd, bytes);
+                try self.forwardRawMainOutput(bytes);
             } else {
-                self.main_pane.feed(bytes);
+                self.main_pane.feedWithReplies(bytes, self.main_pane.foregroundPgrp());
             }
         }
+        try self.flushRawControlPending();
         self.main_pane.closePty();
     }
 
@@ -5058,6 +5522,68 @@ test "host effect mirror discards oversized OSC through its terminator" {
     try mirror.feed(alloc, "\x07\x1b]7;file:///after\x07", &out);
 
     try std.testing.expectEqualStrings("\x1b]7;file:///after\x07", out.items);
+}
+
+test "raw control classifier recognizes locally answered terminal queries" {
+    const queries = [_][]const u8{
+        "\x1bZ",
+        "\x1b[c",
+        "\x1b[>0c",
+        "\x1b[5n",
+        "\x1b[?6n",
+        "\x1b[?2048$p",
+        "\x1b[>q",
+        "\x1b[14t",
+        "\x1b[16t",
+        "\x1b[18t",
+        "\x1b[21t",
+        "\x1b[?u",
+    };
+    for (queries) |query| try std.testing.expect(App.isLocalTerminalQuery(query));
+
+    const passthrough = [_][]const u8{
+        "\x1b[31m",
+        "\x1b[?1049h",
+        "\x1b[22;0t",
+        "\x1b[>1u",
+        "\x1b]0;title\x07",
+    };
+    for (passthrough) |sequence| {
+        try std.testing.expect(!App.isLocalTerminalQuery(sequence));
+    }
+}
+
+test "outer input filter recognizes only complete size reports" {
+    const reports = [_][]const u8{
+        "\x1b[4;384;640t",
+        "\x1b[6;16;8t",
+        "\x1b[8;24;80t",
+        "\x1b[48;24;80;384;640t",
+    };
+    for (reports) |report| try std.testing.expect(App.isSizeReportResponse(report));
+
+    const input = [_][]const u8{
+        "\x1b[18t",
+        "\x1b[8;24t",
+        "\x1b[48;24;80;384t",
+        "\x1b[48;24;bad;384;640t",
+        "\x1b[A",
+    };
+    for (input) |sequence| {
+        try std.testing.expect(!App.isSizeReportResponse(sequence));
+    }
+}
+
+test "terminal mode handoff excludes screen switches and mode 2048" {
+    const alloc = std.testing.allocator;
+    var filtered: std.ArrayList(u8) = .empty;
+    defer filtered.deinit(alloc);
+    try appendWithoutScreenSwitchModes(
+        alloc,
+        &filtered,
+        "a\x1b[?1049hb\x1b[?2048hc\x1b[?2048ld\x1b[31me",
+    );
+    try std.testing.expectEqualStrings("abcd\x1b[31me", filtered.items);
 }
 
 test "layout clamps split while preserving rows when possible" {
@@ -5641,8 +6167,7 @@ test "pane stream handler records full-pane upward scrolls" {
     pane.alive = false;
     pane.reaped = true;
     pane.command_title = "test";
-    pane.passthrough = false;
-    pane.feeding_discarded = false;
+    pane.reply_route = .discard;
     pane.cell_size = .{};
     pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
     defer pane.term.deinit(alloc);
@@ -5671,8 +6196,7 @@ test "pane stream handler records partial-region upward scrolls" {
     pane.alive = false;
     pane.reaped = true;
     pane.command_title = "test";
-    pane.passthrough = false;
-    pane.feeding_discarded = false;
+    pane.reply_route = .discard;
     pane.cell_size = .{};
     pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
     defer pane.term.deinit(alloc);

@@ -53,6 +53,19 @@ split closes. Closing a split does not replay that history.
 Main-pane BEL, title, OSC 7, and OSC 133 effects are forwarded while composed.
 Auxiliary panes cannot publish host-level title, cwd, or prompt effects.
 
+Raw passthrough distinguishes display traffic from terminal control-plane
+transactions. Printable output and ordinary terminal commands still go
+directly to the outer terminal. Queries that would generate terminal input are
+answered from the main pane's shadow model, and in-band size-report mode 2048
+is virtualized per pane rather than enabled on the outer terminal. Replies are
+written only while the requesting foreground process group still owns a
+non-echoing pane terminal.
+
+Unsolicited outer-terminal size reports are discarded outside bracketed paste,
+so a delayed reply cannot become shell input. Parser and library diagnostics
+never write to the owned terminal. Set `TINYMUX_LOG` to an explicit file path
+to retain those diagnostics; otherwise they are silent.
+
 ## Control API
 
 The native surface is deliberately generic:

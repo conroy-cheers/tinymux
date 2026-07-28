@@ -80,6 +80,13 @@ contract is defined in `persistent-session.md`.
 - `TERM-013` REQUIRED for persistent sessions: closing an auxiliary pane uses
   cursor-addressed reconciliation and does not replay pane history or emit
   linefeeds to manufacture outer scrollback.
+- `TERM-014` REQUIRED: terminal queries implemented by tinymux are answered
+  from the pane model without leaking their replies into the physical terminal
+  or a later foreground process.
+- `TERM-015` REQUIRED: in-band size-report mode 2048 is pane-local; enabling it
+  does not enable the corresponding mode on the outer terminal.
+- `TERM-016` REQUIRED: parser and library diagnostics do not write to the
+  physical terminal while tinymux owns it.
 
 ## Terminal Profiles
 
