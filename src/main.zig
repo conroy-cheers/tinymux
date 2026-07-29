@@ -2056,7 +2056,18 @@ const Pane = struct {
         return "tinymux " ++ version;
     }
 
+    fn repairCursorCache(self: *Pane) void {
+        const screen = self.term.screens.active;
+        const expected = screen.cursor.page_pin.rowAndCell();
+        if (screen.cursor.page_row != expected.row or
+            screen.cursor.page_cell != expected.cell)
+        {
+            screen.cursorReload();
+        }
+    }
+
     fn feed(self: *Pane, bytes: []const u8) void {
+        self.repairCursorCache();
         if (self.ascii_fast_feed_enabled) {
             if (plainAsciiEligible(bytes)) {
                 if (self.feedPlainAscii(bytes)) return;
@@ -6242,6 +6253,37 @@ test "pane stream handler keeps alternate-screen scrolls separate" {
     try std.testing.expectEqual(@as(u16, 0), pending.items[0].top);
     try std.testing.expectEqual(@as(u16, 2), pending.items[0].bottom);
     try std.testing.expectEqual(@as(usize, 1), pending.items[0].count);
+}
+
+test "pane feed repairs stale cursor caches before erase line" {
+    const alloc = std.testing.allocator;
+
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .alive = false,
+        .reaped = true,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+    pane.stream = .initAlloc(alloc, Pane.StreamHandler.init(&pane));
+    defer pane.stream.deinit();
+
+    const screen = pane.term.screens.active;
+    const stale_row = screen.cursor.page_pin.down(1).?.rowAndCell();
+    const stale_cell = screen.cursor.page_pin.down(2).?.rowAndCell();
+    screen.cursor.page_row = stale_row.row;
+    screen.cursor.page_cell = stale_cell.cell;
+
+    pane.feed("\x1b[K");
+
+    const expected = screen.cursor.page_pin.rowAndCell();
+    try std.testing.expectEqual(expected.row, screen.cursor.page_row);
+    try std.testing.expectEqual(expected.cell, screen.cursor.page_cell);
 }
 
 test "pane stream handler records partial-region upward scrolls" {
