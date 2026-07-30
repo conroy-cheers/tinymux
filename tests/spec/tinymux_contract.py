@@ -538,6 +538,61 @@ def test_alternate_screen_scroll_does_not_scroll_outer_terminal(tinymux: str) ->
         session.close()
 
 
+def test_lazygit_bottom_row_loader_does_not_shift_outer_screen(tinymux: str) -> None:
+    child = (
+        "import os,sys,time,tty;"
+        "tty.setraw(0);"
+        "os.write(1,b'\\x1b[?1049h\\x1b[2J"
+        "\\x1b[1;1HTOP_SENTINEL"
+        "\\x1b[13;1HBODY_SENTINEL"
+        "\\x1b[14;1HLOAD_READY');"
+        "os.read(0,1);"
+        "os.write(1,b'\\x1b[14;1H\\x1b[2KLOAD_FRAME_1');"
+        "time.sleep(.02);"
+        "os.write(1,b'\\x1b[14;1H\\x1b[2KLOAD_FRAME_2');"
+        "time.sleep(.02);"
+        "os.write(1,b'\\x1b[14;1H\\x1b[2KLOAD_DONE');"
+        "time.sleep(5)"
+    )
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "sleep 5",
+            "--split-rows",
+            "9",
+            "--",
+            sys.executable,
+            "-c",
+            child,
+        ]
+    )
+    try:
+        session.wait_for(b"LOAD_READY")
+        session.drain_until_idle()
+        update_start = len(session.output)
+        session.write(b"x")
+        session.wait_for_after(b"LOAD_DONE", update_start)
+        session.drain_until_idle()
+
+        delta = session.output[update_start:]
+        assert b"\x1b[1S" not in delta, (
+            "bottom-row loader escaped into an outer-terminal scroll; "
+            f"delta={delta!r}"
+        )
+        _, screen = terminal_state(session.output)
+        assert b"TOP_SENTINEL" in screen[0], (
+            "bottom-row loader shifted the composed screen up; "
+            f"screen={screen!r}"
+        )
+        assert any(b"LOAD_DONE" in row for row in screen), (
+            "final loader frame was not painted; "
+            f"screen={screen!r}"
+        )
+    finally:
+        session.close()
+
+
 def test_mouse_wheel_scrolls_main_pane_viewport(tinymux: str) -> None:
     session = Session(
         [
@@ -2465,6 +2520,7 @@ def main() -> int:
         test_split_close_preserves_primary_terminal_without_whitespace,
         test_in_place_split_resizes_main_like_tmux,
         test_alternate_screen_scroll_does_not_scroll_outer_terminal,
+        test_lazygit_bottom_row_loader_does_not_shift_outer_screen,
         test_split_close_reconciles_application_alternate_screen,
         test_persistent_split_hands_kitty_placements_back_to_raw_mode,
         test_persistent_split_keeps_kitty_images_screen_local,
@@ -2507,6 +2563,7 @@ def main() -> int:
         test_split_renders_and_main_gets_input,
         test_split_reserves_scrollbar_column_for_child_ptys,
         test_alternate_screen_scroll_does_not_scroll_outer_terminal,
+        test_lazygit_bottom_row_loader_does_not_shift_outer_screen,
         test_mouse_wheel_scrolls_main_pane_viewport,
         test_mouse_drag_scrollbar_scrolls_main_pane_viewport,
         test_mouse_wheel_scrolls_split_pane_viewport,

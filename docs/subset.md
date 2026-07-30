@@ -87,6 +87,12 @@ contract is defined in `persistent-session.md`.
   does not enable the corresponding mode on the outer terminal.
 - `TERM-016` REQUIRED: parser and library diagnostics do not write to the
   physical terminal while tinymux owns it.
+- `TERM-017` REQUIRED: composed rendering is derived from the authoritative VT
+  model and never mutates the outer terminal from a predicted scroll.
+- `TERM-018` REQUIRED: cursor cache coherence is validated at every parsed VT
+  action boundary, including multiple actions received in one PTY read.
+- `TERM-019` REQUIRED: cached row identity includes the Ghostty page
+  generation; a recycled page pointer alone is not a reusable row identity.
 
 ## Terminal Profiles
 

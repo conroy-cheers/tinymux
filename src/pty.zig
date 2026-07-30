@@ -3,12 +3,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const os = @import("posix_compat.zig");
 
 extern "c" fn posix_openpt(flags: c_int) c_int;
 extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+extern "c" fn execvpe(
+    file: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) c_int;
 
 pub const Tio = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => struct {
@@ -40,7 +46,7 @@ pub const Pty = struct {
         });
         const master = posix_openpt(@bitCast(flags));
         if (master < 0) return error.OpenPtyFailed;
-        errdefer posix.close(master);
+        errdefer os.close(master);
 
         if (grantpt(master) != 0) return error.OpenPtyFailed;
         if (unlockpt(master) != 0) return error.OpenPtyFailed;
@@ -54,11 +60,9 @@ pub const Pty = struct {
         };
         const slave_path = path_buf[0..path_len :0];
 
-        const slave = posix.openZ(slave_path, .{
-            .ACCMODE = .RDWR,
-            .NOCTTY = true,
-        }, 0) catch return error.OpenPtyFailed;
-        errdefer posix.close(slave);
+        const slave = std.c.open(slave_path, @bitCast(flags), @as(std.c.mode_t, 0));
+        if (slave < 0) return error.OpenPtyFailed;
+        errdefer os.close(slave);
 
         if (ioctl(slave, Tio.IOCSWINSZ, @intFromPtr(&size)) != 0) {
             return error.IoctlFailed;
@@ -86,7 +90,7 @@ pub fn getSize(fd: posix.fd_t) !Winsize {
 
 pub const SpawnOptions = struct {
     argv: []const []const u8,
-    env: *std.process.EnvMap,
+    env: *std.process.Environ.Map,
     size: Winsize,
     cwd: ?[]const u8 = null,
 };
@@ -100,8 +104,8 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
     if (opts.argv.len == 0) return error.EmptyArgv;
 
     const pty = try Pty.open(opts.size);
-    errdefer posix.close(pty.master);
-    errdefer posix.close(pty.slave);
+    errdefer os.close(pty.master);
+    errdefer os.close(pty.slave);
 
     const argv0 = try alloc.dupeZ(u8, opts.argv[0]);
     defer alloc.free(argv0);
@@ -113,30 +117,30 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
     for (opts.argv, 0..) |arg, i| {
         argv[i] = try arena.allocator().dupeZ(u8, arg);
     }
-    const envp = try std.process.createEnvironFromMap(arena.allocator(), opts.env, .{});
+    const env_block = try opts.env.createPosixBlock(arena.allocator(), .{});
     const cwd_z: ?[:0]const u8 = if (opts.cwd) |d|
         try arena.allocator().dupeZ(u8, d)
     else
         null;
 
-    const pid = try posix.fork();
+    const pid = std.c.fork();
+    if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
-        _ = posix.setsid() catch posix.exit(127);
-        if (ioctl(pty.slave, Tio.IOCSCTTY, @as(c_ulong, 0)) != 0) posix.exit(127);
+        if (std.c.setsid() < 0) std.process.exit(127);
+        if (ioctl(pty.slave, Tio.IOCSCTTY, @as(c_ulong, 0)) != 0) std.process.exit(127);
 
-        posix.dup2(pty.slave, 0) catch posix.exit(127);
-        posix.dup2(pty.slave, 1) catch posix.exit(127);
-        posix.dup2(pty.slave, 2) catch posix.exit(127);
-        if (pty.slave > 2) posix.close(pty.slave);
-        posix.close(pty.master);
+        if (std.c.dup2(pty.slave, 0) < 0) std.process.exit(127);
+        if (std.c.dup2(pty.slave, 1) < 0) std.process.exit(127);
+        if (std.c.dup2(pty.slave, 2) < 0) std.process.exit(127);
+        if (pty.slave > 2) os.close(pty.slave);
+        os.close(pty.master);
 
-        if (cwd_z) |d| posix.chdirZ(d) catch posix.exit(127);
+        if (cwd_z) |d| if (std.c.chdir(d) != 0) std.process.exit(127);
 
-        const err = posix.execvpeZ(argv0, argv, envp);
-        _ = err catch {};
-        posix.exit(127);
+        _ = execvpe(argv0, argv, env_block.slice.ptr);
+        std.process.exit(127);
     }
 
-    posix.close(pty.slave);
+    os.close(pty.slave);
     return .{ .pid = pid, .master = pty.master };
 }

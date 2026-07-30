@@ -2,10 +2,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const vt = @import("ghostty-vt");
+const wuffs = @import("wuffs");
 const ptypkg = @import("pty.zig");
 const protocol = @import("protocol.zig");
 const shell_scripts = @import("shell_scripts.zig");
 const diagnostics = @import("diagnostics.zig");
+const os = @import("posix_compat.zig");
+const vt_trace = @import("vt_trace.zig");
+const build_options = @import("tinymux_build_options");
+const EnvMap = std.process.Environ.Map;
 
 pub const std_options: std.Options = .{
     .logFn = diagnostics.logFn,
@@ -25,6 +30,60 @@ const OuterTerminal = struct {
 };
 
 const outer_terminal: OuterTerminal = .{ .fd = stdout_fd };
+var runtime_io: ?std.Io = null;
+var runtime_environ: ?*const EnvMap = null;
+
+fn getenv(name: [*:0]const u8) ?[:0]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
+}
+
+fn currentIo() std.Io {
+    if (comptime builtin.is_test) return std.testing.io;
+    return runtime_io.?;
+}
+
+fn currentEnvMap(alloc: std.mem.Allocator) !EnvMap {
+    if (comptime builtin.is_test) return .init(alloc);
+    return runtime_environ.?.clone(alloc);
+}
+
+fn initTerminal(alloc: std.mem.Allocator, options: vt.Terminal.Options) !vt.Terminal {
+    return vt.Terminal.init(currentIo(), alloc, options);
+}
+
+fn decodePng(
+    alloc: std.mem.Allocator,
+    data: []const u8,
+) vt.sys.DecodeError!vt.sys.Image {
+    const result = wuffs.png.decode(alloc, data) catch |err| switch (err) {
+        error.WuffsError => return error.InvalidData,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Overflow => return error.InvalidData,
+    };
+
+    return .{
+        .width = result.width,
+        .height = result.height,
+        .data = result.data,
+    };
+}
+
+fn nanoTimestamp() i128 {
+    return @intCast(std.Io.Clock.awake.now(currentIo()).toNanoseconds());
+}
+
+fn milliTimestamp() i64 {
+    return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_ms));
+}
+
+fn sleepNanoseconds(duration_ns: u64) void {
+    std.Io.sleep(
+        currentIo(),
+        .fromNanoseconds(@intCast(duration_ns)),
+        .awake,
+    ) catch {};
+}
 
 const default_split_rows: u16 = 9;
 const exit_drain_ms: i64 = 50;
@@ -33,6 +92,7 @@ const termination_grace_polls: usize = 100;
 const composed_idle_poll_ms: i32 = 50;
 const composed_frame_interval_ns: i128 = 4 * std.time.ns_per_ms;
 const bulk_frame_interval_ns: i128 = 8 * std.time.ns_per_ms;
+const bulk_max_coalesce_ns: i128 = 50 * std.time.ns_per_ms;
 const bulk_sticky_window_ns: i128 = 120 * std.time.ns_per_ms;
 const resize_quiet_ns: i128 = 80 * std.time.ns_per_ms;
 const control_sequence_timeout_ns: i128 = 20 * std.time.ns_per_ms;
@@ -167,6 +227,11 @@ const RenderScheduler = struct {
         return if (self.bulk) bulk_frame_interval_ns else composed_frame_interval_ns;
     }
 
+    fn mustRenderUnderLoad(self: *const RenderScheduler, now_ns: i128) bool {
+        const last = self.last_render_ns orelse return true;
+        return now_ns >= last + bulk_max_coalesce_ns;
+    }
+
     fn nsToPollMs(ns: i128) i32 {
         if (ns <= 0) return 0;
         const ms = @divFloor(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms);
@@ -196,9 +261,12 @@ const DrainStats = struct {
     }
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    runtime_io = init.io;
+    runtime_environ = init.environ_map;
+    vt.sys.decode_png = &decodePng;
     diagnostics.initFromEnv() catch |err| {
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(init.io, &.{});
         try stderr.interface.print(
             "tinymux: unable to open TINYMUX_LOG: {s}\n",
             .{@errorName(err)},
@@ -206,22 +274,33 @@ pub fn main() !void {
         return err;
     };
     defer diagnostics.deinit();
+    vt_trace.initFromEnv() catch |err| {
+        var stderr = std.Io.File.stderr().writer(init.io, &.{});
+        try stderr.interface.print(
+            "tinymux: unable to open TINYMUX_VT_TRACE: {s}\n",
+            .{@errorName(err)},
+        );
+        return err;
+    };
+    defer vt_trace.deinit();
 
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer {
-        if (builtin.mode == .Debug) _ = debug_allocator.deinit();
+    const alloc = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--version")) {
+        var stdout_buffer: [256]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        try stdout.interface.print(
+            "tinymux {s} ghostty-vt={s} zig={s}\n",
+            .{ version, build_options.ghostty_revision, build_options.zig_version },
+        );
+        try stdout.interface.flush();
+        return;
     }
-    const alloc = if (builtin.mode == .Debug)
-        debug_allocator.allocator()
-    else
-        std.heap.smp_allocator;
-
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
 
     if (args.len > 0 and std.mem.eql(u8, std.fs.path.basename(args[0]), "tmux")) {
         const code = runTmuxShim(alloc, args[1..]) catch |err| blk: {
-            var stderr = std.fs.File.stderr().writer(&.{});
+            var stderr = std.Io.File.stderr().writer(init.io, &.{});
             try stderr.interface.print("tmux: tinymux compatibility failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
@@ -236,7 +315,7 @@ pub fn main() !void {
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "pane")) {
         const code = runNativeControlClient(alloc, args[1..]) catch |err| blk: {
-            var stderr = std.fs.File.stderr().writer(&.{});
+            var stderr = std.Io.File.stderr().writer(init.io, &.{});
             try stderr.interface.print("tinymux: control request failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
@@ -268,11 +347,12 @@ pub fn main() !void {
 }
 
 fn printUsage(err: anyerror) !void {
-    var stderr = std.fs.File.stderr().writer(&.{});
+    var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
     try stderr.interface.print(
         \\tinymux: {s}
         \\
         \\usage:
+        \\  tinymux --version
         \\  tinymux session [--no-tmux-compat] -- <main-argv...>
         \\  tinymux pane run [--rows <n>] -- <argv...>
         \\  tinymux pane close <generation>
@@ -420,7 +500,7 @@ fn runInit(args: []const []const u8) !void {
     if (args.len != 1) return error.UnsupportedShell;
     const shell = shell_scripts.parseInitShell(args[0]) orelse return error.UnsupportedShell;
 
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout = std.Io.File.stdout().writer(currentIo(), &.{});
     try stdout.interface.writeAll(shell_scripts.initScript(shell));
     try stdout.interface.flush();
 }
@@ -439,7 +519,7 @@ fn runDirenvInstantWrapper(args: []const []const u8) !void {
 }
 
 fn printDirenvInstantUsage() !void {
-    var stderr = std.fs.File.stderr().writer(&.{});
+    var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
     try stderr.interface.writeAll(
         \\usage:
         \\  tinymux-direnv-instant hook bash|zsh|fish|nu
@@ -452,7 +532,7 @@ fn printDirenvInstantUsage() !void {
 fn runDirenvInstantHook(shell_name: []const u8) !void {
     const shell = shell_scripts.parseDirenvShell(shell_name) orelse return error.UnsupportedShell;
 
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout = std.Io.File.stdout().writer(currentIo(), &.{});
     try stdout.interface.writeAll(shell_scripts.direnvHook(shell));
     try stdout.interface.flush();
 }
@@ -461,7 +541,7 @@ fn runDirenvInstantChildInit(shell_name: []const u8) !void {
     const shell = shell_scripts.parseDirenvShell(shell_name) orelse return error.UnsupportedShell;
     const child_init = shell_scripts.direnvChildInit(shell);
 
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout = std.Io.File.stdout().writer(currentIo(), &.{});
     if (child_init.prefix) |prefix| try stdout.interface.writeAll(prefix);
     try stdout.interface.writeAll(child_init.hook);
     try stdout.interface.writeAll(child_init.guard);
@@ -490,13 +570,13 @@ fn runHandoffCapture(alloc: std.mem.Allocator, args: []const []const u8) !void {
     const slot_name = slot orelse return error.MissingHandoffSlot;
     if (!validHandoffSlot(slot_name)) return error.InvalidHandoffSlot;
 
-    try std.fs.cwd().makePath(state_dir);
+    try std.Io.Dir.cwd().createDirPath(currentIo(), state_dir);
     const cwd_path = try handoffPath(alloc, state_dir, slot_name, "cwd");
     defer alloc.free(cwd_path);
     const env_path = try handoffPath(alloc, state_dir, slot_name, "env");
     defer alloc.free(env_path);
 
-    const cwd = try std.fs.cwd().realpathAlloc(alloc, ".");
+    const cwd = try std.process.currentPathAlloc(currentIo(), alloc);
     defer alloc.free(cwd);
     try writeFile(cwd_path, cwd);
     try writeEnvSnapshot(alloc, env_path);
@@ -550,19 +630,19 @@ fn handoffPath(alloc: std.mem.Allocator, state_dir: []const u8, slot: []const u8
 }
 
 fn writeFile(path: []const u8, bytes: []const u8) !void {
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(bytes);
+    var file = try std.Io.Dir.cwd().createFile(currentIo(), path, .{ .truncate = true });
+    defer file.close(currentIo());
+    try file.writeStreamingAll(currentIo(), bytes);
 }
 
 fn writeEnvSnapshot(alloc: std.mem.Allocator, path: []const u8) !void {
-    var env = try std.process.getEnvMap(alloc);
+    var env = try currentEnvMap(alloc);
     defer env.deinit();
 
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(currentIo(), path, .{ .truncate = true });
+    defer file.close(currentIo());
     var buffer: [4096]u8 = undefined;
-    var writer = file.writer(&buffer);
+    var writer = file.writer(currentIo(), &buffer);
     const out = &writer.interface;
 
     var it = env.iterator();
@@ -591,7 +671,12 @@ const EnvSnapshot = struct {
 };
 
 fn readEnvSnapshot(alloc: std.mem.Allocator, path: []const u8) !EnvSnapshot {
-    const data = try std.fs.cwd().readFileAlloc(alloc, path, max_handoff_state_bytes);
+    const data = try std.Io.Dir.cwd().readFileAlloc(
+        currentIo(),
+        path,
+        alloc,
+        .limited(max_handoff_state_bytes),
+    );
     errdefer alloc.free(data);
     var map = std.StringHashMap([]const u8).init(alloc);
     errdefer map.deinit();
@@ -649,14 +734,19 @@ fn emitHandoffApply(alloc: std.mem.Allocator, state_dir: []const u8, shell: Appl
     };
     defer result.deinit(alloc);
 
-    const result_cwd = std.fs.cwd().readFileAlloc(alloc, result_cwd_path, std.fs.max_path_bytes) catch |err| switch (err) {
+    const result_cwd = std.Io.Dir.cwd().readFileAlloc(
+        currentIo(),
+        result_cwd_path,
+        alloc,
+        .limited(std.Io.Dir.max_path_bytes),
+    ) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
     defer if (result_cwd) |cwd| alloc.free(cwd);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writer(currentIo(), &stdout_buffer);
     const out = &stdout.interface;
 
     if (shell == .nu) {
@@ -951,13 +1041,13 @@ const TmuxRuntime = struct {
     dir_path: []const u8,
     socket_path: []const u8,
     shim_path: []const u8,
-    server: std.net.Server,
+    server: std.Io.net.Server,
 
     fn init(alloc: std.mem.Allocator) !TmuxRuntime {
-        const tmp = posix.getenv("TMPDIR") orelse "/tmp";
+        const tmp = getenv("TMPDIR") orelse "/tmp";
         var runtime_root = try alloc.dupe(u8, tmp);
         defer alloc.free(runtime_root);
-        if (posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime| {
+        if (getenv("XDG_RUNTIME_DIR")) |xdg_runtime| {
             const candidate = try std.fs.path.join(alloc, &.{ xdg_runtime, "tinymux" });
             if (ensurePrivateRuntimeDir(candidate)) {
                 alloc.free(runtime_root);
@@ -967,9 +1057,11 @@ const TmuxRuntime = struct {
             }
         }
 
+        var random_bytes: [@sizeOf(u64)]u8 = undefined;
+        currentIo().random(&random_bytes);
         const session_id = try std.fmt.allocPrint(alloc, "{d}-{x}", .{
             std.c.getpid(),
-            std.crypto.random.int(u64),
+            std.mem.readInt(u64, &random_bytes, .native),
         });
         errdefer alloc.free(session_id);
 
@@ -978,8 +1070,8 @@ const TmuxRuntime = struct {
         const dir_path = try std.fs.path.join(alloc, &.{ runtime_root, dir_name });
         errdefer alloc.free(dir_path);
 
-        try posix.mkdir(dir_path, 0o700);
-        errdefer std.fs.deleteTreeAbsolute(dir_path) catch {};
+        try std.Io.Dir.createDirAbsolute(currentIo(), dir_path, @enumFromInt(0o700));
+        errdefer std.Io.Dir.cwd().deleteTree(currentIo(), dir_path) catch {};
 
         const socket_path = try std.fs.path.join(alloc, &.{ dir_path, "control.sock" });
         errdefer alloc.free(socket_path);
@@ -987,13 +1079,14 @@ const TmuxRuntime = struct {
         const shim_path = try std.fs.path.join(alloc, &.{ dir_path, "tmux" });
         errdefer alloc.free(shim_path);
 
-        const self_exe = try std.fs.selfExePathAlloc(alloc);
+        const self_exe = try std.process.executablePathAlloc(currentIo(), alloc);
         defer alloc.free(self_exe);
-        try posix.symlink(self_exe, shim_path);
+        try std.Io.Dir.symLinkAbsolute(currentIo(), self_exe, shim_path, .{});
 
-        const address = try std.net.Address.initUnix(socket_path);
-        var server = try address.listen(.{ .kernel_backlog = 16, .force_nonblocking = true });
-        errdefer server.deinit();
+        const address = try std.Io.net.UnixAddress.init(socket_path);
+        var server = try address.listen(currentIo(), .{ .kernel_backlog = 16 });
+        errdefer server.deinit(currentIo());
+        try setNonblocking(server.socket.handle);
 
         return .{
             .session_id = session_id,
@@ -1005,8 +1098,8 @@ const TmuxRuntime = struct {
     }
 
     fn deinit(self: *TmuxRuntime, alloc: std.mem.Allocator) void {
-        self.server.deinit();
-        std.fs.deleteTreeAbsolute(self.dir_path) catch {};
+        self.server.deinit(currentIo());
+        std.Io.Dir.cwd().deleteTree(currentIo(), self.dir_path) catch {};
         alloc.free(self.shim_path);
         alloc.free(self.socket_path);
         alloc.free(self.dir_path);
@@ -1016,14 +1109,25 @@ const TmuxRuntime = struct {
 };
 
 fn ensurePrivateRuntimeDir(path: []const u8) bool {
-    posix.mkdir(path, 0o700) catch |err| switch (err) {
+    std.Io.Dir.createDirAbsolute(currentIo(), path, @enumFromInt(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return false,
     };
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return false;
-    defer dir.close();
-    dir.chmod(0o700) catch return false;
-    return true;
+    const path_z = posix.toPosixPath(path) catch return false;
+    return std.c.chmod(&path_z, 0o700) == 0;
+}
+
+fn setNonblocking(fd: posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL);
+    if (flags < 0) return error.FcntlFailed;
+    const nonblock = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+    if (@as(usize, @intCast(flags)) & nonblock != 0) return;
+    const result = std.c.fcntl(
+        fd,
+        std.c.F.SETFL,
+        @as(c_int, @intCast(@as(usize, @intCast(flags)) | nonblock)),
+    );
+    if (result < 0) return error.FcntlFailed;
 }
 
 const TinymuxEnvRole = enum {
@@ -1034,25 +1138,25 @@ const TinymuxEnvRole = enum {
 
 fn applyTinymuxEnv(
     alloc: std.mem.Allocator,
-    env: *std.process.EnvMap,
+    env: *EnvMap,
     runtime: ?*const TmuxRuntime,
     pane_id: []const u8,
     role: TinymuxEnvRole,
 ) !void {
     try env.put("TINYMUX", "1");
-    _ = env.remove("TINYMUX_SESSION_ID");
-    _ = env.remove("TINYMUX_CONTROL");
-    _ = env.remove("TINYMUX_TMUX_SOCKET");
-    _ = env.remove("TINYMUX_SHIM_DIR");
-    _ = env.remove("TMUX_PANE");
-    _ = env.remove("TMUX");
+    _ = env.swapRemove("TINYMUX_SESSION_ID");
+    _ = env.swapRemove("TINYMUX_CONTROL");
+    _ = env.swapRemove("TINYMUX_TMUX_SOCKET");
+    _ = env.swapRemove("TINYMUX_SHIM_DIR");
+    _ = env.swapRemove("TMUX_PANE");
+    _ = env.swapRemove("TMUX");
 
     if (role != .main_session) {
         // Host integration belongs only to the persistent main shell. Nested
         // legacy shells and auxiliary panes must not publish host prompt/cwd
         // state through the main terminal.
-        _ = env.remove("GHOSTTY_RESOURCES_DIR");
-        _ = env.remove("GHOSTTY_SHELL_INTEGRATION_XDG_DIR");
+        _ = env.swapRemove("GHOSTTY_RESOURCES_DIR");
+        _ = env.swapRemove("GHOSTTY_SHELL_INTEGRATION_XDG_DIR");
     }
 
     if (runtime) |rt| {
@@ -1072,7 +1176,7 @@ fn applyTinymuxEnv(
     }
 }
 
-fn prependPath(alloc: std.mem.Allocator, env: *std.process.EnvMap, dir: []const u8) !void {
+fn prependPath(alloc: std.mem.Allocator, env: *EnvMap, dir: []const u8) !void {
     const current = env.get("PATH") orelse "";
     const updated = if (current.len == 0)
         try alloc.dupe(u8, dir)
@@ -1090,7 +1194,7 @@ const SocketReader = struct {
 
     fn readByte(self: *SocketReader) !u8 {
         if (self.start >= self.end) {
-            const n = try posix.read(self.fd, &self.buf);
+            const n = try os.read(self.fd, &self.buf);
             if (n == 0) return error.EndOfStream;
             self.start = 0;
             self.end = n;
@@ -1148,7 +1252,7 @@ const ControlRequest = struct {
     protocol: ControlProtocol,
     cwd: ?[]u8,
     argv: [][]u8,
-    env: std.process.EnvMap,
+    env: EnvMap,
 
     fn read(alloc: std.mem.Allocator, fd: posix.fd_t) !ControlRequest {
         var reader: SocketReader = .{ .fd = fd };
@@ -1181,7 +1285,7 @@ const ControlRequest = struct {
         }
 
         const env_count = try reader.readCount(alloc);
-        var env = std.process.EnvMap.init(alloc);
+        var env = EnvMap.init(alloc);
         errdefer env.deinit();
         for (0..env_count) |_| {
             const key = try reader.readFrame(alloc);
@@ -1222,7 +1326,7 @@ const ControlRequest = struct {
         }
 
         const env_count = try reader.readCount();
-        var env = std.process.EnvMap.init(alloc);
+        var env = EnvMap.init(alloc);
         errdefer env.deinit();
         for (0..env_count) |_| {
             const key = try alloc.dupe(u8, try reader.readFrame());
@@ -1284,7 +1388,7 @@ const ControlConnection = struct {
     accepted_ns: i128,
 
     fn deinit(self: *ControlConnection, alloc: std.mem.Allocator) void {
-        posix.close(self.fd);
+        os.close(self.fd);
         self.input.deinit(alloc);
         self.* = undefined;
     }
@@ -1335,7 +1439,7 @@ fn writeControlRequest(
     try protocol.writeAll(fd, magic);
     try protocol.writeAll(fd, "\n");
 
-    const cwd = std.fs.cwd().realpathAlloc(alloc, ".") catch try alloc.dupe(u8, "");
+    const cwd = std.process.currentPathAlloc(currentIo(), alloc) catch try alloc.dupe(u8, "");
     defer alloc.free(cwd);
     try writeFrame(fd, cwd);
 
@@ -1344,7 +1448,7 @@ fn writeControlRequest(
     try protocol.writeAll(fd, argc_line);
     for (args) |arg| try writeFrame(fd, arg);
 
-    var env = try std.process.getEnvMap(alloc);
+    var env = try currentEnvMap(alloc);
     defer env.deinit();
     const env_count_line = try std.fmt.bufPrint(&count_buf, "{d}\n", .{env.count()});
     try protocol.writeAll(fd, env_count_line);
@@ -1356,20 +1460,21 @@ fn writeControlRequest(
 }
 
 fn runTmuxShim(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
-    const socket_path = posix.getenv("TINYMUX_TMUX_SOCKET") orelse {
-        var stderr = std.fs.File.stderr().writer(&.{});
+    const socket_path = getenv("TINYMUX_TMUX_SOCKET") orelse {
+        var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
         try stderr.interface.writeAll("tmux: not running inside tinymux tmux compatibility\n");
         return 1;
     };
-    const stream = try std.net.connectUnixSocket(socket_path);
-    defer stream.close();
+    const address = try std.Io.net.UnixAddress.init(socket_path);
+    const stream = try address.connect(currentIo());
+    defer stream.close(currentIo());
 
-    try writeControlRequest(alloc, stream.handle, tmux_control_magic, args);
-    var response = try ControlResponse.read(alloc, stream.handle);
+    try writeControlRequest(alloc, stream.socket.handle, tmux_control_magic, args);
+    var response = try ControlResponse.read(alloc, stream.socket.handle);
     defer response.deinit(alloc);
 
     if (!response.ok) {
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
         try stderr.interface.print("tmux: {s}\n", .{response.message});
         return 1;
     }
@@ -1377,25 +1482,26 @@ fn runTmuxShim(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
 }
 
 fn runNativeControlClient(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
-    const socket_path = posix.getenv("TINYMUX_CONTROL") orelse
-        posix.getenv("TINYMUX_TMUX_SOCKET") orelse {
-        var stderr = std.fs.File.stderr().writer(&.{});
+    const socket_path = getenv("TINYMUX_CONTROL") orelse
+        getenv("TINYMUX_TMUX_SOCKET") orelse {
+        var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
         try stderr.interface.writeAll("tinymux: no persistent session control socket\n");
         return 1;
     };
-    const stream = try std.net.connectUnixSocket(socket_path);
-    defer stream.close();
+    const address = try std.Io.net.UnixAddress.init(socket_path);
+    const stream = try address.connect(currentIo());
+    defer stream.close(currentIo());
 
-    try writeControlRequest(alloc, stream.handle, native_control_magic, args);
-    var response = try ControlResponse.read(alloc, stream.handle);
+    try writeControlRequest(alloc, stream.socket.handle, native_control_magic, args);
+    var response = try ControlResponse.read(alloc, stream.socket.handle);
     defer response.deinit(alloc);
     if (!response.ok) {
-        var stderr = std.fs.File.stderr().writer(&.{});
+        var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
         try stderr.interface.print("tinymux: {s}\n", .{response.message});
         return 1;
     }
     if (response.message.len > 0) {
-        var stdout = std.fs.File.stdout().writer(&.{});
+        var stdout = std.Io.File.stdout().writer(currentIo(), &.{});
         try stdout.interface.writeAll(response.message);
         try stdout.interface.writeByte('\n');
         try stdout.interface.flush();
@@ -1830,8 +1936,8 @@ fn terminalCursorWillScrollUp(term: *const vt.Terminal) bool {
         cursor.x <= term.scrolling_region.right;
 }
 
-fn cloneEnvMap(alloc: std.mem.Allocator, source: *const std.process.EnvMap) !std.process.EnvMap {
-    var env = std.process.EnvMap.init(alloc);
+fn cloneEnvMap(alloc: std.mem.Allocator, source: *const EnvMap) !EnvMap {
+    var env = EnvMap.init(alloc);
     errdefer env.deinit();
     var it = source.iterator();
     while (it.next()) |entry| {
@@ -1856,6 +1962,8 @@ const Pane = struct {
     pending_scrolls: [max_pending_scrolls]PendingScrollUp = undefined,
     pending_scroll_count: usize = 0,
     pending_scroll_overflow: bool = false,
+    model_epoch: u64 = 0,
+    cursor_repair_count: u64 = 0,
 
     pub const TerminalHandler = vt.TerminalStream.Handler;
     pub const Stream = vt.Stream(StreamHandler);
@@ -1872,12 +1980,15 @@ const Pane = struct {
             handler.effects = .{
                 .write_pty = effectWritePty,
                 .bell = null,
+                .desktop_notification = null,
                 .color_scheme = null,
                 .device_attributes = effectDeviceAttributes,
                 .enquiry = null,
                 .size = effectSize,
                 .title_changed = null,
                 .pwd_changed = null,
+                .progress_report = null,
+                .clipboard_write = null,
                 .xtversion = effectXtversion,
             };
             return .{
@@ -1895,8 +2006,11 @@ const Pane = struct {
             comptime action: Action.Tag,
             value: Action.Value(action),
         ) void {
+            self.pane.ensureCursorCoherent("before", @tagName(action));
             const scroll_up = self.scrollUp(action, value);
             self.terminal_handler.vt(action, value);
+            self.pane.model_epoch +%= 1;
+            self.pane.ensureCursorCoherent("after", @tagName(action));
             if (comptime action == .set_mode) {
                 if (value.mode == .in_band_size_reports) {
                     self.pane.in_band_size_owner = switch (self.pane.reply_route) {
@@ -1953,7 +2067,7 @@ const Pane = struct {
     fn create(
         alloc: std.mem.Allocator,
         argv: []const []const u8,
-        env: *std.process.EnvMap,
+        env: *EnvMap,
         rows: u16,
         cols: u16,
         cell_size: CellSize,
@@ -1968,7 +2082,7 @@ const Pane = struct {
             .size = cell_size.makeWinsize(rows, cols),
             .cwd = cwd,
         });
-        errdefer posix.close(spawned.master);
+        errdefer os.close(spawned.master);
 
         self.* = .{
             .alloc = alloc,
@@ -1982,18 +2096,18 @@ const Pane = struct {
         errdefer alloc.free(self.command_title);
 
         self.term = if (comptime kitty_graphics_enabled)
-            try vt.Terminal.init(alloc, .{
+            try initTerminal(alloc, .{
                 .cols = cols,
                 .rows = rows,
-                .max_scrollback = scrollback_bytes,
+                .max_scrollback_bytes = scrollback_bytes,
                 .kitty_image_storage_limit = kitty_image_storage_limit,
-                .kitty_image_loading_limits = .all,
+                .kitty_image_loading_limits = .direct,
             })
         else
-            try vt.Terminal.init(alloc, .{
+            try initTerminal(alloc, .{
                 .cols = cols,
                 .rows = rows,
-                .max_scrollback = scrollback_bytes,
+                .max_scrollback_bytes = scrollback_bytes,
             });
         errdefer self.term.deinit(alloc);
         self.cell_size.applyToTerm(&self.term);
@@ -2056,21 +2170,36 @@ const Pane = struct {
         return "tinymux " ++ version;
     }
 
-    fn repairCursorCache(self: *Pane) void {
+    fn repairCursorCache(self: *Pane) bool {
         const screen = self.term.screens.active;
         const expected = screen.cursor.page_pin.rowAndCell();
         if (screen.cursor.page_row != expected.row or
             screen.cursor.page_cell != expected.cell)
         {
             screen.cursorReload();
+            self.cursor_repair_count +%= 1;
+            return true;
         }
+        return false;
+    }
+
+    fn ensureCursorCoherent(self: *Pane, phase: []const u8, action: []const u8) void {
+        if (!self.repairCursorCache()) return;
+        std.log.warn(
+            "repaired stale cursor cache phase={s} action={s} epoch={d}",
+            .{ phase, action, self.model_epoch },
+        );
     }
 
     fn feed(self: *Pane, bytes: []const u8) void {
-        self.repairCursorCache();
+        vt_trace.feed(self.child_pid, bytes);
+        self.ensureCursorCoherent("feed-before", "slice");
         if (self.ascii_fast_feed_enabled) {
             if (plainAsciiEligible(bytes)) {
-                if (self.feedPlainAscii(bytes)) return;
+                if (self.feedPlainAscii(bytes)) {
+                    self.ensureCursorCoherent("feed-after", "ascii-slice");
+                    return;
+                }
                 self.ascii_fast_feed_enabled = false;
                 return;
             } else {
@@ -2078,6 +2207,7 @@ const Pane = struct {
             }
         }
         self.stream.nextSlice(bytes);
+        self.ensureCursorCoherent("feed-after", "slice");
     }
 
     fn feedWithReplies(self: *Pane, bytes: []const u8, owner: ?posix.pid_t) void {
@@ -2126,9 +2256,17 @@ const Pane = struct {
         for (bytes, 0..) |byte, i| {
             switch (byte) {
                 '\r', '\n' => {
-                    if (start < i) self.term.printString(bytes[start..i]) catch return false;
+                    if (start < i) {
+                        self.ensureCursorCoherent("before", "print-string");
+                        self.term.printString(bytes[start..i]) catch return false;
+                        self.model_epoch +%= 1;
+                        self.ensureCursorCoherent("after", "print-string");
+                    }
                     if (byte == '\r') {
+                        self.ensureCursorCoherent("before", "carriage-return");
                         self.term.carriageReturn();
+                        self.model_epoch +%= 1;
+                        self.ensureCursorCoherent("after", "carriage-return");
                     } else {
                         if (terminalCursorWillScrollUp(&self.term)) {
                             self.noteScrollUp(.{
@@ -2138,14 +2276,22 @@ const Pane = struct {
                                 .count = 1,
                             });
                         }
+                        self.ensureCursorCoherent("before", "linefeed");
                         self.term.linefeed() catch return false;
+                        self.model_epoch +%= 1;
+                        self.ensureCursorCoherent("after", "linefeed");
                     }
                     start = i + 1;
                 },
                 else => {},
             }
         }
-        if (start < bytes.len) self.term.printString(bytes[start..]) catch return false;
+        if (start < bytes.len) {
+            self.ensureCursorCoherent("before", "print-string");
+            self.term.printString(bytes[start..]) catch return false;
+            self.model_epoch +%= 1;
+            self.ensureCursorCoherent("after", "print-string");
+        }
         return true;
     }
 
@@ -2191,8 +2337,15 @@ const Pane = struct {
 
     fn resize(self: *Pane, rows: u16, cols: u16, cell_size: CellSize) !void {
         self.cell_size = cell_size;
-        try self.term.resize(self.alloc, cols, rows);
-        self.cell_size.applyToTerm(&self.term);
+        vt_trace.resize(self.child_pid, rows, cols, cell_size.width, cell_size.height);
+        try self.term.resize(self.alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .cell_size_px = .{
+                .width = cell_size.width,
+                .height = cell_size.height,
+            },
+        });
         if (self.pty_fd >= 0) {
             try ptypkg.Pty.setSize(self.pty_fd, self.cell_size.makeWinsize(rows, cols));
         }
@@ -2201,7 +2354,7 @@ const Pane = struct {
 
     fn closePty(self: *Pane) void {
         if (self.pty_fd >= 0) {
-            posix.close(self.pty_fd);
+            os.close(self.pty_fd);
             self.pty_fd = -1;
         }
     }
@@ -2237,7 +2390,7 @@ const Pane = struct {
     fn waitForExit(self: *Pane, polls: usize, sleep_ns: u64) bool {
         for (0..polls) |_| {
             if (self.reap(posix.W.NOHANG)) return true;
-            std.Thread.sleep(sleep_ns);
+            sleepNanoseconds(sleep_ns);
         }
         return false;
     }
@@ -2382,6 +2535,7 @@ const sanitize_sequence = reset_state_sequence ++ "\x1b[H\x1b[2J";
 const ViewportRow = struct {
     bytes: std.ArrayList(u8) = .empty,
     node: ?*const anyopaque = null,
+    serial: u64 = 0,
     offset: u16 = 0,
     valid: bool = false,
 
@@ -2391,6 +2545,7 @@ const ViewportRow = struct {
 
     fn capturePin(self: *ViewportRow, pin: vt.Pin) void {
         self.node = @ptrCast(pin.node);
+        self.serial = pin.node.serial;
         self.offset = pin.y;
         self.valid = true;
     }
@@ -2398,6 +2553,7 @@ const ViewportRow = struct {
     fn matchesPin(self: *const ViewportRow, pin: vt.Pin) bool {
         if (!self.valid) return false;
         if (self.node != @as(*const anyopaque, @ptrCast(pin.node))) return false;
+        if (self.serial != pin.node.serial) return false;
         return self.offset == pin.y;
     }
 };
@@ -3061,7 +3217,7 @@ fn appendRawGraphicsRestore(
         var insert_at = image_ids.items.len;
         while (insert_at > 0) {
             const previous = storage.images.get(image_ids.items[insert_at - 1]) orelse break;
-            if (previous.transmit_time.order(entry.value_ptr.transmit_time) != .gt) break;
+            if (previous.generation <= entry.value_ptr.generation) break;
             insert_at -= 1;
         }
         try image_ids.insert(alloc, insert_at, entry.key_ptr.*);
@@ -3163,56 +3319,15 @@ const Compositor = struct {
         const graphics = self.graphicsFor(main_pane.term.screens.active_key);
         const graphics_dirty = include_graphics and (self.full_render or graphics.needsUpdate(main_pane, split_pane));
 
-        const pending_main_scrolls = main_pane.takePendingScrolls();
-        const pending_split_scrolls = if (split_pane) |pane| pane.takePendingScrolls() else PendingScrollBatch{};
+        // Composed mode is a pure absolute repaint. Never mutate the outer
+        // terminal with a scroll prediction: a single false positive shifts
+        // unrelated rows and cannot be repaired by later row diffs.
+        _ = main_pane.takePendingScrolls();
+        if (split_pane) |pane| _ = pane.takePendingScrolls();
         try self.main_rows.ensure(self.alloc, main_pane.term.rows);
-        if (self.canPaneScrollFastPath(
-            graphics,
-            main_pane.term.screens.active_key,
-            layout.main_rows,
-            graphics_dirty,
-        )) {
-            try self.applyPendingScrolls(
-                &self.main_rows,
-                main_pane.term.screens.active_key,
-                0,
-                layout.main_rows,
-                pending_main_scrolls,
-            );
-            if (pending_main_scrolls.len == 0 and !pending_main_scrolls.overflow) {
-                const main_scroll_delta = self.main_rows.detectScrollUp(&main_pane.term, layout.main_rows, false);
-                if (main_scroll_delta > 0) {
-                    try self.emitScrollUp(0, layout.main_rows, main_scroll_delta);
-                    self.rotateOuterRowsForRegion(0, layout.main_rows, main_scroll_delta);
-                    self.main_rows.rotateRegionScrollUp(0, layout.main_rows, main_scroll_delta);
-                }
-            }
-        }
 
         if (split_pane) |pane| {
             try self.split_rows.ensure(self.alloc, pane.term.rows);
-            if (self.canPaneScrollFastPath(
-                graphics,
-                pane.term.screens.active_key,
-                layout.split_rows,
-                graphics_dirty,
-            )) {
-                try self.applyPendingScrolls(
-                    &self.split_rows,
-                    pane.term.screens.active_key,
-                    layout.splitTop(),
-                    layout.split_rows,
-                    pending_split_scrolls,
-                );
-                if (pending_split_scrolls.len == 0 and !pending_split_scrolls.overflow) {
-                    const split_scroll_delta = self.split_rows.detectScrollUp(&pane.term, layout.split_rows, false);
-                    if (split_scroll_delta > 0) {
-                        try self.emitScrollUp(layout.splitTop(), layout.split_rows, split_scroll_delta);
-                        self.rotateOuterRowsForRegion(layout.splitTop(), layout.split_rows, split_scroll_delta);
-                        self.split_rows.rotateRegionScrollUp(0, layout.split_rows, split_scroll_delta);
-                    }
-                }
-            }
         }
 
         for (0..layout.rows) |row_index| {
@@ -3265,11 +3380,12 @@ const Compositor = struct {
         visible_rows: u16,
         graphics_dirty: bool,
     ) bool {
-        if (self.full_render or graphics_dirty) return false;
-        if (screen == .alternate) return false;
-        if (graphics.uploaded.count() != 0) return false;
-        if (visible_rows < 3) return false;
-        return true;
+        _ = self;
+        _ = graphics;
+        _ = screen;
+        _ = visible_rows;
+        _ = graphics_dirty;
+        return false;
     }
 
     fn applyPendingScrolls(
@@ -3819,7 +3935,7 @@ const App = struct {
     fn init(alloc: std.mem.Allocator, config: Config) !App {
         var tmux_runtime: ?TmuxRuntime = if (config.tmux_compat)
             TmuxRuntime.init(alloc) catch |err| blk: {
-                var stderr = std.fs.File.stderr().writer(&.{});
+                var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
                 stderr.interface.print(
                     "tinymux: control socket unavailable ({s}); continuing without pane control\n",
                     .{@errorName(err)},
@@ -3834,12 +3950,12 @@ const App = struct {
         const cell_size = CellSize.fromWinsize(outer_size);
         const split_visible = config.split_cmd != null;
         const layout = Layout.compute(outer_size.row, outer_size.col, split_visible, config.split_rows);
-        const cwd = std.fs.cwd().realpathAlloc(alloc, ".") catch null;
+        const cwd = std.process.currentPathAlloc(currentIo(), alloc) catch null;
         defer if (cwd) |path| alloc.free(path);
 
-        const outer_term = posix.getenv("TERM");
-        const colorterm = posix.getenv("COLORTERM");
-        var main_env = try std.process.getEnvMap(alloc);
+        const outer_term = getenv("TERM");
+        const colorterm = getenv("COLORTERM");
+        var main_env = try currentEnvMap(alloc);
         defer main_env.deinit();
         if (!config.seamless) {
             const main_term = selectTerm(.auto, outer_term, colorterm);
@@ -3873,7 +3989,7 @@ const App = struct {
             defer split_env.deinit();
             try split_env.put("TERM", selectTerm(config.split_term, outer_term, colorterm));
             if (tmux_runtime != null) try split_env.put("TMUX_PANE", "%1");
-            const shell = posix.getenv("SHELL") orelse "/bin/sh";
+            const shell = getenv("SHELL") orelse "/bin/sh";
             const split_argv = [_][]const u8{ shell, "-lc", cmd };
             split_pane = try Pane.create(
                 alloc,
@@ -3933,7 +4049,7 @@ const App = struct {
             self.terminal_restore_needed = true;
             self.compositor.invalidate();
             try self.compositor.render(self.layout, self.main_pane, self.split_pane, true);
-            self.render_scheduler.rendered(std.time.nanoTimestamp());
+            self.render_scheduler.rendered(nanoTimestamp());
         }
 
         var running = true;
@@ -3946,10 +4062,9 @@ const App = struct {
             if (self.split_pane) |pane| pane.reapIfExited();
             try self.closeAutoSplitIfExited();
 
-            try self.checkResize(std.time.nanoTimestamp());
-            try self.flushRawControlIfDue(std.time.nanoTimestamp());
-            try self.flushOuterInputIfDue(std.time.nanoTimestamp());
-            try self.renderIfDue();
+            try self.checkResize(nanoTimestamp());
+            try self.flushRawControlIfDue(nanoTimestamp());
+            try self.flushOuterInputIfDue(nanoTimestamp());
 
             var fds_storage: [4 + max_control_connections]posix.pollfd = undefined;
             var count: usize = 0;
@@ -3960,7 +4075,7 @@ const App = struct {
             var control_index: ?usize = null;
             if (self.tmux_runtime) |*runtime| {
                 control_index = count;
-                fds_storage[count] = .{ .fd = runtime.server.stream.handle, .events = posix.POLL.IN, .revents = 0 };
+                fds_storage[count] = .{ .fd = runtime.server.socket.handle, .events = posix.POLL.IN, .revents = 0 };
                 count += 1;
             }
 
@@ -3991,7 +4106,7 @@ const App = struct {
                 count += 1;
             }
 
-            const now = std.time.nanoTimestamp();
+            const now = nanoTimestamp();
             const timeout = self.pollTimeoutMs(now);
             _ = try posix.poll(fds_storage[0..count], timeout);
 
@@ -4009,11 +4124,11 @@ const App = struct {
                     try self.readControlConnection(control_offset);
                 }
             }
-            self.expireControlConnections(std.time.nanoTimestamp());
+            self.expireControlConnections(nanoTimestamp());
 
             if (fds_storage[stdin_index].revents & posix.POLL.IN != 0) {
                 if (try self.readInput(&running)) {
-                    self.render_scheduler.noteInput(std.time.nanoTimestamp());
+                    self.render_scheduler.noteInput(nanoTimestamp());
                 }
             }
 
@@ -4033,7 +4148,7 @@ const App = struct {
                 }
             }
             if (pane_stats.bytes > 0) {
-                const drain_now = std.time.nanoTimestamp();
+                const drain_now = nanoTimestamp();
                 pane_stats.merge(try self.drainReadyPanes(self.render_scheduler.ptyDrainBudget(drain_now, pane_stats)));
                 if (self.composed) {
                     var model_stats = pane_stats;
@@ -4044,7 +4159,7 @@ const App = struct {
                     }
                     if (model_stats.bytes > 0 or model_stats.saturated) {
                         if (self.direct_main_painted_bytes > 0) model_stats.reads = 1;
-                        const damage_now = std.time.nanoTimestamp();
+                        const damage_now = nanoTimestamp();
                         const kind = self.render_scheduler.dirtyKindForDamage(damage_now, model_stats);
                         self.render_scheduler.markDirty(kind);
                     }
@@ -4056,7 +4171,9 @@ const App = struct {
             if (pane_stats.bytes == 0) self.advanceDeferredMainState();
             try self.closeAutoSplitIfExited();
 
-            if (self.composed) {
+            if (self.composed and
+                (!pane_stats.saturated or self.render_scheduler.mustRenderUnderLoad(nanoTimestamp())))
+            {
                 try self.renderIfDue();
             }
         }
@@ -4064,12 +4181,12 @@ const App = struct {
 
     fn renderIfDue(self: *App) !void {
         if (!self.composed) return;
-        const render_now = std.time.nanoTimestamp();
+        const render_now = nanoTimestamp();
         if (!self.render_scheduler.shouldRender(render_now)) return;
         try self.endComposedMainPassthrough();
         self.flushDeferredMainState();
         try self.compositor.render(self.layout, self.main_pane, self.split_pane, true);
-        self.render_scheduler.rendered(std.time.nanoTimestamp());
+        self.render_scheduler.rendered(nanoTimestamp());
     }
 
     fn beginOuterComposition(self: *App) void {
@@ -4236,7 +4353,7 @@ const App = struct {
 
     fn readInput(self: *App, running: *bool) !bool {
         var buf: [8192]u8 = undefined;
-        const n = posix.read(stdin_fd, &buf) catch |err| switch (err) {
+        const n = os.read(stdin_fd, &buf) catch |err| switch (err) {
             error.WouldBlock => return false,
             error.InputOutput => {
                 running.* = false;
@@ -4333,11 +4450,11 @@ const App = struct {
                 .ground => {
                     if (byte != 0x1b) continue;
                     if (direct_start) |start| try out.appendSlice(self.alloc, bytes[start..i]);
-                    self.outer_input_filter.start(std.time.nanoTimestamp());
+                    self.outer_input_filter.start(nanoTimestamp());
                     direct_start = null;
                 },
                 .escape => {
-                    if (!self.outer_input_filter.append(byte, std.time.nanoTimestamp())) {
+                    if (!self.outer_input_filter.append(byte, nanoTimestamp())) {
                         try out.appendSlice(self.alloc, self.outer_input_filter.buffered());
                         try out.append(self.alloc, byte);
                         self.outer_input_filter.resetSequence();
@@ -4353,7 +4470,7 @@ const App = struct {
                     }
                 },
                 .csi => {
-                    if (!self.outer_input_filter.append(byte, std.time.nanoTimestamp())) {
+                    if (!self.outer_input_filter.append(byte, nanoTimestamp())) {
                         try out.appendSlice(self.alloc, self.outer_input_filter.buffered());
                         try out.append(self.alloc, byte);
                         self.outer_input_filter.resetSequence();
@@ -4582,7 +4699,7 @@ const App = struct {
     }
 
     fn readPaneInto(self: *App, pane: *Pane, which: WhichPane, buf: *[64 * 1024]u8) !usize {
-        const n = posix.read(pane.pty_fd, buf) catch {
+        const n = os.read(pane.pty_fd, buf) catch {
             pane.markDead();
             return 0;
         };
@@ -4594,7 +4711,6 @@ const App = struct {
         if (!self.composed and which == .main) {
             try self.forwardRawMainOutput(bytes);
         } else if (self.composed and which == .main) {
-            if (try self.tryComposedMainPassthrough(bytes)) return n;
             try self.endComposedMainPassthrough();
             self.flushDeferredMainState();
             try self.mirrorMainScreenSwitches(bytes);
@@ -4648,7 +4764,7 @@ const App = struct {
             );
         }
         try self.deferred_main_state.appendSlice(self.alloc, bytes);
-        self.deferred_catchup_due_ns = std.time.nanoTimestamp() + deferred_raw_catchup_delay_ns;
+        self.deferred_catchup_due_ns = nanoTimestamp() + deferred_raw_catchup_delay_ns;
     }
 
     fn deferredMainStateLen(self: *const App) usize {
@@ -4671,14 +4787,14 @@ const App = struct {
 
     fn advanceDeferredMainState(self: *App) void {
         if (self.composed or self.deferredMainStateLen() == 0) return;
-        const now = std.time.nanoTimestamp();
+        const now = nanoTimestamp();
         if (self.deferred_catchup_due_ns) |due| {
             if (now < due) return;
         }
         const bulk = self.deferredMainStateLen() >= deferred_raw_bulk_threshold;
         const byte_budget = if (bulk) deferred_raw_bulk_catchup_bytes else deferred_raw_catchup_bytes;
         const time_budget = if (bulk) deferred_raw_bulk_catchup_ns else deferred_raw_catchup_ns;
-        const started = std.time.nanoTimestamp();
+        const started = nanoTimestamp();
         var processed: usize = 0;
         while (self.deferredMainStateLen() > 0 and processed < byte_budget) {
             const n = @min(
@@ -4689,7 +4805,7 @@ const App = struct {
             self.main_pane.feed(self.deferred_main_state.items[self.deferred_main_offset..end]);
             self.deferred_main_offset = end;
             processed += n;
-            if (std.time.nanoTimestamp() - started >= time_budget) break;
+            if (nanoTimestamp() - started >= time_budget) break;
         }
         if (self.deferredMainStateLen() == 0) {
             self.deferred_main_state.clearRetainingCapacity();
@@ -4700,7 +4816,7 @@ const App = struct {
         {
             self.compactDeferredMainState();
         }
-        if (self.deferredMainStateLen() > 0) self.deferred_catchup_due_ns = std.time.nanoTimestamp();
+        if (self.deferredMainStateLen() > 0) self.deferred_catchup_due_ns = nanoTimestamp();
         self.syncMainPassthroughCursor();
     }
 
@@ -4767,7 +4883,7 @@ const App = struct {
     }
 
     fn forwardRawMainOutput(self: *App, bytes: []const u8) !void {
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = nanoTimestamp();
         var outer_start: ?usize = if (self.raw_control_scanner.state == .ground) 0 else null;
         var sequence_start: ?usize = null;
         var i: usize = 0;
@@ -4923,14 +5039,14 @@ const App = struct {
     }
 
     fn drainReadyPanes(self: *App, budget_ns: i128) !DrainStats {
-        const deadline = std.time.nanoTimestamp() + budget_ns;
+        const deadline = nanoTimestamp() + budget_ns;
         var stats: DrainStats = .{};
         var buf: [64 * 1024]u8 = undefined;
 
         while (true) {
             if (stats.reads >= pty_drain_max_reads or
                 stats.bytes >= pty_drain_max_bytes or
-                std.time.nanoTimestamp() >= deadline)
+                nanoTimestamp() >= deadline)
             {
                 stats.saturated = try self.panesReady();
                 return stats;
@@ -4998,34 +5114,25 @@ const App = struct {
 
     fn acceptControlConnections(self: *App) !void {
         const runtime = if (self.tmux_runtime) |*runtime| runtime else return;
-        while (true) {
-            const accepted = runtime.server.accept() catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => return err,
-            };
-            const fd = accepted.stream.handle;
-            if (self.control_connections.items.len >= max_control_connections) {
-                accepted.stream.close();
-                continue;
-            }
-
-            const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-            const nonblock = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-            if (flags & nonblock == 0) {
-                _ = try posix.fcntl(fd, posix.F.SETFL, flags | nonblock);
-            }
-            try self.control_connections.append(self.alloc, .{
-                .fd = fd,
-                .accepted_ns = std.time.nanoTimestamp(),
-            });
+        const accepted = try runtime.server.accept(currentIo());
+        const fd = accepted.socket.handle;
+        if (self.control_connections.items.len >= max_control_connections) {
+            accepted.close(currentIo());
+            return;
         }
+
+        try setNonblocking(fd);
+        try self.control_connections.append(self.alloc, .{
+            .fd = fd,
+            .accepted_ns = nanoTimestamp(),
+        });
     }
 
     fn readControlConnection(self: *App, index: usize) !void {
         var closed = false;
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
-            const n = posix.read(self.control_connections.items[index].fd, &buf) catch |err| switch (err) {
+            const n = os.read(self.control_connections.items[index].fd, &buf) catch |err| switch (err) {
                 error.WouldBlock => break,
                 else => {
                     self.removeControlConnection(index);
@@ -5161,9 +5268,9 @@ const App = struct {
         }
     }
 
-    fn prepareAuxiliaryEnv(self: *App, env: *std.process.EnvMap) !void {
-        const outer_term = posix.getenv("TERM");
-        const colorterm = posix.getenv("COLORTERM");
+    fn prepareAuxiliaryEnv(self: *App, env: *EnvMap) !void {
+        const outer_term = getenv("TERM");
+        const colorterm = getenv("COLORTERM");
         try env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
         try applyTinymuxEnv(self.alloc, env, self.tmuxRuntimePtr(), "%1", .auxiliary);
     }
@@ -5171,7 +5278,7 @@ const App = struct {
     fn createSplitPaneFrom(
         self: *App,
         argv: []const []const u8,
-        env: *std.process.EnvMap,
+        env: *EnvMap,
         cwd: ?[]const u8,
         rows: u16,
     ) !*Pane {
@@ -5190,17 +5297,17 @@ const App = struct {
         const cmd = self.config.split_cmd orelse return;
         if (self.split_pane != null) return;
 
-        var split_env = try std.process.getEnvMap(self.alloc);
+        var split_env = try currentEnvMap(self.alloc);
         defer split_env.deinit();
-        const outer_term = posix.getenv("TERM");
-        const colorterm = posix.getenv("COLORTERM");
+        const outer_term = getenv("TERM");
+        const colorterm = getenv("COLORTERM");
         try split_env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
         try applyTinymuxEnv(self.alloc, &split_env, self.tmuxRuntimePtr(), "%1", .auxiliary);
 
-        const cwd = std.fs.cwd().realpathAlloc(self.alloc, ".") catch null;
+        const cwd = std.process.currentPathAlloc(currentIo(), self.alloc) catch null;
         defer if (cwd) |path| self.alloc.free(path);
 
-        const shell = posix.getenv("SHELL") orelse "/bin/sh";
+        const shell = getenv("SHELL") orelse "/bin/sh";
         const split_argv = [_][]const u8{ shell, "-lc", cmd };
         _ = try self.openSplitWith(
             &split_argv,
@@ -5214,7 +5321,7 @@ const App = struct {
     fn openSplitWith(
         self: *App,
         argv: []const []const u8,
-        env: *std.process.EnvMap,
+        env: *EnvMap,
         cwd: ?[]const u8,
         rows: u16,
         autoclose: bool,
@@ -5245,7 +5352,7 @@ const App = struct {
         self.terminal_restore_needed = true;
         self.compositor.invalidate();
         try self.compositor.render(self.layout, self.main_pane, self.split_pane, true);
-        self.render_scheduler.rendered(std.time.nanoTimestamp());
+        self.render_scheduler.rendered(nanoTimestamp());
         return generation;
     }
 
@@ -5269,7 +5376,7 @@ const App = struct {
         try self.reconcileMainToOuter();
 
         self.composed = false;
-        self.render_scheduler.rendered(std.time.nanoTimestamp());
+        self.render_scheduler.rendered(nanoTimestamp());
     }
 
     fn reconcileMainToOuter(self: *App) !void {
@@ -5351,8 +5458,8 @@ const App = struct {
     }
 
     fn drainMainForExit(self: *App) !void {
-        const deadline = std.time.milliTimestamp() + exit_drain_ms;
-        while (self.main_pane.pty_fd >= 0 and std.time.milliTimestamp() < deadline) {
+        const deadline = milliTimestamp() + exit_drain_ms;
+        while (self.main_pane.pty_fd >= 0 and milliTimestamp() < deadline) {
             var fds = [_]posix.pollfd{.{
                 .fd = self.main_pane.pty_fd,
                 .events = posix.POLL.IN,
@@ -5363,7 +5470,7 @@ const App = struct {
             if (fds[0].revents == 0) continue;
 
             var buf: [64 * 1024]u8 = undefined;
-            const n = posix.read(self.main_pane.pty_fd, &buf) catch break;
+            const n = os.read(self.main_pane.pty_fd, &buf) catch break;
             if (n == 0) break;
 
             const bytes = buf[0..n];
@@ -5718,7 +5825,7 @@ test "composed pending resize waits for quiet deadline" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{ .cols = 80, .rows = 24 }),
+        .term = try initTerminal(alloc, .{ .cols = 80, .rows = 24 }),
         .stream = undefined,
     };
     defer pane.term.deinit(alloc);
@@ -5870,7 +5977,7 @@ test "mouse forwarding encoder remaps coordinates into child pane space" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{ .cols = 80, .rows = 9 }),
+        .term = try initTerminal(alloc, .{ .cols = 80, .rows = 9 }),
         .stream = undefined,
     };
     defer pane.term.deinit(alloc);
@@ -5953,6 +6060,17 @@ test "render scheduler bulk damage uses bulk frame spacing" {
 
     try std.testing.expect(!scheduler.shouldRender(rendered_at + composed_frame_interval_ns));
     try std.testing.expect(scheduler.shouldRender(rendered_at + bulk_frame_interval_ns));
+}
+
+test "render scheduler bounds coalescing under continuous PTY load" {
+    var scheduler: RenderScheduler = .{};
+    const rendered_at: i128 = 1_000 * std.time.ns_per_ms;
+
+    scheduler.rendered(rendered_at);
+    scheduler.markDirty(.bulk);
+
+    try std.testing.expect(!scheduler.mustRenderUnderLoad(rendered_at + bulk_max_coalesce_ns - 1));
+    try std.testing.expect(scheduler.mustRenderUnderLoad(rendered_at + bulk_max_coalesce_ns));
 }
 
 test "render scheduler keeps bulk mode sticky briefly" {
@@ -6076,7 +6194,7 @@ test "plain ascii fast feed matches vt stream repaint" {
         .child_pid = 0,
         .command_title = "fast",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{ .cols = 8, .rows = 3, .max_scrollback = scrollback_bytes }),
+        .term = try initTerminal(alloc, .{ .cols = 8, .rows = 3, .max_scrollback_bytes = scrollback_bytes }),
         .stream = undefined,
     };
     defer fast.term.deinit(alloc);
@@ -6090,7 +6208,7 @@ test "plain ascii fast feed matches vt stream repaint" {
         .command_title = "slow",
         .cell_size = .{},
         .ascii_fast_feed_enabled = false,
-        .term = try vt.Terminal.init(alloc, .{ .cols = 8, .rows = 3, .max_scrollback = scrollback_bytes }),
+        .term = try initTerminal(alloc, .{ .cols = 8, .rows = 3, .max_scrollback_bytes = scrollback_bytes }),
         .stream = undefined,
     };
     defer slow.term.deinit(alloc);
@@ -6123,7 +6241,7 @@ test "composed cursor mirrors child cursor style" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{ .cols = 10, .rows = 5 }),
+        .term = try initTerminal(alloc, .{ .cols = 10, .rows = 5 }),
         .stream = undefined,
     };
     defer pane.term.deinit(alloc);
@@ -6148,7 +6266,7 @@ test "composed cursor mirrors child cursor visibility" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{ .cols = 10, .rows = 5 }),
+        .term = try initTerminal(alloc, .{ .cols = 10, .rows = 5 }),
         .stream = undefined,
     };
     defer pane.term.deinit(alloc);
@@ -6169,7 +6287,7 @@ test "composed cursor hides when child cursor is outside the viewport" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{ .cols = 10, .rows = 3, .max_scrollback = scrollback_bytes }),
+        .term = try initTerminal(alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = scrollback_bytes }),
         .stream = undefined,
     };
     defer pane.term.deinit(alloc);
@@ -6207,7 +6325,7 @@ test "pane stream handler records full-pane upward scrolls" {
     pane.command_title = "test";
     pane.reply_route = .discard;
     pane.cell_size = .{};
-    pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    pane.term = try initTerminal(alloc, .{ .cols = 20, .rows = 3 });
     defer pane.term.deinit(alloc);
     pane.pending_scroll_count = 0;
     pane.pending_scroll_overflow = false;
@@ -6237,7 +6355,7 @@ test "pane stream handler keeps alternate-screen scrolls separate" {
     pane.command_title = "test";
     pane.reply_route = .discard;
     pane.cell_size = .{};
-    pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    pane.term = try initTerminal(alloc, .{ .cols = 20, .rows = 3 });
     defer pane.term.deinit(alloc);
     pane.pending_scroll_count = 0;
     pane.pending_scroll_overflow = false;
@@ -6266,7 +6384,7 @@ test "pane feed repairs stale cursor caches before erase line" {
         .reaped = true,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3 }),
+        .term = try initTerminal(alloc, .{ .cols = 20, .rows = 3 }),
         .stream = undefined,
     };
     defer pane.term.deinit(alloc);
@@ -6284,6 +6402,47 @@ test "pane feed repairs stale cursor caches before erase line" {
     const expected = screen.cursor.page_pin.rowAndCell();
     try std.testing.expectEqual(expected.row, screen.cursor.page_row);
     try std.testing.expectEqual(expected.cell, screen.cursor.page_cell);
+    try std.testing.expectEqual(@as(u64, 1), pane.cursor_repair_count);
+    try std.testing.expect(pane.model_epoch > 0);
+}
+
+test "lazygit-style bottom-row loader preserves the alternate-screen top row" {
+    const alloc = std.testing.allocator;
+
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .alive = false,
+        .reaped = true,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try initTerminal(alloc, .{ .cols = 20, .rows = 4 }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+    pane.stream = .initAlloc(alloc, Pane.StreamHandler.init(&pane));
+    defer pane.stream.deinit();
+
+    pane.feed(
+        "\x1b[?1049h\x1b[2J" ++
+            "\x1b[1;1HTOP_SENTINEL" ++
+            "\x1b[4;1H\x1b[2KLOAD_FRAME_1" ++
+            "\x1b[4;1H\x1b[2KLOAD_FRAME_2" ++
+            "\x1b[4;1H\x1b[2KLOAD_DONE",
+    );
+
+    var top: std.ArrayList(u8) = .empty;
+    defer top.deinit(alloc);
+    try appendTermRow(alloc, &pane.term, 0, &top);
+    var bottom: std.ArrayList(u8) = .empty;
+    defer bottom.deinit(alloc);
+    try appendTermRow(alloc, &pane.term, 3, &bottom);
+
+    try std.testing.expectEqual(vt.ScreenSet.Key.alternate, pane.term.screens.active_key);
+    try std.testing.expect(std.mem.indexOf(u8, top.items, "TOP_SENTINEL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bottom.items, "LOAD_DONE") != null);
+    try std.testing.expectEqual(@as(u16, 3), pane.term.screens.active.cursor.y);
 }
 
 test "pane stream handler records partial-region upward scrolls" {
@@ -6298,7 +6457,7 @@ test "pane stream handler records partial-region upward scrolls" {
     pane.command_title = "test";
     pane.reply_route = .discard;
     pane.cell_size = .{};
-    pane.term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    pane.term = try initTerminal(alloc, .{ .cols = 20, .rows = 5 });
     defer pane.term.deinit(alloc);
     pane.pending_scroll_count = 0;
     pane.pending_scroll_overflow = false;
@@ -6324,12 +6483,12 @@ test "graphics update ignores text-only scroll dirty without placements" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{
+        .term = try initTerminal(alloc, .{
             .cols = 10,
             .rows = 3,
-            .max_scrollback = scrollback_bytes,
+            .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .all,
+            .kitty_image_loading_limits = .direct,
         }),
         .stream = undefined,
     };
@@ -6345,7 +6504,7 @@ test "graphics update ignores text-only scroll dirty without placements" {
 test "pane row cache detects upward viewport scroll" {
     const alloc = std.testing.allocator;
 
-    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 4 });
+    var term = try initTerminal(alloc, .{ .cols = 20, .rows = 4 });
     defer term.deinit(alloc);
     var stream = term.vtStream();
     defer stream.deinit();
@@ -6377,7 +6536,7 @@ test "pane row cache detects upward viewport scroll" {
 test "pane viewport scroll changes visible top row" {
     const alloc = std.testing.allocator;
 
-    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 3, .max_scrollback = scrollback_bytes });
+    var term = try initTerminal(alloc, .{ .cols = 20, .rows = 3, .max_scrollback_bytes = scrollback_bytes });
     defer term.deinit(alloc);
     var stream = term.vtStream();
     defer stream.deinit();
@@ -6440,7 +6599,7 @@ test "split pane scroll fast path emits split scroll region" {
     try std.testing.expectEqualStrings("\x1b[5;6r\x1b[1S\x1b[r", compositor.body.items);
 }
 
-test "alternate-screen panes do not use the outer scroll fast path" {
+test "composed panes never mutate the outer terminal with a scroll fast path" {
     const alloc = std.testing.allocator;
 
     var compositor: Compositor = .{ .alloc = alloc };
@@ -6450,7 +6609,7 @@ test "alternate-screen panes do not use the outer scroll fast path" {
     var graphics: GraphicsState = .{};
     defer graphics.deinit(alloc);
 
-    try std.testing.expect(compositor.canPaneScrollFastPath(&graphics, .primary, 3, false));
+    try std.testing.expect(!compositor.canPaneScrollFastPath(&graphics, .primary, 3, false));
     try std.testing.expect(!compositor.canPaneScrollFastPath(&graphics, .alternate, 3, false));
 }
 
@@ -6475,12 +6634,12 @@ test "raw graphics handoff preserves application image references and placements
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{
+        .term = try initTerminal(alloc, .{
             .cols = 10,
             .rows = 5,
-            .max_scrollback = scrollback_bytes,
+            .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .all,
+            .kitty_image_loading_limits = .direct,
         }),
         .stream = undefined,
     };
@@ -6561,12 +6720,12 @@ test "graphics replay keeps image upload cached across placement updates" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{
+        .term = try initTerminal(alloc, .{
             .cols = 10,
             .rows = 5,
-            .max_scrollback = scrollback_bytes,
+            .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .all,
+            .kitty_image_loading_limits = .direct,
         }),
         .stream = undefined,
     };
@@ -6610,12 +6769,12 @@ test "graphics replay skips garbage placement pins after scrollback pruning" {
         .child_pid = 0,
         .command_title = "test",
         .cell_size = .{},
-        .term = try vt.Terminal.init(alloc, .{
+        .term = try initTerminal(alloc, .{
             .cols = 10,
             .rows = 5,
-            .max_scrollback = scrollback_bytes,
+            .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .all,
+            .kitty_image_loading_limits = .direct,
         }),
         .stream = undefined,
     };
@@ -6655,7 +6814,7 @@ test "graphics replay skips garbage placement pins after scrollback pruning" {
 test "viewport row cache invalidates clean rows that scrolled" {
     const alloc = std.testing.allocator;
 
-    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 4 });
+    var term = try initTerminal(alloc, .{ .cols = 20, .rows = 4 });
     defer term.deinit(alloc);
     var stream = term.vtStream();
     defer stream.deinit();
@@ -6668,9 +6827,7 @@ test "viewport row cache invalidates clean rows that scrolled" {
     for (0..4) |y| {
         const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = @intCast(y) } }).?;
         try appendTermRow(alloc, &term, @intCast(y), &entries[y].bytes);
-        entries[y].node = @ptrCast(pin.node);
-        entries[y].offset = pin.y;
-        entries[y].valid = true;
+        entries[y].capturePin(pin);
     }
     screen.pages.clearDirty();
 
