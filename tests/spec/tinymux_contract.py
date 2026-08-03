@@ -723,6 +723,36 @@ def test_mouse_wheel_forwards_when_child_requests_mouse(tinymux: str) -> None:
         session.close()
 
 
+def test_alternate_screen_wheel_translates_to_cursor_input(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "--split",
+            "printf 'SPLIT_READY\\n'; sleep 5",
+            "--",
+            "/bin/sh",
+            "-lc",
+            (
+                "printf '\\033[?1049hALT_SCROLL_READY\\n'; "
+                "stty raw -echo; "
+                "python3 -c 'import sys, time; "
+                "data = sys.stdin.buffer.read(3); "
+                "sys.stdout.buffer.write(b\"ALT_SCROLL_BYTES|\" + data.hex().encode() + b\"\\n\"); "
+                "sys.stdout.flush(); "
+                "time.sleep(0.2)'"
+            ),
+        ]
+    )
+    try:
+        session.wait_for(b"ALT_SCROLL_READY")
+        session.wait_for(b"SPLIT_READY")
+        scroll_start = len(session.output)
+        session.write(b"\x1b[<64;10;5M")
+        session.wait_for_after(b"ALT_SCROLL_BYTES|1b5b41", scroll_start)
+    finally:
+        session.close()
+
+
 def test_split_replays_kitty_graphics(tinymux: str) -> None:
     session = Session(
         [
@@ -2180,6 +2210,258 @@ def test_real_direnv_instant_fish_is_usable_after_split_closes(tinymux: str) -> 
             session.close()
 
 
+def assert_focus_event_does_not_leak(
+    argv: Sequence[str], fish: str, bash: str, *, open_split: bool
+) -> None:
+    session = Session(
+        argv,
+        extra_env={"SHELL": fish},
+        controlling_terminal=True,
+    )
+    try:
+        write_fish_command(session, "function fish_greeting; end")
+        write_fish_command(session, "stty -echo")
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+
+        write_fish_command(
+            session,
+            "printf '\\033[?1004h\\033[?2004hTINYMUX_%s\\n' INPUT_MODES_ENABLED",
+        )
+        session.wait_for(b"TINYMUX_INPUT_MODES_ENABLED", timeout=5.0)
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+
+        if open_split:
+            split_start = len(session.output)
+            write_fish_command(
+                session,
+                "tmux split-window -d -l 5 /bin/sh -lc "
+                + shlex.quote("printf TINYMUX_SPLIT_READY; sleep 10"),
+            )
+            session.wait_for_after(b"TINYMUX_SPLIT_READY", split_start, timeout=8.0)
+            session.drain_until_idle(idle=0.2, timeout=3.0)
+
+        command = (
+            f"{shlex.quote(bash)} --noprofile --norc -c "
+            + shlex.quote(
+                "printf '\\033[?1004l\\033[?2004l'; "
+                "printf 'TINYMUX_CHILD_%s\\n' WAITING; "
+                "IFS= read -r -n 1 byte; "
+                "if [[ $byte == y ]]; then "
+                "printf 'TINYMUX_CHILD_%s\\n' EXPLICIT_INPUT; "
+                "else printf 'TINYMUX_CHILD_%s\\n' LEAKED_INPUT; fi"
+            )
+        )
+        start = len(session.output)
+        write_fish_command(session, command)
+        session.wait_for_after(b"TINYMUX_CHILD_WAITING", start, timeout=8.0)
+        waiting_end = session.output.rfind(b"TINYMUX_CHILD_WAITING") + len(
+            b"TINYMUX_CHILD_WAITING"
+        )
+        session.drain_until_idle(idle=0.3, timeout=3.0)
+        child_output = session.output[waiting_end:]
+        mode_output = session.output[start:]
+        if open_split:
+            assert b"\x1b[?1004l" not in mode_output, mode_output[-2000:]
+            assert b"\x1b[?2004l" not in mode_output, mode_output[-2000:]
+        else:
+            assert b"\x1b[?1004l" in mode_output, mode_output[-2000:]
+            assert b"\x1b[?2004l" in mode_output, mode_output[-2000:]
+        assert b"TINYMUX_CHILD_LEAKED_INPUT" not in child_output, child_output[-2000:]
+        assert b"TINYMUX_CHILD_EXPLICIT_INPUT" not in child_output, child_output[-2000:]
+
+        session.write(b"\x1b[I")
+        session.drain_until_idle(idle=0.3, timeout=3.0)
+        assert b"TINYMUX_CHILD_LEAKED_INPUT" not in session.output[waiting_end:]
+        assert b"TINYMUX_CHILD_EXPLICIT_INPUT" not in session.output[waiting_end:]
+
+        session.write(b"y")
+        session.wait_for_after(b"TINYMUX_CHILD_EXPLICIT_INPUT", start, timeout=5.0)
+        assert b"TINYMUX_CHILD_LEAKED_INPUT" not in session.output[start:]
+    finally:
+        session.close()
+
+
+def test_persistent_focus_event_does_not_leak_into_child_stdin(tinymux: str) -> None:
+    """A stale outer focus event must not answer a Fish child prompt."""
+    fish = shutil.which("fish")
+    bash = shutil.which("bash")
+    if fish is None or bash is None:
+        return
+
+    assert_focus_event_does_not_leak(
+        [tinymux, "session", "--", fish, "--no-config", "--interactive"],
+        fish,
+        bash,
+        open_split=False,
+    )
+    assert_focus_event_does_not_leak(
+        [tinymux, "session", "--", fish, "--no-config", "--interactive"],
+        fish,
+        bash,
+        open_split=True,
+    )
+
+
+def test_pane_mode_output_wins_simultaneously_ready_focus_input(tinymux: str) -> None:
+    """Ready pane mode changes must be applied before a queued outer report."""
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+
+    with tempfile.TemporaryDirectory(prefix="tinymux-focus-race-") as root:
+        release = os.path.join(root, "release")
+        command = (
+            "printf '\033[?1004hTINYMUX_RACE_ARMED\n'; "
+            f"while [[ ! -e {shlex.quote(release)} ]]; do sleep 0.01; done; "
+            "printf '\033[?1004lTINYMUX_RACE_WAITING\n'; "
+            "IFS= read -r -n 1 byte; "
+            "if [[ $byte == y ]]; then printf 'TINYMUX_RACE_EXPLICIT'; "
+            "else printf 'TINYMUX_RACE_LEAKED'; fi; sleep 3"
+        )
+        session = Session(
+            [
+                tinymux,
+                "--split",
+                "sleep 5",
+                "--",
+                bash,
+                "--noprofile",
+                "--norc",
+                "-c",
+                command,
+            ]
+        )
+        stopped = False
+        try:
+            session.wait_for(b"TINYMUX_RACE_ARMED", timeout=8.0)
+            os.kill(session.proc.pid, signal.SIGSTOP)
+            stopped = True
+            with open(release, "w", encoding="utf-8"):
+                pass
+            time.sleep(0.1)
+            session.write(b"\x1b[I")
+            os.kill(session.proc.pid, signal.SIGCONT)
+            stopped = False
+
+            waiting_start = len(session.output)
+            session.wait_for_after(b"TINYMUX_RACE_WAITING", waiting_start, timeout=8.0)
+            session.drain_until_idle(idle=0.2, timeout=2.0)
+            assert b"TINYMUX_RACE_LEAKED" not in session.output[waiting_start:]
+            session.write(b"y")
+            session.wait_for_after(b"TINYMUX_RACE_EXPLICIT", waiting_start, timeout=5.0)
+        finally:
+            if stopped:
+                os.kill(session.proc.pid, signal.SIGCONT)
+            session.close()
+
+
+def test_color_scheme_queries_are_correlated_terminal_reports(tinymux: str) -> None:
+    command = (
+        "stty raw -echo; printf '\033[?996nTINYMUX_COLOR_QUERY_SENT\n'; "
+        "python3 -c 'import sys, time; data = sys.stdin.buffer.read(9); "
+        "sys.stdout.buffer.write(b\"TINYMUX_COLOR_REPLY|\" + data.hex().encode() + b\"\\n\"); "
+        "sys.stdout.flush(); time.sleep(0.2)'"
+    )
+    for argv in (
+        [tinymux, "--", "/bin/sh", "-lc", command],
+        [tinymux, "--split", "sleep 5", "--", "/bin/sh", "-lc", command],
+    ):
+        session = Session(argv)
+        try:
+            session.wait_for(b"TINYMUX_COLOR_QUERY_SENT", timeout=8.0)
+            assert b"\x1b[?996n" in session.output
+            reply_start = len(session.output)
+            session.write(b"\x1b[?997;1n")
+            session.wait_for_after(
+                b"TINYMUX_COLOR_REPLY|1b5b3f3939373b316e",
+                reply_start,
+                timeout=5.0,
+            )
+        finally:
+            session.close()
+
+
+def test_composed_mirrors_keyboard_input_protocol_state(tinymux: str) -> None:
+    set_modes = "\033[12h\033[20h\033[?1h\033[?66h\033[?67h\033[?1035h\033[?1036h\033[?1039h\033[>4;2m\033[=5;1u"
+    reset_modes = "\033[12l\033[20l\033[?1l\033[?66l\033[?67l\033[?1035l\033[?1036l\033[?1039l\033[>4;0m\033[=0;1u"
+    command = (
+        f"sleep 0.2; printf '{set_modes}TINYMUX_PROTOCOL_SET'; "
+        f"sleep 0.2; printf '{reset_modes}TINYMUX_PROTOCOL_RESET'; sleep 3"
+    )
+    session = Session(
+        [tinymux, "--split", "sleep 3", "--", "/bin/sh", "-lc", command]
+    )
+    try:
+        session.wait_for(b"TINYMUX_PROTOCOL_SET", timeout=8.0)
+        session.wait_for(b"TINYMUX_PROTOCOL_RESET", timeout=8.0)
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+        for sequence in (
+            b"\x1b[12h",
+            b"\x1b[20h",
+            b"\x1b[?1h",
+            b"\x1b[?66h",
+            b"\x1b[?67h",
+            b"\x1b[?1035h",
+            b"\x1b[?1036h",
+            b"\x1b[?1039h",
+            b"\x1b[>4;2m",
+            b"\x1b[=5;1u",
+            b"\x1b[12l",
+            b"\x1b[20l",
+            b"\x1b[?1l",
+            b"\x1b[?66l",
+            b"\x1b[?67l",
+            b"\x1b[>4;0m",
+            b"\x1b[=0;1u",
+        ):
+            assert sequence in session.output, (sequence, session.output[-4000:])
+    finally:
+        session.close()
+
+
+def test_composed_strips_paste_framing_when_pane_disables_it(tinymux: str) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+    command = (
+        "printf '\033[?2004lTINYMUX_PASTE_WAITING\n'; "
+        "IFS= read -r -n 3 bytes; "
+        "if [[ $bytes == abc ]]; then printf 'TINYMUX_PASTE_PLAIN'; "
+        "else printf 'TINYMUX_PASTE_FRAMED'; fi; sleep 3"
+    )
+    session = Session(
+        [tinymux, "--split", "sleep 3", "--", bash, "--noprofile", "--norc", "-c", command]
+    )
+    try:
+        session.wait_for(b"TINYMUX_PASTE_WAITING", timeout=8.0)
+        session.write(b"\x1b[200~abc\x1b[201~")
+        session.wait_for(b"TINYMUX_PASTE_PLAIN", timeout=5.0)
+        assert b"TINYMUX_PASTE_FRAMED" not in session.output
+    finally:
+        session.close()
+
+
+def test_composed_virtualizes_keyboard_action_mode(tinymux: str) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+    command = (
+        "printf '\033[2hTINYMUX_KAM_READY\n'; "
+        "IFS= read -r -n 1 byte; printf 'TINYMUX_KAM_GOT_%s' \"$byte\"; sleep 3"
+    )
+    session = Session(
+        [tinymux, "--split", "sleep 3", "--", bash, "--noprofile", "--norc", "-c", command]
+    )
+    try:
+        session.wait_for(b"TINYMUX_KAM_READY", timeout=8.0)
+        session.write(b"a")
+        session.drain_until_idle(idle=0.3, timeout=2.0)
+        assert b"TINYMUX_KAM_GOT" not in session.output
+        session.write(b"\x02x")
+    finally:
+        session.close()
+
+
 def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str) -> None:
     """A direct A-to-B transition must load both roots in one Tinymux session."""
     fish = shutil.which("fish")
@@ -2528,6 +2810,13 @@ def main() -> int:
         test_persistent_main_preserves_host_integration_but_auxiliary_scrubs_it,
         test_tmux_compat_env_and_private_shim,
         test_real_direnv_instant_daemon_opens_tmux_split,
+        test_persistent_focus_event_does_not_leak_into_child_stdin,
+        test_pane_mode_output_wins_simultaneously_ready_focus_input,
+        test_color_scheme_queries_are_correlated_terminal_reports,
+        test_composed_mirrors_keyboard_input_protocol_state,
+        test_composed_strips_paste_framing_when_pane_disables_it,
+        test_composed_virtualizes_keyboard_action_mode,
+        test_alternate_screen_wheel_translates_to_cursor_input,
         # The real Fish daemon lifecycle tests remain in the full suite. The
         # Darwin Nix sandbox does not deliver direnv-instant's watcher-exit
         # signal, so use the deterministic watcher-EOF regression above as
@@ -2568,6 +2857,7 @@ def main() -> int:
         test_mouse_drag_scrollbar_scrolls_main_pane_viewport,
         test_mouse_wheel_scrolls_split_pane_viewport,
         test_mouse_wheel_forwards_when_child_requests_mouse,
+        test_alternate_screen_wheel_translates_to_cursor_input,
         test_split_replays_kitty_graphics,
         test_split_replays_kitty_png_graphics,
         test_split_close_switches_to_raw_main,
@@ -2580,6 +2870,12 @@ def main() -> int:
         test_tmux_compat_env_and_private_shim,
         test_real_direnv_instant_daemon_opens_tmux_split,
         test_real_direnv_instant_fish_is_usable_after_split_closes,
+        test_persistent_focus_event_does_not_leak_into_child_stdin,
+        test_pane_mode_output_wins_simultaneously_ready_focus_input,
+        test_color_scheme_queries_are_correlated_terminal_reports,
+        test_composed_mirrors_keyboard_input_protocol_state,
+        test_composed_strips_paste_framing_when_pane_disables_it,
+        test_composed_virtualizes_keyboard_action_mode,
         test_persistent_fish_keeps_session_across_sibling_direnv_roots,
         test_persistent_control_client_cannot_block_main_input,
         test_persistent_session_survives_control_socket_failure,

@@ -96,6 +96,7 @@ const bulk_max_coalesce_ns: i128 = 50 * std.time.ns_per_ms;
 const bulk_sticky_window_ns: i128 = 120 * std.time.ns_per_ms;
 const resize_quiet_ns: i128 = 80 * std.time.ns_per_ms;
 const control_sequence_timeout_ns: i128 = 20 * std.time.ns_per_ms;
+const terminal_report_settle_ns: i128 = 1 * std.time.ns_per_ms;
 const interactive_input_window_ns: i128 = 50 * std.time.ns_per_ms;
 const interactive_pty_drain_budget_ns: i128 = 1 * std.time.ns_per_ms;
 const bulk_pty_drain_budget_ns: i128 = 6 * std.time.ns_per_ms;
@@ -130,6 +131,13 @@ const style_dim = "\x1b[2m";
 const synchronized_update_begin = "\x1b[?2026h";
 const synchronized_update_end = "\x1b[?2026l";
 const mux_mouse_enable = "\x1b[?1002h\x1b[?1006h";
+const composed_input_reset =
+    "\x1b[2l\x1b[12h\x1b[20l" ++
+    "\x1b[?1l\x1b[?8h\x1b[?66l\x1b[?67l\x1b[?1035l\x1b[?1036l\x1b[?1039l" ++
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l" ++
+    "\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?2033l" ++
+    "\x1b[>4;0m\x1b[=0;1u";
+const composed_input_capture = mux_mouse_enable ++ "\x1b[?1004h\x1b[?2004h\x1b[?2031h\x1b[?2033h";
 const scrollbar_track = "│";
 const scrollbar_thumb = "█";
 
@@ -1625,6 +1633,7 @@ const OuterInputFilter = struct {
     len: usize = 0,
     due_ns: ?i128 = null,
     bracketed_paste: bool = false,
+    paste_forward_markers: bool = false,
 
     fn start(self: *OuterInputFilter, now_ns: i128) void {
         self.state = .escape;
@@ -1650,6 +1659,251 @@ const OuterInputFilter = struct {
     fn buffered(self: *const OuterInputFilter) []const u8 {
         return self.bytes[0..self.len];
     }
+};
+
+const PaneInputEncoding = struct {
+    screen: vt.ScreenSet.Key = .primary,
+    send_receive_mode: bool = true,
+    linefeed: bool = false,
+    cursor_keys: bool = false,
+    keypad_keys: bool = false,
+    backarrow_key_mode: bool = false,
+    ignore_keypad_with_numlock: bool = false,
+    alt_esc_prefix: bool = false,
+    alt_sends_escape: bool = false,
+    modify_other_keys_2: bool = false,
+    kitty_flags: u8 = 0,
+
+    fn fromPane(pane: *const Pane) PaneInputEncoding {
+        const term = &pane.term;
+        return .{
+            .screen = term.screens.active_key,
+            .send_receive_mode = term.modes.get(.send_receive_mode),
+            .linefeed = term.modes.get(.linefeed),
+            .cursor_keys = term.modes.get(.cursor_keys),
+            .keypad_keys = term.modes.get(.keypad_keys),
+            .backarrow_key_mode = term.modes.get(.backarrow_key_mode),
+            .ignore_keypad_with_numlock = term.modes.get(.ignore_keypad_with_numlock),
+            .alt_esc_prefix = term.modes.get(.alt_esc_prefix),
+            .alt_sends_escape = term.modes.get(.alt_sends_escape),
+            .modify_other_keys_2 = term.flags.modify_other_keys_2,
+            .kitty_flags = @intCast(term.screens.active.kitty_keyboard.current().int()),
+        };
+    }
+};
+
+const InputModePolicy = enum {
+    display_state,
+    mirror_to_outer,
+    pin_outer_default,
+    virtualize_in_mux,
+    synthesize_report,
+};
+
+/// Every terminal mode must have an explicit ownership policy. This switch is
+/// intentionally exhaustive so updating ghostty-vt cannot silently introduce
+/// another mode that changes outer input behind the mux's back.
+fn inputModePolicy(mode: vt.Mode) InputModePolicy {
+    return switch (mode) {
+        .send_receive_mode,
+        .linefeed,
+        .cursor_keys,
+        .keypad_keys,
+        .backarrow_key_mode,
+        .ignore_keypad_with_numlock,
+        .alt_esc_prefix,
+        .alt_sends_escape,
+        => .mirror_to_outer,
+
+        .autorepeat => .pin_outer_default,
+
+        .disable_keyboard,
+        .mouse_event_x10,
+        .mouse_event_normal,
+        .mouse_event_button,
+        .mouse_event_any,
+        .focus_event,
+        .mouse_format_utf8,
+        .mouse_format_sgr,
+        .mouse_alternate_scroll,
+        .mouse_format_urxvt,
+        .mouse_format_sgr_pixels,
+        .bracketed_paste,
+        => .virtualize_in_mux,
+
+        .report_color_scheme,
+        .report_visibility,
+        .in_band_size_reports,
+        => .synthesize_report,
+
+        .insert,
+        .@"132_column",
+        .slow_scroll,
+        .reverse_colors,
+        .origin,
+        .wraparound,
+        .cursor_blinking,
+        .cursor_visible,
+        .enable_mode_3,
+        .reverse_wrap,
+        .alt_screen_legacy,
+        .enable_left_and_right_margin,
+        .reverse_wrap_extended,
+        .alt_screen,
+        .save_cursor,
+        .alt_screen_save_cursor_clear_enter,
+        .synchronized_output,
+        .grapheme_cluster,
+        => .display_state,
+    };
+}
+
+const PaneInputState = struct {
+    encoding: PaneInputEncoding = .{},
+    keyboard_disabled: bool = false,
+    focus_event: bool = false,
+    bracketed_paste: bool = false,
+    report_color_scheme: bool = false,
+    report_visibility: bool = false,
+
+    fn fromPane(pane: *const Pane) PaneInputState {
+        return .{
+            .encoding = .fromPane(pane),
+            .keyboard_disabled = pane.term.modes.get(.disable_keyboard),
+            .focus_event = pane.term.modes.get(.focus_event),
+            .bracketed_paste = pane.term.modes.get(.bracketed_paste),
+            .report_color_scheme = pane.term.modes.get(.report_color_scheme),
+            .report_visibility = pane.term.modes.get(.report_visibility),
+        };
+    }
+};
+
+const OuterInputProtocol = struct {
+    composed: bool = false,
+    state: PaneInputState = .{},
+
+    fn appendMode(
+        writer: *std.Io.Writer,
+        previous: bool,
+        desired: bool,
+        force: bool,
+        set: []const u8,
+        reset: []const u8,
+    ) !void {
+        if (!force and previous == desired) return;
+        try writer.writeAll(if (desired) set else reset);
+    }
+
+    fn appendEncodingDiff(
+        previous: PaneInputEncoding,
+        desired: PaneInputEncoding,
+        writer: *std.Io.Writer,
+        force_all: bool,
+    ) !void {
+        const force = force_all or previous.screen != desired.screen;
+        try appendMode(
+            writer,
+            previous.send_receive_mode,
+            desired.send_receive_mode,
+            force,
+            "\x1b[12h",
+            "\x1b[12l",
+        );
+        try appendMode(writer, previous.linefeed, desired.linefeed, force, "\x1b[20h", "\x1b[20l");
+        try appendMode(writer, previous.cursor_keys, desired.cursor_keys, force, "\x1b[?1h", "\x1b[?1l");
+        try appendMode(writer, previous.keypad_keys, desired.keypad_keys, force, "\x1b[?66h", "\x1b[?66l");
+        try appendMode(writer, previous.backarrow_key_mode, desired.backarrow_key_mode, force, "\x1b[?67h", "\x1b[?67l");
+        try appendMode(
+            writer,
+            previous.ignore_keypad_with_numlock,
+            desired.ignore_keypad_with_numlock,
+            force,
+            "\x1b[?1035h",
+            "\x1b[?1035l",
+        );
+        try appendMode(writer, previous.alt_esc_prefix, desired.alt_esc_prefix, force, "\x1b[?1036h", "\x1b[?1036l");
+        try appendMode(writer, previous.alt_sends_escape, desired.alt_sends_escape, force, "\x1b[?1039h", "\x1b[?1039l");
+        try appendMode(
+            writer,
+            previous.modify_other_keys_2,
+            desired.modify_other_keys_2,
+            force,
+            "\x1b[>4;2m",
+            "\x1b[>4;0m",
+        );
+        if (force or previous.kitty_flags != desired.kitty_flags) {
+            try writer.print("\x1b[={d};1u", .{desired.kitty_flags});
+        }
+    }
+
+    fn enterComposed(
+        self: *OuterInputProtocol,
+        desired: PaneInputState,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.writeAll(composed_input_reset);
+        try writer.writeAll(composed_input_capture);
+        try appendEncodingDiff(.{}, desired.encoding, writer, true);
+        self.composed = true;
+        self.state = desired;
+    }
+
+    fn sync(
+        self: *OuterInputProtocol,
+        desired: PaneInputState,
+        writer: *std.Io.Writer,
+    ) !void {
+        if (!self.composed) return;
+        try appendEncodingDiff(self.state.encoding, desired.encoding, writer, false);
+        self.state = desired;
+    }
+
+    fn adoptRaw(self: *OuterInputProtocol, desired: PaneInputState) void {
+        self.composed = false;
+        self.state = desired;
+    }
+
+    fn noteRawControlSequence(self: *OuterInputProtocol, sequence: []const u8) void {
+        if (self.composed) return;
+        if (std.mem.eql(u8, sequence, "\x1b[?1004h")) self.state.focus_event = true;
+        if (std.mem.eql(u8, sequence, "\x1b[?1004l")) self.state.focus_event = false;
+        if (std.mem.eql(u8, sequence, "\x1b[?2004h")) self.state.bracketed_paste = true;
+        if (std.mem.eql(u8, sequence, "\x1b[?2004l")) self.state.bracketed_paste = false;
+        if (std.mem.eql(u8, sequence, "\x1b[?2031h")) self.state.report_color_scheme = true;
+        if (std.mem.eql(u8, sequence, "\x1b[?2031l")) self.state.report_color_scheme = false;
+        if (std.mem.eql(u8, sequence, "\x1b[?2033h")) self.state.report_visibility = true;
+        if (std.mem.eql(u8, sequence, "\x1b[?2033l")) self.state.report_visibility = false;
+    }
+};
+
+const DeferredOuterReport = enum {
+    focus_in,
+    focus_out,
+    color_scheme_dark,
+    color_scheme_light,
+    visibility_visible,
+    visibility_hidden,
+
+    fn bytes(self: DeferredOuterReport) []const u8 {
+        return switch (self) {
+            .focus_in => "\x1b[I",
+            .focus_out => "\x1b[O",
+            .color_scheme_dark => "\x1b[?997;1n",
+            .color_scheme_light => "\x1b[?997;2n",
+            .visibility_visible => "\x1b[?999;1n",
+            .visibility_hidden => "\x1b[?999;2n",
+        };
+    }
+};
+
+const PendingColorQuery = struct {
+    pane: PaneId,
+    owner: ?posix.pid_t,
+};
+
+const DeferredOuterReportDelivery = struct {
+    report: DeferredOuterReport,
+    query: ?PendingColorQuery = null,
 };
 
 const RawTerminal = struct {
@@ -1964,9 +2218,13 @@ const Pane = struct {
     pending_scroll_overflow: bool = false,
     model_epoch: u64 = 0,
     cursor_repair_count: u64 = 0,
+    color_scheme: ColorScheme = null,
+    color_scheme_queries_to_outer: usize = 0,
+    color_scheme_query_owner: ?posix.pid_t = null,
 
     pub const TerminalHandler = vt.TerminalStream.Handler;
     pub const Stream = vt.Stream(StreamHandler);
+    const ColorScheme = EffectReturn("color_scheme");
 
     const StreamHandler = struct {
         const Action = @import("ghostty-vt").StreamAction;
@@ -1981,7 +2239,7 @@ const Pane = struct {
                 .write_pty = effectWritePty,
                 .bell = null,
                 .desktop_notification = null,
-                .color_scheme = null,
+                .color_scheme = effectColorScheme,
                 .device_attributes = effectDeviceAttributes,
                 .enquiry = null,
                 .size = effectSize,
@@ -2153,6 +2411,17 @@ const Pane = struct {
     fn effectDeviceAttributes(handler: *TerminalHandler) DeviceAttributes {
         _ = handler;
         return .{};
+    }
+
+    fn effectColorScheme(handler: *TerminalHandler) ColorScheme {
+        const self = fromHandler(handler);
+        if (self.color_scheme) |scheme| return scheme;
+        self.color_scheme_queries_to_outer +|= 1;
+        self.color_scheme_query_owner = switch (self.reply_route) {
+            .discard => null,
+            .pane => |owner| owner,
+        };
+        return null;
     }
 
     fn effectSize(handler: *TerminalHandler) ?vt.size_report.Size {
@@ -2525,11 +2794,14 @@ fn appendWithoutScreenSwitchModes(
 }
 
 const reset_state_sequence = "\x0f\x1b(B" ++
-    "\x1b[0m\x1b[0 q\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?7h" ++
+    "\x1b[0m\x1b[0 q\x1b[2l\x1b[12h\x1b[20l" ++
+    "\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?7h\x1b[?8h" ++
     "\x1b[4l\x1b[r\x1b[?69l\x1b[?25h" ++
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l" ++
-    "\x1b[?2004l\x1b[?1004l\x1b[?2048l\x1b[>4;0m\x1b[=0;1u";
-const restore_terminal_sequence = reset_state_sequence ++ "\x1b[?2026l\x1b[?2031l";
+    "\x1b[?66l\x1b[?67l\x1b[?1035l\x1b[?1036l\x1b[?1039l" ++
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l" ++
+    "\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?2033l\x1b[?2048l" ++
+    "\x1b[>4;0m\x1b[=0;1u";
+const restore_terminal_sequence = reset_state_sequence ++ "\x1b[?2026l";
 const sanitize_sequence = reset_state_sequence ++ "\x1b[H\x1b[2J";
 
 const ViewportRow = struct {
@@ -3603,6 +3875,29 @@ fn kittyKeyCommand(key: KittyKey) ?u8 {
     return @intCast(key.codepoint);
 }
 
+fn parseModifyOtherKey(input: []const u8) ?KittyKey {
+    const max_len = 64;
+    if (input.len < 8 or !std.mem.startsWith(u8, input, "\x1b[27;")) return null;
+
+    var end: usize = 5;
+    while (end < input.len and end < max_len) : (end += 1) {
+        const byte = input[end];
+        if (byte == '~') break;
+        if (!std.ascii.isDigit(byte) and byte != ';') return null;
+    }
+    if (end >= input.len or input[end] != '~') return null;
+
+    var fields = std.mem.splitScalar(u8, input[5..end], ';');
+    const modifiers_text = fields.next() orelse return null;
+    const codepoint_text = fields.next() orelse return null;
+    if (fields.next() != null or modifiers_text.len == 0 or codepoint_text.len == 0) return null;
+    return .{
+        .codepoint = std.fmt.parseUnsigned(u21, codepoint_text, 10) catch return null,
+        .modifiers = std.fmt.parseUnsigned(u16, modifiers_text, 10) catch return null,
+        .len = end + 1,
+    };
+}
+
 const PrefixParser = struct {
     pending: bool = false,
 
@@ -3638,6 +3933,15 @@ const PrefixParser = struct {
                 continue;
             }
             if (parseKittyKey(input[i..])) |key| {
+                if (kittyKeyIsPrefix(key)) {
+                    if (start < i) try result.forwarded.appendSlice(alloc, input[start..i]);
+                    self.pending = true;
+                    i += key.len;
+                    start = i;
+                    continue;
+                }
+            }
+            if (parseModifyOtherKey(input[i..])) |key| {
                 if (kittyKeyIsPrefix(key)) {
                     if (start < i) try result.forwarded.appendSlice(alloc, input[start..i]);
                     self.pending = true;
@@ -3914,6 +4218,10 @@ const App = struct {
     host_effect_mirror: HostEffectMirror = .{},
     raw_control_scanner: RawControlScanner = .{},
     outer_input_filter: OuterInputFilter = .{},
+    outer_input_protocol: OuterInputProtocol = .{},
+    deferred_outer_reports: std.ArrayList(DeferredOuterReportDelivery) = .empty,
+    pending_color_queries: std.ArrayList(PendingColorQuery) = .empty,
+    deferred_outer_report_due_ns: ?i128 = null,
     outer_primary_touched: bool = false,
     outer_alternate_touched: bool = false,
     outer_primary_graphics: RawGraphicsOwnership = .{},
@@ -4023,6 +4331,7 @@ const App = struct {
             .cell_size = cell_size,
             .tmux_runtime = tmux_runtime,
             .control_connections = .empty,
+            .outer_input_protocol = .{ .state = .fromPane(main_pane) },
             .terminal_restore_needed = !config.seamless,
         };
     }
@@ -4033,6 +4342,8 @@ const App = struct {
         if (self.split_pane) |pane| pane.destroy();
         self.main_pane.destroy();
         self.input_buffer.deinit(self.alloc);
+        self.deferred_outer_reports.deinit(self.alloc);
+        self.pending_color_queries.deinit(self.alloc);
         self.deferred_main_state.deinit(self.alloc);
         self.compositor.deinit();
         self.outer_primary_graphics.deinit(self.alloc);
@@ -4044,8 +4355,7 @@ const App = struct {
 
     fn run(self: *App) !void {
         if (self.composed) {
-            self.beginOuterComposition();
-            try outer_terminal.write(mux_mouse_enable);
+            try self.beginOuterComposition();
             self.terminal_restore_needed = true;
             self.compositor.invalidate();
             try self.compositor.render(self.layout, self.main_pane, self.split_pane, true);
@@ -4147,6 +4457,9 @@ const App = struct {
                     }
                 }
             }
+            if (self.deferred_outer_reports.items.len > 0) {
+                pane_stats.merge(try self.drainReadyPanes(interactive_pty_drain_budget_ns));
+            }
             if (pane_stats.bytes > 0) {
                 const drain_now = nanoTimestamp();
                 pane_stats.merge(try self.drainReadyPanes(self.render_scheduler.ptyDrainBudget(drain_now, pane_stats)));
@@ -4169,6 +4482,9 @@ const App = struct {
             // the next otherwise-idle turn so sustained passthrough retains
             // direct-path throughput and interactive gaps still converge.
             if (pane_stats.bytes == 0) self.advanceDeferredMainState();
+            if (try self.flushDeferredOuterReportsIfDue(nanoTimestamp())) {
+                self.render_scheduler.noteInput(nanoTimestamp());
+            }
             try self.closeAutoSplitIfExited();
 
             if (self.composed and
@@ -4189,9 +4505,13 @@ const App = struct {
         self.render_scheduler.rendered(nanoTimestamp());
     }
 
-    fn beginOuterComposition(self: *App) void {
+    fn beginOuterComposition(self: *App) !void {
         self.screen_switch_mirror.reset();
         self.host_effect_mirror.reset();
+        var bytes: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&bytes);
+        try self.outer_input_protocol.enterComposed(.fromPane(self.main_pane), &writer);
+        try outer_terminal.write(writer.buffered());
         self.outer_primary_touched = false;
         self.outer_alternate_touched = false;
         switch (self.main_pane.term.screens.active_key) {
@@ -4298,6 +4618,16 @@ const App = struct {
         }
 
         if (self.outer_input_filter.due_ns) |due_ns| {
+            if (now_ns >= due_ns) return 0;
+            const remaining_ns = due_ns - now_ns;
+            const remaining_ms: i32 = @intCast(@max(
+                @as(i128, 1),
+                @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+            ));
+            timeout = @min(timeout, remaining_ms);
+        }
+
+        if (self.deferred_outer_report_due_ns) |due_ns| {
             if (now_ns >= due_ns) return 0;
             const remaining_ns = due_ns - now_ns;
             const remaining_ms: i32 = @intCast(@max(
@@ -4416,19 +4746,75 @@ const App = struct {
         return count == expected;
     }
 
+    fn deferredOuterReport(sequence: []const u8) ?DeferredOuterReport {
+        if (std.mem.eql(u8, sequence, "\x1b[I")) return .focus_in;
+        if (std.mem.eql(u8, sequence, "\x1b[O")) return .focus_out;
+        if (std.mem.eql(u8, sequence, "\x1b[?997;1n")) return .color_scheme_dark;
+        if (std.mem.eql(u8, sequence, "\x1b[?997;2n")) return .color_scheme_light;
+        if (std.mem.eql(u8, sequence, "\x1b[?999;1n")) return .visibility_visible;
+        if (std.mem.eql(u8, sequence, "\x1b[?999;2n")) return .visibility_hidden;
+        return null;
+    }
+
+    fn queueOuterReport(self: *App, report: DeferredOuterReport) !void {
+        const query: ?PendingColorQuery = switch (report) {
+            .color_scheme_dark, .color_scheme_light => if (self.pending_color_queries.items.len > 0)
+                self.pending_color_queries.orderedRemove(0)
+            else
+                null,
+            else => null,
+        };
+        const scheme: ?vt.device_status.ColorScheme = switch (report) {
+            .color_scheme_dark => .dark,
+            .color_scheme_light => .light,
+            else => null,
+        };
+        if (scheme) |value| {
+            self.main_pane.color_scheme = value;
+            if (self.split_pane) |pane| pane.color_scheme = value;
+        }
+        const visible: ?bool = switch (report) {
+            .visibility_visible => true,
+            .visibility_hidden => false,
+            else => null,
+        };
+        if (visible) |value| {
+            self.main_pane.term.flags.visible = value;
+            if (self.split_pane) |pane| pane.term.flags.visible = value;
+        }
+        try self.deferred_outer_reports.append(self.alloc, .{
+            .report = report,
+            .query = query,
+        });
+        if (self.deferred_outer_report_due_ns == null) {
+            self.deferred_outer_report_due_ns = nanoTimestamp() + terminal_report_settle_ns;
+        }
+    }
+
     fn finishOuterInputSequence(
         self: *App,
         out: *std.ArrayList(u8),
     ) !void {
         const sequence = self.outer_input_filter.buffered();
         if (self.outer_input_filter.bracketed_paste) {
-            try out.appendSlice(self.alloc, sequence);
             if (std.mem.eql(u8, sequence, "\x1b[201~")) {
+                if (self.outer_input_filter.paste_forward_markers) {
+                    try out.appendSlice(self.alloc, sequence);
+                }
                 self.outer_input_filter.bracketed_paste = false;
+                self.outer_input_filter.paste_forward_markers = false;
+            } else {
+                try out.appendSlice(self.alloc, sequence);
             }
         } else if (std.mem.eql(u8, sequence, "\x1b[200~")) {
-            try out.appendSlice(self.alloc, sequence);
             self.outer_input_filter.bracketed_paste = true;
+            self.outer_input_filter.paste_forward_markers = !self.composed or
+                self.outer_input_protocol.state.bracketed_paste;
+            if (self.outer_input_filter.paste_forward_markers) {
+                try out.appendSlice(self.alloc, sequence);
+            }
+        } else if (deferredOuterReport(sequence)) |report| {
+            try self.queueOuterReport(report);
         } else if (isSizeReportResponse(sequence)) {
             std.log.scoped(.input).warn("discarded unsolicited terminal size report", .{});
         } else {
@@ -4497,6 +4883,41 @@ const App = struct {
         try self.dispatchInput(pending[0..len]);
     }
 
+    fn flushDeferredOuterReportsIfDue(self: *App, now_ns: i128) !bool {
+        const due_ns = self.deferred_outer_report_due_ns orelse return false;
+        if (now_ns < due_ns) return false;
+
+        const state = self.outer_input_protocol.state;
+        var forwarded = false;
+        for (self.deferred_outer_reports.items) |delivery| {
+            const report = delivery.report;
+            if (delivery.query) |query| {
+                if (self.paneForId(query.pane)) |pane| {
+                    pane.writeTerminalReply(report.bytes(), query.owner);
+                    forwarded = true;
+                }
+                continue;
+            }
+            const subscribed = switch (report) {
+                .focus_in, .focus_out => state.focus_event,
+                .color_scheme_dark, .color_scheme_light => state.report_color_scheme,
+                .visibility_visible, .visibility_hidden => state.report_visibility,
+            };
+            if (subscribed) {
+                try self.main_pane.writeInput(report.bytes());
+                forwarded = true;
+            } else {
+                std.log.scoped(.input).warn(
+                    "discarded terminal report {s} while its pane subscription is disabled",
+                    .{@tagName(report)},
+                );
+            }
+        }
+        self.deferred_outer_reports.clearRetainingCapacity();
+        self.deferred_outer_report_due_ns = null;
+        return forwarded;
+    }
+
     fn processComposedInputBuffer(self: *App) !void {
         var forward_start: usize = 0;
         var cursor: usize = 0;
@@ -4555,7 +4976,8 @@ const App = struct {
         }
         var result = try self.prefix.feed(self.alloc, bytes);
         defer result.deinit(self.alloc);
-        if (result.forwarded.items.len > 0) {
+        const keyboard_disabled = self.composed and self.outer_input_protocol.state.keyboard_disabled;
+        if (!keyboard_disabled and result.forwarded.items.len > 0) {
             try self.main_pane.writeInput(result.forwarded.items);
         }
         if (result.close_split) {
@@ -4617,7 +5039,22 @@ const App = struct {
                     return;
                 }
 
-                const delta: isize = switch (event.wheelAction() orelse return) {
+                const wheel = event.wheelAction() orelse return;
+                if (pane.term.screens.active_key == .alternate and
+                    pane.term.modes.get(.mouse_alternate_scroll))
+                {
+                    const application = pane.term.modes.get(.cursor_keys);
+                    const sequence: []const u8 = switch (wheel) {
+                        .up => if (application) "\x1bOA" else "\x1b[A",
+                        .down => if (application) "\x1bOB" else "\x1b[B",
+                        .right => if (application) "\x1bOC" else "\x1b[C",
+                        .left => if (application) "\x1bOD" else "\x1b[D",
+                    };
+                    try pane.writeInput(sequence);
+                    return;
+                }
+
+                const delta: isize = switch (wheel) {
                     .up => -wheel_scroll_rows,
                     .down => wheel_scroll_rows,
                     .left, .right => return,
@@ -4715,11 +5152,35 @@ const App = struct {
             self.flushDeferredMainState();
             try self.mirrorMainScreenSwitches(bytes);
             pane.feedWithReplies(bytes, pane.foregroundPgrp());
+            try self.syncOuterInputProtocol();
             self.syncMainPassthroughCursor();
         } else {
             pane.feedWithReplies(bytes, pane.foregroundPgrp());
         }
+        try self.flushPaneOuterQueries(pane, which);
         return n;
+    }
+
+    fn flushPaneOuterQueries(self: *App, pane: *Pane, which: WhichPane) !void {
+        const count = pane.color_scheme_queries_to_outer;
+        if (count == 0) return;
+        const query = PendingColorQuery{
+            .pane = switch (which) {
+                .main => .main,
+                .split => .split,
+            },
+            .owner = pane.color_scheme_query_owner,
+        };
+        pane.color_scheme_queries_to_outer = 0;
+        pane.color_scheme_query_owner = null;
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.alloc);
+        for (0..count) |_| {
+            try self.pending_color_queries.append(self.alloc, query);
+            try bytes.appendSlice(self.alloc, "\x1b[?996n");
+        }
+        try outer_terminal.write(bytes.items);
     }
 
     fn mirrorMainScreenSwitches(self: *App, bytes: []const u8) !void {
@@ -4736,6 +5197,13 @@ const App = struct {
         if (mirrored.items.len == 0) return;
         try outer_terminal.write(mirrored.items);
         self.compositor.invalidate();
+    }
+
+    fn syncOuterInputProtocol(self: *App) !void {
+        var bytes: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&bytes);
+        try self.outer_input_protocol.sync(.fromPane(self.main_pane), &writer);
+        if (writer.buffered().len > 0) try outer_terminal.write(writer.buffered());
     }
 
     fn rawModeNeedsPaneState(self: *const App) bool {
@@ -4856,7 +5324,8 @@ const App = struct {
                 std.mem.eql(u8, body, "6") or
                 std.mem.eql(u8, body, "?6") or
                 std.mem.eql(u8, body, "?996") or
-                std.mem.eql(u8, body, "?997"),
+                std.mem.eql(u8, body, "?997") or
+                std.mem.eql(u8, body, "?998"),
             'p' => std.mem.startsWith(u8, body, "?") and
                 std.mem.endsWith(u8, body, "$") and
                 body.len > 2,
@@ -4877,6 +5346,7 @@ const App = struct {
     }
 
     fn noteRawControlSequence(self: *App, sequence: []const u8) void {
+        self.outer_input_protocol.noteRawControlSequence(sequence);
         if (std.mem.eql(u8, sequence, "\x1bc")) {
             self.main_pane.in_band_size_owner = null;
         }
@@ -5338,7 +5808,7 @@ const App = struct {
         self.scrollbar_drag = null;
         const pane = try self.createSplitPaneFrom(argv, env, cwd, self.layout.split_rows);
         errdefer pane.destroy();
-        self.beginOuterComposition();
+        try self.beginOuterComposition();
         try self.removeRawGraphicsForComposition();
         try self.main_pane.resize(self.layout.main_rows, self.layout.paneCols(), self.cell_size);
 
@@ -5348,7 +5818,6 @@ const App = struct {
         self.next_split_generation = if (generation == std.math.maxInt(u64)) 1 else generation + 1;
         self.split_generation = generation;
         self.composed = true;
-        try outer_terminal.write(mux_mouse_enable);
         self.terminal_restore_needed = true;
         self.compositor.invalidate();
         try self.compositor.render(self.layout, self.main_pane, self.split_pane, true);
@@ -5395,6 +5864,7 @@ const App = struct {
         self.outer_alternate_touched = false;
         self.screen_switch_mirror.reset();
         self.host_effect_mirror.reset();
+        self.outer_input_protocol.adoptRaw(.fromPane(self.main_pane));
     }
 
     fn renderMainOnOuterScreen(
@@ -5868,6 +6338,96 @@ test "composed pending resize waits for quiet deadline" {
     try std.testing.expect(app.resize_due_ns == null);
     try std.testing.expectEqual(@as(u16, 32), app.last_size.row);
     try std.testing.expectEqual(@as(u16, 120), app.last_size.col);
+}
+
+test "outer input protocol establishes and synchronizes composed input state" {
+    var protocol_state: OuterInputProtocol = .{};
+    const desired: PaneInputState = .{
+        .encoding = .{
+            .linefeed = true,
+            .cursor_keys = true,
+            .keypad_keys = true,
+            .backarrow_key_mode = true,
+            .ignore_keypad_with_numlock = true,
+            .alt_esc_prefix = true,
+            .alt_sends_escape = true,
+            .modify_other_keys_2 = true,
+            .kitty_flags = 5,
+        },
+        .focus_event = true,
+        .bracketed_paste = true,
+    };
+
+    var enter_bytes: [1024]u8 = undefined;
+    var enter_writer = std.Io.Writer.fixed(&enter_bytes);
+    try protocol_state.enterComposed(desired, &enter_writer);
+    const enter = enter_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, enter, composed_input_reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, composed_input_capture) != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[12h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[20h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[?1h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[?66h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[?67h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[?1035h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[?1036h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[?1039h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[>4;2m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enter, "\x1b[=5;1u") != null);
+
+    var reset = desired;
+    reset.encoding.cursor_keys = false;
+    reset.encoding.modify_other_keys_2 = false;
+    reset.encoding.kitty_flags = 0;
+    reset.focus_event = false;
+    reset.bracketed_paste = false;
+    var sync_bytes: [256]u8 = undefined;
+    var sync_writer = std.Io.Writer.fixed(&sync_bytes);
+    try protocol_state.sync(reset, &sync_writer);
+    const synced = sync_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, synced, "\x1b[?1l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, synced, "\x1b[>4;0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, synced, "\x1b[=0;1u") != null);
+    try std.testing.expect(std.mem.indexOf(u8, synced, "\x1b[?1004l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, synced, "\x1b[?2004l") == null);
+}
+
+test "every terminal mode has an explicit input ownership policy" {
+    try std.testing.expectEqual(InputModePolicy.mirror_to_outer, inputModePolicy(.cursor_keys));
+    try std.testing.expectEqual(InputModePolicy.pin_outer_default, inputModePolicy(.autorepeat));
+    try std.testing.expectEqual(InputModePolicy.virtualize_in_mux, inputModePolicy(.focus_event));
+    try std.testing.expectEqual(InputModePolicy.synthesize_report, inputModePolicy(.report_visibility));
+    try std.testing.expectEqual(InputModePolicy.display_state, inputModePolicy(.wraparound));
+}
+
+test "outer input protocol observes raw report subscriptions" {
+    var protocol_state: OuterInputProtocol = .{};
+    protocol_state.noteRawControlSequence("\x1b[?1004h");
+    protocol_state.noteRawControlSequence("\x1b[?2004h");
+    protocol_state.noteRawControlSequence("\x1b[?2031h");
+    protocol_state.noteRawControlSequence("\x1b[?2033h");
+    try std.testing.expect(protocol_state.state.focus_event);
+    try std.testing.expect(protocol_state.state.bracketed_paste);
+    try std.testing.expect(protocol_state.state.report_color_scheme);
+    try std.testing.expect(protocol_state.state.report_visibility);
+
+    protocol_state.noteRawControlSequence("\x1b[?1004l");
+    protocol_state.noteRawControlSequence("\x1b[?2004l");
+    protocol_state.noteRawControlSequence("\x1b[?2031l");
+    protocol_state.noteRawControlSequence("\x1b[?2033l");
+    try std.testing.expect(!protocol_state.state.focus_event);
+    try std.testing.expect(!protocol_state.state.bracketed_paste);
+    try std.testing.expect(!protocol_state.state.report_color_scheme);
+    try std.testing.expect(!protocol_state.state.report_visibility);
+}
+
+test "prefix parser recognizes modifyOtherKeys control-b" {
+    const alloc = std.testing.allocator;
+    var parser: PrefixParser = .{};
+    var result = try parser.feed(alloc, "\x1b[27;5;98~x");
+    defer result.deinit(alloc);
+    try std.testing.expect(result.close_split);
+    try std.testing.expectEqual(@as(usize, 0), result.forwarded.items.len);
 }
 
 test "prefix parser closes split and forwards literal prefix" {
