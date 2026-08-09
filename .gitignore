@@ -1,6 +1,7 @@
 /target/
 /.zig-cache/
 /zig-out/
+/zig-pkg/
 /result
 /result-*
 /parity-artifacts*/

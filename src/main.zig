@@ -9,6 +9,7 @@ const shell_scripts = @import("shell_scripts.zig");
 const diagnostics = @import("diagnostics.zig");
 const os = @import("posix_compat.zig");
 const vt_trace = @import("vt_trace.zig");
+const graphics_protocol = @import("graphics_protocol.zig");
 const build_options = @import("tinymux_build_options");
 const EnvMap = std.process.Environ.Map;
 
@@ -120,6 +121,7 @@ const deferred_raw_bulk_catchup_ns: i128 = 6 * std.time.ns_per_ms;
 const deferred_raw_bulk_prealloc_trigger: usize = 32 * 1024;
 const deferred_raw_bulk_prealloc_bytes: usize = 16 * 1024 * 1024;
 const kitty_image_storage_limit: usize = 320 * 1024 * 1024;
+const kitty_image_loading_limits: @FieldType(vt.Terminal.Options, "kitty_image_loading_limits") = .direct;
 const kitty_upload_chunk_bytes: usize = 3000;
 const outer_image_id_start: u32 = 0x70000000;
 const default_cell_width: u32 = 8;
@@ -306,18 +308,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (args.len > 0 and std.mem.eql(u8, std.fs.path.basename(args[0]), "tmux")) {
-        const code = runTmuxShim(alloc, args[1..]) catch |err| blk: {
+    if (args.len > 0 and std.mem.eql(u8, std.fs.path.basename(args[0]), "kitty")) {
+        const code = runKittyShim(alloc, args[1..]) catch |err| blk: {
             var stderr = std.Io.File.stderr().writer(init.io, &.{});
-            try stderr.interface.print("tmux: tinymux compatibility failed: {s}\n", .{@errorName(err)});
+            try stderr.interface.print("kitty: tinymux compatibility failed: {s}\n", .{@errorName(err)});
             break :blk 1;
         };
         if (code != 0) std.process.exit(code);
-        return;
-    }
-
-    if (args.len > 0 and std.mem.eql(u8, std.fs.path.basename(args[0]), "tinymux-direnv-instant")) {
-        try runDirenvInstantWrapper(args[1..]);
         return;
     }
 
@@ -361,7 +358,7 @@ fn printUsage(err: anyerror) !void {
         \\
         \\usage:
         \\  tinymux --version
-        \\  tinymux session [--no-tmux-compat] -- <main-argv...>
+        \\  tinymux session [--no-kitty-compat] -- <main-argv...>
         \\  tinymux pane run [--rows <n>] -- <argv...>
         \\  tinymux pane close <generation>
         \\  tinymux pane status
@@ -373,7 +370,7 @@ fn printUsage(err: anyerror) !void {
         \\  tinymux handoff-apply --shell fish|sh|nu --state <dir>
         \\
         \\options:
-        \\  --no-tmux-compat    do not expose a private tmux shim to child processes
+        \\  --no-kitty-compat   do not expose the Kitty compatibility facade to child processes
         \\  session             run one seamless multiplexer for the main process lifetime
         \\  --seamless          avoid raw-mode terminal cleanup/redraw bytes unless a split is opened
         \\
@@ -414,7 +411,9 @@ fn selectTerm(choice: TermChoice, outer_term: ?[]const u8, colorterm: ?[]const u
 
 fn outerSupportsKittyGraphics(outer_term: ?[]const u8) bool {
     if (outer_term) |term| {
-        return containsIgnoreCase(term, "kitty") or containsIgnoreCase(term, "ghostty");
+        return containsIgnoreCase(term, "kitty") or
+            containsIgnoreCase(term, "ghostty") or
+            containsIgnoreCase(term, "wezterm");
     }
     return false;
 }
@@ -448,7 +447,7 @@ const Config = struct {
     split_cmd: ?[]const u8 = null,
     split_rows: u16 = default_split_rows,
     split_term: TermChoice = .auto,
-    tmux_compat: bool = true,
+    kitty_compat: bool = true,
     seamless: bool = false,
     session: bool = false,
     handoff_state: ?[]const u8 = null,
@@ -484,8 +483,8 @@ fn parseArgs(args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingSplitTerm;
             config.split_term = try TermChoice.parse(args[i]);
-        } else if (std.mem.eql(u8, arg, "--no-tmux-compat")) {
-            config.tmux_compat = false;
+        } else if (std.mem.eql(u8, arg, "--no-kitty-compat")) {
+            config.kitty_compat = false;
         } else if (std.mem.eql(u8, arg, "--seamless")) {
             config.seamless = true;
         } else if (std.mem.eql(u8, arg, "--handoff-state")) {
@@ -510,49 +509,6 @@ fn runInit(args: []const []const u8) !void {
 
     var stdout = std.Io.File.stdout().writer(currentIo(), &.{});
     try stdout.interface.writeAll(shell_scripts.initScript(shell));
-    try stdout.interface.flush();
-}
-
-fn runDirenvInstantWrapper(args: []const []const u8) !void {
-    if (args.len == 2 and std.mem.eql(u8, args[0], "hook")) {
-        try runDirenvInstantHook(args[1]);
-        return;
-    }
-    if (args.len == 2 and std.mem.eql(u8, args[0], "child-init")) {
-        try runDirenvInstantChildInit(args[1]);
-        return;
-    }
-    try printDirenvInstantUsage();
-    return error.InvalidDirenvInstantCommand;
-}
-
-fn printDirenvInstantUsage() !void {
-    var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
-    try stderr.interface.writeAll(
-        \\usage:
-        \\  tinymux-direnv-instant hook bash|zsh|fish|nu
-        \\  tinymux-direnv-instant child-init bash|zsh|fish|nu
-        \\
-    );
-    try stderr.interface.flush();
-}
-
-fn runDirenvInstantHook(shell_name: []const u8) !void {
-    const shell = shell_scripts.parseDirenvShell(shell_name) orelse return error.UnsupportedShell;
-
-    var stdout = std.Io.File.stdout().writer(currentIo(), &.{});
-    try stdout.interface.writeAll(shell_scripts.direnvHook(shell));
-    try stdout.interface.flush();
-}
-
-fn runDirenvInstantChildInit(shell_name: []const u8) !void {
-    const shell = shell_scripts.parseDirenvShell(shell_name) orelse return error.UnsupportedShell;
-    const child_init = shell_scripts.direnvChildInit(shell);
-
-    var stdout = std.Io.File.stdout().writer(currentIo(), &.{});
-    if (child_init.prefix) |prefix| try stdout.interface.writeAll(prefix);
-    try stdout.interface.writeAll(child_init.hook);
-    try stdout.interface.writeAll(child_init.guard);
     try stdout.interface.flush();
 }
 
@@ -847,6 +803,7 @@ fn handoffVarAllowed(key: []const u8) bool {
     if (std.mem.eql(u8, key, "TERM")) return false;
     if (std.mem.eql(u8, key, "SHELL")) return false;
     if (std.mem.startsWith(u8, key, "TMUX")) return false;
+    if (std.mem.startsWith(u8, key, "KITTY_")) return false;
     if (std.mem.eql(u8, key, "TINYMUX")) return false;
     if (std.mem.startsWith(u8, key, "TINYMUX_")) return false;
     return true;
@@ -904,8 +861,8 @@ fn writeJsonString(out: *std.Io.Writer, bytes: []const u8) !void {
     try out.writeByte('"');
 }
 
-const tmux_control_magic = "TINYMUX_TMUX_CONTROL_1";
 const native_control_magic = "TINYMUX_CONTROL_2";
+const kitty_split_rows_text = "10";
 const max_control_line: usize = 128;
 const max_control_frame: usize = 1024 * 1024;
 const max_control_items: usize = 4096;
@@ -913,8 +870,8 @@ const max_control_request: usize = 16 * 1024 * 1024;
 const max_control_connections: usize = 16;
 const control_connection_timeout_ns: i128 = 2 * std.time.ns_per_s;
 
-const SplitWindowCommand = struct {
-    rows: u16,
+const KittyLaunchCommand = struct {
+    address: ?[]const u8,
     argv: []const []const u8,
 };
 
@@ -929,25 +886,65 @@ const NativeCommand = union(enum) {
     pane_status,
 };
 
-const KillPaneCommand = struct {
-    target: ?[]const u8 = null,
-};
-
-const TmuxCommand = union(enum) {
-    split_window: SplitWindowCommand,
-    kill_pane: KillPaneCommand,
-};
-
-fn parseTmuxCommand(args: []const []const u8) !TmuxCommand {
-    if (args.len == 0) return error.MissingTmuxCommand;
-    const cmd = args[0];
-    if (std.mem.eql(u8, cmd, "split-window") or std.mem.eql(u8, cmd, "splitw")) {
-        return .{ .split_window = try parseTmuxSplitWindow(args[1..]) };
+fn parseKittyCommand(args: []const []const u8) !KittyLaunchCommand {
+    if (args.len == 0 or !std.mem.eql(u8, args[0], "@")) {
+        return error.MissingKittyRemoteControlMarker;
     }
-    if (std.mem.eql(u8, cmd, "kill-pane")) {
-        return .{ .kill_pane = try parseTmuxKillPane(args[1..]) };
+
+    var address: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len and !std.mem.eql(u8, args[i], "launch")) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--to")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKittyAddress;
+            address = args[i];
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--to=") and arg.len > "--to=".len) {
+            address = arg["--to=".len..];
+            i += 1;
+        } else {
+            return error.UnsupportedKittyGlobalOption;
+        }
     }
-    return error.UnsupportedTmuxCommand;
+    if (i >= args.len) return error.MissingKittyLaunchCommand;
+    i += 1;
+
+    var location_ok = false;
+    var keep_focus = false;
+    var self = false;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--location")) {
+            i += 1;
+            if (i >= args.len) return error.MissingKittyLocation;
+            if (!std.mem.eql(u8, args[i], "hsplit")) return error.UnsupportedKittyLocation;
+            location_ok = true;
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--location=") and arg.len > "--location=".len) {
+            if (!std.mem.eql(u8, arg["--location=".len..], "hsplit")) {
+                return error.UnsupportedKittyLocation;
+            }
+            location_ok = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--keep-focus")) {
+            keep_focus = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--self")) {
+            self = true;
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.UnsupportedKittyLaunchOption;
+        } else {
+            break;
+        }
+    }
+    if (!location_ok) return error.MissingKittyLocation;
+    if (!keep_focus) return error.MissingKittyKeepFocus;
+    if (!self) return error.MissingKittySelf;
+    if (i >= args.len) return error.MissingSplitCommand;
+
+    return .{ .address = address, .argv = args[i..] };
 }
 
 fn parseNativeCommand(args: []const []const u8) !NativeCommand {
@@ -963,7 +960,7 @@ fn parseNativeCommand(args: []const []const u8) !NativeCommand {
             } else if (std.mem.eql(u8, arg, "--rows")) {
                 i += 1;
                 if (i >= args.len) return error.MissingSplitRows;
-                rows = try parseTmuxRows(args[i]);
+                rows = try parseRows(args[i]);
                 i += 1;
             } else {
                 return error.UnsupportedPaneOption;
@@ -986,72 +983,20 @@ fn parseNativeCommand(args: []const []const u8) !NativeCommand {
     return error.UnsupportedControlCommand;
 }
 
-fn parseTmuxSplitWindow(args: []const []const u8) !SplitWindowCommand {
-    var rows: u16 = default_split_rows;
-    var i: usize = 0;
-    while (i < args.len) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--")) {
-            i += 1;
-            break;
-        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detached")) {
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "-l")) {
-            i += 1;
-            if (i >= args.len) return error.MissingSplitRows;
-            rows = try parseTmuxRows(args[i]);
-            i += 1;
-        } else if (std.mem.startsWith(u8, arg, "-l") and arg.len > 2) {
-            rows = try parseTmuxRows(arg[2..]);
-            i += 1;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return error.UnsupportedTmuxOption;
-        } else {
-            break;
-        }
-    }
-    if (i >= args.len) return error.MissingSplitCommand;
-    return .{ .rows = rows, .argv = args[i..] };
-}
-
-fn parseTmuxRows(value: []const u8) !u16 {
+fn parseRows(value: []const u8) !u16 {
     const rows = try std.fmt.parseUnsigned(u16, value, 10);
     if (rows == 0) return error.InvalidSplitRows;
     return rows;
 }
 
-fn parseTmuxKillPane(args: []const []const u8) !KillPaneCommand {
-    var target: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < args.len) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--")) {
-            i += 1;
-            if (i != args.len) return error.UnsupportedTmuxOption;
-            break;
-        } else if (std.mem.eql(u8, arg, "-t")) {
-            i += 1;
-            if (i >= args.len) return error.MissingTargetPane;
-            target = args[i];
-            i += 1;
-        } else if (std.mem.startsWith(u8, arg, "-t") and arg.len > 2) {
-            target = arg[2..];
-            i += 1;
-        } else {
-            return error.UnsupportedTmuxOption;
-        }
-    }
-    return .{ .target = target };
-}
-
-const TmuxRuntime = struct {
+const ControlRuntime = struct {
     session_id: []const u8,
     dir_path: []const u8,
     socket_path: []const u8,
-    shim_path: []const u8,
+    kitty_shim_dir: []const u8,
     server: std.Io.net.Server,
 
-    fn init(alloc: std.mem.Allocator) !TmuxRuntime {
+    fn init(alloc: std.mem.Allocator) !ControlRuntime {
         const tmp = getenv("TMPDIR") orelse "/tmp";
         var runtime_root = try alloc.dupe(u8, tmp);
         defer alloc.free(runtime_root);
@@ -1084,12 +1029,8 @@ const TmuxRuntime = struct {
         const socket_path = try std.fs.path.join(alloc, &.{ dir_path, "control.sock" });
         errdefer alloc.free(socket_path);
 
-        const shim_path = try std.fs.path.join(alloc, &.{ dir_path, "tmux" });
-        errdefer alloc.free(shim_path);
-
-        const self_exe = try std.process.executablePathAlloc(currentIo(), alloc);
-        defer alloc.free(self_exe);
-        try std.Io.Dir.symLinkAbsolute(currentIo(), self_exe, shim_path, .{});
+        const kitty_shim_dir = try kittyShimDirAlloc(alloc);
+        errdefer alloc.free(kitty_shim_dir);
 
         const address = try std.Io.net.UnixAddress.init(socket_path);
         var server = try address.listen(currentIo(), .{ .kernel_backlog = 16 });
@@ -1100,21 +1041,29 @@ const TmuxRuntime = struct {
             .session_id = session_id,
             .dir_path = dir_path,
             .socket_path = socket_path,
-            .shim_path = shim_path,
+            .kitty_shim_dir = kitty_shim_dir,
             .server = server,
         };
     }
 
-    fn deinit(self: *TmuxRuntime, alloc: std.mem.Allocator) void {
+    fn deinit(self: *ControlRuntime, alloc: std.mem.Allocator) void {
         self.server.deinit(currentIo());
         std.Io.Dir.cwd().deleteTree(currentIo(), self.dir_path) catch {};
-        alloc.free(self.shim_path);
+        alloc.free(self.kitty_shim_dir);
         alloc.free(self.socket_path);
         alloc.free(self.dir_path);
         alloc.free(self.session_id);
         self.* = undefined;
     }
 };
+
+fn kittyShimDirAlloc(alloc: std.mem.Allocator) ![]u8 {
+    const self_exe = try std.process.executablePathAlloc(currentIo(), alloc);
+    defer alloc.free(self_exe);
+    const bin_dir = std.fs.path.dirname(self_exe) orelse return error.InvalidExecutablePath;
+    const prefix = std.fs.path.dirname(bin_dir) orelse return error.InvalidExecutablePath;
+    return try std.fs.path.join(alloc, &.{ prefix, "libexec", "tinymux" });
+}
 
 fn ensurePrivateRuntimeDir(path: []const u8) bool {
     std.Io.Dir.createDirAbsolute(currentIo(), path, @enumFromInt(0o700)) catch |err| switch (err) {
@@ -1147,7 +1096,8 @@ const TinymuxEnvRole = enum {
 fn applyTinymuxEnv(
     alloc: std.mem.Allocator,
     env: *EnvMap,
-    runtime: ?*const TmuxRuntime,
+    runtime: ?*const ControlRuntime,
+    kitty_compat: bool,
     pane_id: []const u8,
     role: TinymuxEnvRole,
 ) !void {
@@ -1158,6 +1108,9 @@ fn applyTinymuxEnv(
     _ = env.swapRemove("TINYMUX_SHIM_DIR");
     _ = env.swapRemove("TMUX_PANE");
     _ = env.swapRemove("TMUX");
+    _ = env.swapRemove("KITTY_LISTEN_ON");
+    _ = env.swapRemove("KITTY_WINDOW_ID");
+    _ = env.swapRemove("KITTY_PID");
 
     if (role != .main_session) {
         // Host integration belongs only to the persistent main shell. Nested
@@ -1170,22 +1123,22 @@ fn applyTinymuxEnv(
     if (runtime) |rt| {
         try env.put("TINYMUX_SESSION_ID", rt.session_id);
         try env.put("TINYMUX_CONTROL", rt.socket_path);
-        try env.put("TINYMUX_TMUX_SOCKET", rt.socket_path);
-        try env.put("TINYMUX_SHIM_DIR", rt.dir_path);
-        try env.put("TMUX_PANE", pane_id);
-        const tmux_value = try std.fmt.allocPrint(
-            alloc,
-            "{s},{d},0",
-            .{ rt.socket_path, std.c.getpid() },
-        );
-        defer alloc.free(tmux_value);
-        try env.put("TMUX", tmux_value);
-        try prependPath(alloc, env, rt.dir_path);
+        if (kitty_compat) {
+            const listen_on = try std.fmt.allocPrint(alloc, "unix:{s}", .{rt.socket_path});
+            defer alloc.free(listen_on);
+            try env.put("KITTY_LISTEN_ON", listen_on);
+            try env.put("KITTY_WINDOW_ID", pane_id);
+            try prependPath(alloc, env, rt.kitty_shim_dir);
+        }
     }
 }
 
 fn prependPath(alloc: std.mem.Allocator, env: *EnvMap, dir: []const u8) !void {
     const current = env.get("PATH") orelse "";
+    var paths = std.mem.splitScalar(u8, current, ':');
+    while (paths.next()) |path| {
+        if (std.mem.eql(u8, path, dir)) return;
+    }
     const updated = if (current.len == 0)
         try alloc.dupe(u8, dir)
     else
@@ -1254,10 +1207,7 @@ const SocketReader = struct {
     }
 };
 
-const ControlProtocol = enum { tmux_v1, native_v2 };
-
 const ControlRequest = struct {
-    protocol: ControlProtocol,
     cwd: ?[]u8,
     argv: [][]u8,
     env: EnvMap,
@@ -1266,13 +1216,7 @@ const ControlRequest = struct {
         var reader: SocketReader = .{ .fd = fd };
         const magic = try reader.readLineAlloc(alloc, max_control_line);
         defer alloc.free(magic);
-        const control_protocol: ControlProtocol =
-            if (std.mem.eql(u8, magic, tmux_control_magic))
-                .tmux_v1
-            else if (std.mem.eql(u8, magic, native_control_magic))
-                .native_v2
-            else
-                return error.InvalidControlMagic;
+        if (!std.mem.eql(u8, magic, native_control_magic)) return error.InvalidControlMagic;
 
         const cwd_frame = try reader.readFrame(alloc);
         const cwd: ?[]u8 = if (cwd_frame.len == 0) cwd: {
@@ -1303,19 +1247,13 @@ const ControlRequest = struct {
             try env.putMove(key, value);
         }
 
-        return .{ .protocol = control_protocol, .cwd = cwd, .argv = argv, .env = env };
+        return .{ .cwd = cwd, .argv = argv, .env = env };
     }
 
     fn readBuffer(alloc: std.mem.Allocator, data: []const u8) !ControlRequest {
         var reader: ControlBufferReader = .{ .data = data };
         const magic = try reader.readLine(max_control_line);
-        const control_protocol: ControlProtocol =
-            if (std.mem.eql(u8, magic, tmux_control_magic))
-                .tmux_v1
-            else if (std.mem.eql(u8, magic, native_control_magic))
-                .native_v2
-            else
-                return error.InvalidControlMagic;
+        if (!std.mem.eql(u8, magic, native_control_magic)) return error.InvalidControlMagic;
 
         const cwd_frame = try reader.readFrame();
         const cwd: ?[]u8 = if (cwd_frame.len == 0)
@@ -1345,7 +1283,7 @@ const ControlRequest = struct {
         }
         if (reader.index != data.len) return error.TrailingControlData;
 
-        return .{ .protocol = control_protocol, .cwd = cwd, .argv = argv, .env = env };
+        return .{ .cwd = cwd, .argv = argv, .env = env };
     }
 
     fn deinit(self: *ControlRequest, alloc: std.mem.Allocator) void {
@@ -1467,31 +1405,49 @@ fn writeControlRequest(
     }
 }
 
-fn runTmuxShim(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
-    const socket_path = getenv("TINYMUX_TMUX_SOCKET") orelse {
+fn runKittyShim(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
+    const listen_on = getenv("KITTY_LISTEN_ON") orelse {
         var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
-        try stderr.interface.writeAll("tmux: not running inside tinymux tmux compatibility\n");
+        try stderr.interface.writeAll("kitty: not running inside tinymux Kitty compatibility\n");
         return 1;
     };
+    const socket_path = getenv("TINYMUX_CONTROL") orelse {
+        var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
+        try stderr.interface.writeAll("kitty: no tinymux control socket\n");
+        return 1;
+    };
+    const launch = try parseKittyCommand(args);
+    if (launch.address) |address| {
+        if (!std.mem.eql(u8, address, listen_on)) return error.KittyAddressMismatch;
+    }
+
+    var native_args = try alloc.alloc([]const u8, launch.argv.len + 5);
+    defer alloc.free(native_args);
+    native_args[0] = "pane";
+    native_args[1] = "run";
+    native_args[2] = "--rows";
+    native_args[3] = kitty_split_rows_text;
+    native_args[4] = "--";
+    std.mem.copyForwards([]const u8, native_args[5..], launch.argv);
+
     const address = try std.Io.net.UnixAddress.init(socket_path);
     const stream = try address.connect(currentIo());
     defer stream.close(currentIo());
 
-    try writeControlRequest(alloc, stream.socket.handle, tmux_control_magic, args);
+    try writeControlRequest(alloc, stream.socket.handle, native_control_magic, native_args);
     var response = try ControlResponse.read(alloc, stream.socket.handle);
     defer response.deinit(alloc);
 
     if (!response.ok) {
         var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
-        try stderr.interface.print("tmux: {s}\n", .{response.message});
+        try stderr.interface.print("kitty: {s}\n", .{response.message});
         return 1;
     }
     return 0;
 }
 
 fn runNativeControlClient(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
-    const socket_path = getenv("TINYMUX_CONTROL") orelse
-        getenv("TINYMUX_TMUX_SOCKET") orelse {
+    const socket_path = getenv("TINYMUX_CONTROL") orelse {
         var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
         try stderr.interface.writeAll("tinymux: no persistent session control socket\n");
         return 1;
@@ -2221,6 +2177,9 @@ const Pane = struct {
     color_scheme: ColorScheme = null,
     color_scheme_queries_to_outer: usize = 0,
     color_scheme_query_owner: ?posix.pid_t = null,
+    graphics_normalizer: graphics_protocol.Normalizer = .{},
+    graphics_seen: bool = false,
+    graphics_dropped: bool = false,
 
     pub const TerminalHandler = vt.TerminalStream.Handler;
     pub const Stream = vt.Stream(StreamHandler);
@@ -2359,7 +2318,7 @@ const Pane = struct {
                 .rows = rows,
                 .max_scrollback_bytes = scrollback_bytes,
                 .kitty_image_storage_limit = kitty_image_storage_limit,
-                .kitty_image_loading_limits = .direct,
+                .kitty_image_loading_limits = kitty_image_loading_limits,
             })
         else
             try initTerminal(alloc, .{
@@ -2377,6 +2336,7 @@ const Pane = struct {
 
     fn destroy(self: *Pane) void {
         self.terminate();
+        self.graphics_normalizer.deinit(self.alloc);
         self.stream.deinit();
         self.term.deinit(self.alloc);
         self.alloc.free(self.command_title);
@@ -4236,23 +4196,21 @@ const App = struct {
     pending_resize: ?ptypkg.Winsize = null,
     resize_due_ns: ?i128 = null,
     cell_size: CellSize,
-    tmux_runtime: ?TmuxRuntime = null,
+    control_runtime: ?ControlRuntime = null,
     control_connections: std.ArrayList(ControlConnection) = .empty,
     terminal_restore_needed: bool = false,
+    graphics_normalization_enabled: bool = false,
 
     fn init(alloc: std.mem.Allocator, config: Config) !App {
-        var tmux_runtime: ?TmuxRuntime = if (config.tmux_compat)
-            TmuxRuntime.init(alloc) catch |err| blk: {
-                var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
-                stderr.interface.print(
-                    "tinymux: control socket unavailable ({s}); continuing without pane control\n",
-                    .{@errorName(err)},
-                ) catch {};
-                break :blk null;
-            }
-        else
-            null;
-        errdefer if (tmux_runtime) |*runtime| runtime.deinit(alloc);
+        var control_runtime: ?ControlRuntime = ControlRuntime.init(alloc) catch |err| blk: {
+            var stderr = std.Io.File.stderr().writer(currentIo(), &.{});
+            stderr.interface.print(
+                "tinymux: control socket unavailable ({s}); continuing without pane control\n",
+                .{@errorName(err)},
+            ) catch {};
+            break :blk null;
+        };
+        errdefer if (control_runtime) |*runtime| runtime.deinit(alloc);
 
         const outer_size = ptypkg.getSize(stdout_fd) catch ptypkg.makeWinsize(24, 80);
         const cell_size = CellSize.fromWinsize(outer_size);
@@ -4276,8 +4234,9 @@ const App = struct {
         try applyTinymuxEnv(
             alloc,
             &main_env,
-            if (tmux_runtime) |*runtime| runtime else null,
-            "%0",
+            if (control_runtime) |*runtime| runtime else null,
+            config.kitty_compat,
+            "1",
             if (config.session) .main_session else .nested_main,
         );
         const main_pane = try Pane.create(
@@ -4296,7 +4255,14 @@ const App = struct {
             var split_env = try cloneEnvMap(alloc, &main_env);
             defer split_env.deinit();
             try split_env.put("TERM", selectTerm(config.split_term, outer_term, colorterm));
-            if (tmux_runtime != null) try split_env.put("TMUX_PANE", "%1");
+            try applyTinymuxEnv(
+                alloc,
+                &split_env,
+                if (control_runtime) |*runtime| runtime else null,
+                config.kitty_compat,
+                "2",
+                .auxiliary,
+            );
             const shell = getenv("SHELL") orelse "/bin/sh";
             const split_argv = [_][]const u8{ shell, "-lc", cmd };
             split_pane = try Pane.create(
@@ -4329,10 +4295,11 @@ const App = struct {
             .last_size = outer_size,
             .active_split_rows = config.split_rows,
             .cell_size = cell_size,
-            .tmux_runtime = tmux_runtime,
+            .control_runtime = control_runtime,
             .control_connections = .empty,
             .outer_input_protocol = .{ .state = .fromPane(main_pane) },
             .terminal_restore_needed = !config.seamless,
+            .graphics_normalization_enabled = outerSupportsKittyGraphics(outer_term),
         };
     }
 
@@ -4350,7 +4317,7 @@ const App = struct {
         self.outer_alternate_graphics.deinit(self.alloc);
         for (self.control_connections.items) |*connection| connection.deinit(self.alloc);
         self.control_connections.deinit(self.alloc);
-        if (self.tmux_runtime) |*runtime| runtime.deinit(self.alloc);
+        if (self.control_runtime) |*runtime| runtime.deinit(self.alloc);
     }
 
     fn run(self: *App) !void {
@@ -4383,7 +4350,7 @@ const App = struct {
             count += 1;
 
             var control_index: ?usize = null;
-            if (self.tmux_runtime) |*runtime| {
+            if (self.control_runtime) |*runtime| {
                 control_index = count;
                 fds_storage[count] = .{ .fd = runtime.server.socket.handle, .events = posix.POLL.IN, .revents = 0 };
                 count += 1;
@@ -4546,12 +4513,16 @@ const App = struct {
             self.main_pane.term.screens.switchTo(key);
             var deletes: std.ArrayList(u8) = .empty;
             defer deletes.deinit(self.alloc);
-            if (!try appendRawGraphicsRemoval(
+            if (self.main_pane.graphics_seen) {
+                try deletes.appendSlice(self.alloc, "\x1b_Ga=d,d=A,q=2;\x1b\\");
+            }
+            const removed_modeled = try appendRawGraphicsRemoval(
                 self.alloc,
                 &deletes,
                 self.main_pane,
                 self.rawGraphicsFor(key),
-            )) continue;
+            );
+            if (deletes.items.len == 0 and !removed_modeled) continue;
             if (selected_key != key) {
                 try out.appendSlice(self.alloc, switch (key) {
                     .primary => "\x1b[?1047l",
@@ -5144,7 +5115,30 @@ const App = struct {
             pane.markDead();
             return 0;
         }
-        const bytes = buf[0..n];
+        if (!self.graphics_normalization_enabled or
+            !pane.graphics_normalizer.needsProcessing(buf[0..n]))
+        {
+            try self.processPaneOutput(pane, which, buf[0..n]);
+            try self.flushPaneOuterQueries(pane, which);
+            return n;
+        }
+        var normalized: std.ArrayList(u8) = .empty;
+        defer normalized.deinit(self.alloc);
+        const normalization = try pane.graphics_normalizer.feed(
+            currentIo(),
+            self.alloc,
+            getenv("TMPDIR") orelse "/tmp",
+            buf[0..n],
+            &normalized,
+        );
+        pane.graphics_seen = pane.graphics_seen or normalization.graphics;
+        pane.graphics_dropped = pane.graphics_dropped or normalization.dropped;
+        try self.processPaneOutput(pane, which, normalized.items);
+        try self.flushPaneOuterQueries(pane, which);
+        return n;
+    }
+
+    fn processPaneOutput(self: *App, pane: *Pane, which: WhichPane, bytes: []const u8) !void {
         if (!self.composed and which == .main) {
             try self.forwardRawMainOutput(bytes);
         } else if (self.composed and which == .main) {
@@ -5157,8 +5151,6 @@ const App = struct {
         } else {
             pane.feedWithReplies(bytes, pane.foregroundPgrp());
         }
-        try self.flushPaneOuterQueries(pane, which);
-        return n;
     }
 
     fn flushPaneOuterQueries(self: *App, pane: *Pane, which: WhichPane) !void {
@@ -5207,7 +5199,7 @@ const App = struct {
     }
 
     fn rawModeNeedsPaneState(self: *const App) bool {
-        return self.config.split_cmd != null or self.tmux_runtime != null;
+        return self.config.split_cmd != null or self.control_runtime != null;
     }
 
     fn deferMainState(self: *App, bytes: []const u8) !void {
@@ -5578,12 +5570,12 @@ const App = struct {
         return try posix.poll(fds_storage[0..count], 0) > 0;
     }
 
-    fn tmuxRuntimePtr(self: *App) ?*const TmuxRuntime {
-        return if (self.tmux_runtime) |*runtime| runtime else null;
+    fn controlRuntimePtr(self: *App) ?*const ControlRuntime {
+        return if (self.control_runtime) |*runtime| runtime else null;
     }
 
     fn acceptControlConnections(self: *App) !void {
-        const runtime = if (self.tmux_runtime) |*runtime| runtime else return;
+        const runtime = if (self.control_runtime) |*runtime| runtime else return;
         const accepted = try runtime.server.accept(currentIo());
         const fd = accepted.socket.handle;
         if (self.control_connections.items.len >= max_control_connections) {
@@ -5644,20 +5636,14 @@ const App = struct {
 
     fn isControlClientError(err: anyerror) bool {
         return switch (err) {
-            error.MissingTmuxCommand,
-            error.UnsupportedTmuxCommand,
             error.MissingSplitRows,
             error.InvalidCharacter,
             error.Overflow,
             error.InvalidSplitRows,
-            error.UnsupportedTmuxOption,
             error.MissingSplitCommand,
             error.UnsupportedControlCommand,
             error.UnsupportedPaneOption,
             error.MissingPaneGeneration,
-            error.CannotKillMainPane,
-            error.UnsupportedTargetPane,
-            error.NoSplitPane,
             error.SplitAlreadyOpen,
             error.TerminalTooSmall,
             => true,
@@ -5686,54 +5672,26 @@ const App = struct {
         request: *ControlRequest,
         response_buf: []u8,
     ) ![]const u8 {
-        switch (request.protocol) {
-            .tmux_v1 => {
-                const command = try parseTmuxCommand(request.argv);
-                switch (command) {
-                    .split_window => |split| {
-                        try self.prepareAuxiliaryEnv(&request.env);
-                        _ = try self.openSplitWith(
-                            split.argv,
-                            &request.env,
-                            request.cwd,
-                            split.rows,
-                            true,
-                        );
-                    },
-                    .kill_pane => |kill| {
-                        if (kill.target) |target| {
-                            if (std.mem.eql(u8, target, "%0")) return error.CannotKillMainPane;
-                            if (!std.mem.eql(u8, target, "%1")) return error.UnsupportedTargetPane;
-                        }
-                        if (self.split_pane == null) return error.NoSplitPane;
-                        try self.closeSplit();
-                    },
-                }
-                return "";
+        const command = try parseNativeCommand(request.argv);
+        switch (command) {
+            .pane_run => |pane| {
+                try self.prepareAuxiliaryEnv(&request.env);
+                const generation = try self.openSplitWith(
+                    pane.argv,
+                    &request.env,
+                    request.cwd,
+                    pane.rows,
+                    true,
+                );
+                return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
             },
-            .native_v2 => {
-                const command = try parseNativeCommand(request.argv);
-                switch (command) {
-                    .pane_run => |pane| {
-                        try self.prepareAuxiliaryEnv(&request.env);
-                        const generation = try self.openSplitWith(
-                            pane.argv,
-                            &request.env,
-                            request.cwd,
-                            pane.rows,
-                            true,
-                        );
-                        return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
-                    },
-                    .pane_close => |generation| {
-                        if (self.split_generation == generation) try self.closeSplit();
-                        return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
-                    },
-                    .pane_status => {
-                        const generation = self.split_generation orelse return "none";
-                        return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
-                    },
-                }
+            .pane_close => |generation| {
+                if (self.split_generation == generation) try self.closeSplit();
+                return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
+            },
+            .pane_status => {
+                const generation = self.split_generation orelse return "none";
+                return try std.fmt.bufPrint(response_buf, "{d}", .{generation});
             },
         }
     }
@@ -5742,7 +5700,14 @@ const App = struct {
         const outer_term = getenv("TERM");
         const colorterm = getenv("COLORTERM");
         try env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
-        try applyTinymuxEnv(self.alloc, env, self.tmuxRuntimePtr(), "%1", .auxiliary);
+        try applyTinymuxEnv(
+            self.alloc,
+            env,
+            self.controlRuntimePtr(),
+            self.config.kitty_compat,
+            "2",
+            .auxiliary,
+        );
     }
 
     fn createSplitPaneFrom(
@@ -5772,7 +5737,14 @@ const App = struct {
         const outer_term = getenv("TERM");
         const colorterm = getenv("COLORTERM");
         try split_env.put("TERM", selectTerm(self.config.split_term, outer_term, colorterm));
-        try applyTinymuxEnv(self.alloc, &split_env, self.tmuxRuntimePtr(), "%1", .auxiliary);
+        try applyTinymuxEnv(
+            self.alloc,
+            &split_env,
+            self.controlRuntimePtr(),
+            self.config.kitty_compat,
+            "2",
+            .auxiliary,
+        );
 
         const cwd = std.process.currentPathAlloc(currentIo(), self.alloc) catch null;
         defer if (cwd) |path| self.alloc.free(path);
@@ -6030,64 +6002,72 @@ test "CLI parsing supports raw only mode" {
     const args = [_][]const u8{ "tinymux", "--", "vim" };
     const cfg = try parseArgs(&args);
     try std.testing.expect(cfg.split_cmd == null);
-    try std.testing.expect(cfg.tmux_compat);
+    try std.testing.expect(cfg.kitty_compat);
     try std.testing.expectEqualStrings("vim", cfg.main_argv[0]);
 }
 
-test "CLI parsing can disable tmux compatibility" {
-    const args = [_][]const u8{ "tinymux", "--no-tmux-compat", "--", "vim" };
+test "CLI parsing can disable Kitty compatibility" {
+    const args = [_][]const u8{ "tinymux", "--no-kitty-compat", "--", "vim" };
     const cfg = try parseArgs(&args);
-    try std.testing.expect(!cfg.tmux_compat);
+    try std.testing.expect(!cfg.kitty_compat);
     try std.testing.expectEqualStrings("vim", cfg.main_argv[0]);
 }
 
-test "tmux parser treats split-window argv as opaque" {
+test "Kitty parser accepts direnv-instant launch and keeps argv opaque" {
     const args = [_][]const u8{
-        "split-window",
-        "-d",
-        "-l",
-        "10",
+        "@",
+        "--to",
+        "unix:/tmp/tinymux.sock",
+        "launch",
+        "--location",
+        "hsplit",
+        "--keep-focus",
+        "--self",
         "/bin/direnv-instant",
         "watch",
         "/tmp/stderr",
         "/tmp/socket",
     };
-    const command = try parseTmuxCommand(&args);
-    switch (command) {
-        .split_window => |split| {
-            try std.testing.expectEqual(@as(u16, 10), split.rows);
-            try std.testing.expectEqualStrings("/bin/direnv-instant", split.argv[0]);
-            try std.testing.expectEqualStrings("watch", split.argv[1]);
-        },
-        else => return error.UnexpectedTmuxCommand,
-    }
+    const launch = try parseKittyCommand(&args);
+    try std.testing.expectEqualStrings("unix:/tmp/tinymux.sock", launch.address.?);
+    try std.testing.expectEqualStrings("/bin/direnv-instant", launch.argv[0]);
+    try std.testing.expectEqualStrings("watch", launch.argv[1]);
 }
 
-test "tmux parser accepts split alias and compact rows" {
-    const args = [_][]const u8{ "splitw", "-d", "-l7", "--", "sh", "-lc", "echo split" };
-    const command = try parseTmuxCommand(&args);
-    switch (command) {
-        .split_window => |split| {
-            try std.testing.expectEqual(@as(u16, 7), split.rows);
-            try std.testing.expectEqualStrings("sh", split.argv[0]);
-            try std.testing.expectEqualStrings("-lc", split.argv[1]);
-        },
-        else => return error.UnexpectedTmuxCommand,
-    }
+test "Kitty parser accepts equals options" {
+    const args = [_][]const u8{
+        "@",
+        "--to=unix:/tmp/tinymux.sock",
+        "launch",
+        "--location=hsplit",
+        "--keep-focus",
+        "--self",
+        "sh",
+        "-lc",
+        "echo split",
+    };
+    const launch = try parseKittyCommand(&args);
+    try std.testing.expectEqualStrings("unix:/tmp/tinymux.sock", launch.address.?);
+    try std.testing.expectEqualStrings("sh", launch.argv[0]);
+    try std.testing.expectEqualStrings("-lc", launch.argv[1]);
 }
 
-test "tmux parser accepts kill-pane target" {
-    const args = [_][]const u8{ "kill-pane", "-t", "%1" };
-    const command = try parseTmuxCommand(&args);
-    switch (command) {
-        .kill_pane => |kill| try std.testing.expectEqualStrings("%1", kill.target.?),
-        else => return error.UnexpectedTmuxCommand,
-    }
+test "Kitty parser rejects unsupported layouts" {
+    const args = [_][]const u8{
+        "@",
+        "launch",
+        "--location",
+        "vsplit",
+        "--keep-focus",
+        "--self",
+        "sh",
+    };
+    try std.testing.expectError(error.UnsupportedKittyLocation, parseKittyCommand(&args));
 }
 
-test "tmux parser rejects unsupported commands" {
-    const args = [_][]const u8{ "display-message", "hello" };
-    try std.testing.expectError(error.UnsupportedTmuxCommand, parseTmuxCommand(&args));
+test "Kitty parser rejects unsupported remote-control commands" {
+    const args = [_][]const u8{ "@", "ls" };
+    try std.testing.expectError(error.UnsupportedKittyGlobalOption, parseKittyCommand(&args));
 }
 
 test "control request failures distinguish client errors from transition failures" {
@@ -7048,7 +7028,7 @@ test "graphics update ignores text-only scroll dirty without placements" {
             .rows = 3,
             .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .direct,
+            .kitty_image_loading_limits = kitty_image_loading_limits,
         }),
         .stream = undefined,
     };
@@ -7199,7 +7179,7 @@ test "raw graphics handoff preserves application image references and placements
             .rows = 5,
             .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .direct,
+            .kitty_image_loading_limits = kitty_image_loading_limits,
         }),
         .stream = undefined,
     };
@@ -7285,7 +7265,7 @@ test "graphics replay keeps image upload cached across placement updates" {
             .rows = 5,
             .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .direct,
+            .kitty_image_loading_limits = kitty_image_loading_limits,
         }),
         .stream = undefined,
     };
@@ -7334,7 +7314,7 @@ test "graphics replay skips garbage placement pins after scrollback pruning" {
             .rows = 5,
             .max_scrollback_bytes = scrollback_bytes,
             .kitty_image_storage_limit = kitty_image_storage_limit,
-            .kitty_image_loading_limits = .direct,
+            .kitty_image_loading_limits = kitty_image_loading_limits,
         }),
         .stream = undefined,
     };

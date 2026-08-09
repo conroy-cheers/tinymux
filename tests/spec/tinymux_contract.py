@@ -32,7 +32,7 @@ class Session:
     def __init__(
         self,
         argv: Sequence[str],
-        extra_env: dict[str, str] | None = None,
+        extra_env: dict[str, str | None] | None = None,
         rows: int = DEFAULT_ROWS,
         cols: int = DEFAULT_COLS,
         cwd: str | None = None,
@@ -51,7 +51,11 @@ class Session:
         env.setdefault("TERM", "xterm-256color")
         env["SHELL"] = "/bin/sh"
         if extra_env is not None:
-            env.update(extra_env)
+            for key, value in extra_env.items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
 
         def acquire_controlling_terminal() -> None:
             fcntl = __import__("fcntl")
@@ -175,7 +179,7 @@ class ForkSession:
     def __init__(
         self,
         argv: Sequence[str],
-        extra_env: dict[str, str] | None = None,
+        extra_env: dict[str, str | None] | None = None,
         rows: int = DEFAULT_ROWS,
         cols: int = DEFAULT_COLS,
         cwd: str | None = None,
@@ -186,7 +190,11 @@ class ForkSession:
             env.setdefault("TERM", "xterm-256color")
             env["SHELL"] = "/bin/sh"
             if extra_env is not None:
-                env.update(extra_env)
+                for key, value in extra_env.items():
+                    if value is None:
+                        env.pop(key, None)
+                    else:
+                        env[key] = value
             if cwd is not None:
                 os.chdir(cwd)
             os.execvpe(argv[0], argv, env)
@@ -807,7 +815,8 @@ def test_persistent_split_hands_kitty_placements_back_to_raw_mode(tinymux: str) 
         "\\033_Ga=T,f=24,t=d,i=77,p=23,s=1,v=1,c=2,r=2,q=2;////\\033\\\\"
         "\\033[1;1HRAW_IMAGE_READY'; "
         "sleep 0.2; "
-        "tmux split-window -d -l 5 /bin/sh -lc 'sleep 0.4'; "
+        "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+        "/bin/sh -lc 'sleep 0.4'; "
         "sleep 1; "
         "printf 'RAW_IMAGE_CLOSE_DONE'; "
         "sleep 5"
@@ -840,6 +849,98 @@ def test_persistent_split_hands_kitty_placements_back_to_raw_mode(tinymux: str) 
         session.close()
 
 
+def test_persistent_split_tracks_kitty_file_transmissions(tinymux: str) -> None:
+    """Fastfetch's persistent file transport must participate in graphics handoff."""
+    png = (
+        "iVBORw0KGgoAAAANSUhEUgAAADIAAABMAQMAAAAV2XZDAAAAA1BMVEUrLzc5wwm5"
+        "AAAADklEQVR4AWOgIRgFowAAAmAAATnED6oAAAAASUVORK5CYII="
+    )
+    outer_id = 0x70000000
+    with tempfile.TemporaryDirectory(prefix="tinymux-kitty-file-") as directory:
+        image_path = os.path.join(directory, "fastfetch.png")
+        with open(image_path, "wb") as image_file:
+            image_file.write(__import__("base64").b64decode(png))
+        encoded_path = __import__("base64").b64encode(image_path.encode()).decode()
+        command = (
+            "printf '\\033[2;3H"
+            f"\\033_Ga=T,f=100,t=f,c=10,r=5,q=2;{encoded_path}\\033\\\\"
+            "\\033[8;1HFILE_IMAGE_READY'; "
+            "sleep 0.2; "
+            "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+            "/bin/sh -lc 'sleep 0.4'; "
+            "sleep 1; "
+            "printf 'FILE_IMAGE_CLOSE_DONE'; "
+            "sleep 5"
+        )
+        session = Session(
+            [tinymux, "session", "--", "/bin/sh", "-c", command],
+            extra_env={"TERM": "xterm-ghostty"},
+        )
+        try:
+            session.wait_for(b"FILE_IMAGE_CLOSE_DONE", timeout=8.0)
+            session.drain_until_idle(idle=0.2, timeout=3.0)
+            output = session.output
+
+            raw_upload = output.index(b"a=T,t=d,f=32,s=50,v=76,c=10,r=5")
+            raw_delete_all = output.index(b"a=d,d=A", raw_upload)
+            raw_delete = output.index(b"a=d,d=p,x=3,y=2", raw_delete_all)
+            managed_upload = output.index(
+                f"a=t,t=d,f=32,s=50,v=76,i={outer_id}".encode(), raw_delete
+            )
+            managed_delete = output.index(
+                f"a=d,d=I,i={outer_id}".encode(), managed_upload
+            )
+            restored_upload = output.index(b"a=t,t=d,f=32,s=50,v=76,i=", managed_delete)
+            restored_placement = output.index(b"a=p,i=", restored_upload)
+
+            assert b"t=f" not in output, "file transport escaped the normalization boundary"
+            assert encoded_path.encode() not in output, "local path leaked to the outer terminal"
+            assert raw_upload < raw_delete_all < raw_delete < managed_upload < managed_delete
+            assert managed_delete < restored_upload < restored_placement
+        finally:
+            session.close()
+
+
+def test_raw_iterm_image_is_normalized_to_kitty(tinymux: str) -> None:
+    png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    sequence = f"\\033]1337;File=inline=1;width=2;height=3:{png}\\007"
+    session = Session(
+        [tinymux, "session", "--", "/bin/sh", "-c", f"printf '{sequence}ITERM_DONE'; sleep 1"],
+        extra_env={"TERM": "xterm-ghostty"},
+    )
+    try:
+        session.wait_for(b"ITERM_DONE")
+        output = session.output
+        assert b"\x1b]1337;File=" not in output
+        assert b"a=T,t=d,f=32,s=1,v=1,c=2,r=3" in output
+    finally:
+        session.close()
+
+
+def test_raw_sixel_image_is_normalized_to_kitty(tinymux: str) -> None:
+    session = Session(
+        [
+            tinymux,
+            "session",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '\\033Pq#1;2;100;0;0~\\033\\\\SIXEL_DONE'; sleep 1",
+        ],
+        extra_env={"TERM": "xterm-ghostty"},
+    )
+    try:
+        session.wait_for(b"SIXEL_DONE")
+        output = session.output
+        assert b"\x1bPq" not in output
+        assert b"a=T,t=d,f=32,s=1,v=6" in output
+    finally:
+        session.close()
+
+
 def test_persistent_split_keeps_kitty_images_screen_local(tinymux: str) -> None:
     outer_id = 0x70000000
     command = (
@@ -849,7 +950,8 @@ def test_persistent_split_keeps_kitty_images_screen_local(tinymux: str) -> None:
         "\033_Ga=T,f=24,t=d,i=82,p=32,s=1,v=1,c=1,r=1,q=2;AAAA\033\\"
         "\033[1;1HSCREEN_IMAGE_READY'; "
         "sleep 0.2; "
-        "tmux split-window -d -l 5 /bin/sh -lc 'sleep 0.8'; "
+        "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+        "/bin/sh -lc 'sleep 0.8'; "
         "sleep 0.15; printf '\033[?47l'; "
         "sleep 0.15; printf '\033[?47h'; "
         "sleep 1; printf 'SCREEN_IMAGE_CLOSE_DONE'; sleep 5"
@@ -910,7 +1012,7 @@ def test_split_close_preserves_primary_terminal_without_whitespace(tinymux: str)
         command = (
             f"{lines}"
             "printf 'PRIMARY_PROMPT>'; "
-            "tmux split-window -d -l 5 "
+            "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
             f"/bin/sh -lc {shlex.quote(f'printf BOTTOM_WHITESPACE_TEST; sleep 0.2; touch {shlex.quote(ready)}')}; "
             f"while test ! -e {shlex.quote(ready)}; do sleep 0.02; done; "
             "sleep 0.5; "
@@ -949,11 +1051,12 @@ def test_split_close_preserves_primary_terminal_without_whitespace(tinymux: str)
             session.close()
 
 
-def test_in_place_split_resizes_main_like_tmux(tinymux: str) -> None:
+def test_in_place_split_resizes_main_for_kitty_launch(tinymux: str) -> None:
     script = (
         "import os, subprocess, time; "
         "print('SIZE_INITIAL_%d_%d' % os.get_terminal_size(0), flush=True); "
-        "subprocess.run(['tmux', 'split-window', '-d', '-l', '5', '/bin/sh', '-lc', "
+        "subprocess.run(['kitty', '@', '--to', os.environ['KITTY_LISTEN_ON'], 'launch', "
+        "'--location', 'hsplit', '--keep-focus', '--self', '/bin/sh', '-lc', "
         "'printf SIZE_SPLIT_READY; sleep 0.2'], check=True); "
         "print('SIZE_OPEN_%d_%d' % os.get_terminal_size(0), flush=True); "
         "time.sleep(1); "
@@ -963,7 +1066,7 @@ def test_in_place_split_resizes_main_like_tmux(tinymux: str) -> None:
     session = Session([tinymux, "session", "--", sys.executable, "-c", script])
     try:
         session.wait_for(b"SIZE_INITIAL_80_24")
-        session.wait_for(b"SIZE_OPEN_79_18")
+        session.wait_for(b"SIZE_OPEN_79_13")
         session.wait_for(b"SIZE_CLOSE_80_24")
         assert b"\x1b[?1049h" not in session.output
         assert b"\x1b[?1049l" not in session.output
@@ -974,7 +1077,8 @@ def test_in_place_split_resizes_main_like_tmux(tinymux: str) -> None:
 def test_split_close_reconciles_application_alternate_screen(tinymux: str) -> None:
     command = (
         "printf 'PRIMARY_BEFORE>'; "
-        "tmux split-window -d -l 5 /bin/sh -lc 'printf BOTTOM_ALT_TEST; sleep 0.2'; "
+        "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+        "/bin/sh -lc 'printf BOTTOM_ALT_TEST; sleep 0.2'; "
         "printf '\\033[?1049hALT_ACTIVE>'; "
         "sleep 1; "
         "printf '\\033[?1049lPRIMARY_AFTER>'; "
@@ -1131,6 +1235,7 @@ def test_handoff_apply_emits_safe_shell_state(tinymux: str) -> None:
                         "TERM": "should-not-apply",
                         "TINYMUX_INTERNAL": "should-not-apply",
                         "TMUX": "should-not-apply",
+                        "KITTY_LISTEN_ON": "should-not-apply",
                     }
                 )
                 subprocess.run(
@@ -1161,6 +1266,7 @@ def test_handoff_apply_emits_safe_shell_state(tinymux: str) -> None:
     assert "TERM" not in nu_applied["env"]
     assert "TINYMUX_INTERNAL" not in nu_applied["env"]
     assert "TMUX" not in nu_applied["env"]
+    assert "KITTY_LISTEN_ON" not in nu_applied["env"]
 
 
 def test_common_shell_init_outputs_entrypoint_functions(tinymux: str) -> None:
@@ -1174,111 +1280,9 @@ def test_common_shell_init_outputs_entrypoint_functions(tinymux: str) -> None:
         assert "handoff-apply" in script
 
 
-def direnv_wrapper_for(tinymux_abs: str) -> str:
-    wrapper = os.path.join(os.path.dirname(tinymux_abs), "tinymux-direnv-instant")
-    assert os.path.exists(wrapper), f"missing installed direnv wrapper next to tinymux: {wrapper}"
-    return wrapper
-
-
-def test_direnv_instant_wrapper_outputs_hooks(tinymux: str) -> None:
-    wrapper = direnv_wrapper_for(os.path.abspath(tinymux))
-    for shell in ("bash", "zsh", "fish", "nu", "nushell"):
-        script = subprocess.check_output([wrapper, "hook", shell], text=True)
-        assert "direnv-instant" in script
-        assert "__DIRENV_INSTANT_ENV_FILE" in script
-        assert "__DIRENV_INSTANT_STDERR_FILE" in script
-        assert "tinymux --seamless" not in script
-        assert "handoff-capture" not in script
-        assert "TINYMUX_DIRENV_ROOT" not in script
-
-
-def write_direnv_instant_stub(bin_dir: str) -> None:
-    stub = os.path.join(bin_dir, "direnv-instant")
-    with open(stub, "w", encoding="utf-8") as file:
-        file.write(
-            """#!/bin/sh
-set -eu
-
-find_envrc() {
-    dir=$PWD
-    while :; do
-        if [ -f "$dir/.envrc" ]; then
-            printf '%s\\n' "$dir"
-            return 0
-        fi
-        [ "$dir" = / ] && return 1
-        dir=${dir%/*}
-        [ -n "$dir" ] || dir=/
-    done
-}
-
-emit_export() {
-    # Test paths are mktemp paths without single quotes.
-    if [ "${DIRENV_INSTANT_SHELL:-}" = fish ]; then
-        printf "set -gx %s '%s'\\n" "$1" "$2"
-    else
-        printf "export %s='%s'\\n" "$1" "$2"
-    fi
-}
-
-emit_unset() {
-    if [ "${DIRENV_INSTANT_SHELL:-}" = fish ]; then
-        printf "set -e %s\\n" "$1"
-    else
-        printf "unset %s\\n" "$1"
-    fi
-}
-
-case "${1:-}" in
-    start)
-        root=$(find_envrc || true)
-        printf 'START|TINYMUX=%s|PWD=%s|ROOT=%s\\n' "${TINYMUX:-}" "$PWD" "$root" >> "$TINYMUX_DIRENV_STUB_LOG"
-        if [ -z "$root" ]; then
-            emit_unset __DIRENV_INSTANT_CURRENT_DIR
-            emit_unset __DIRENV_INSTANT_ENV_FILE
-            emit_unset __DIRENV_INSTANT_STDERR_FILE
-            emit_unset DIRENV_WRAPPED
-            exit 0
-        fi
-
-        env_file=$(mktemp "${TMPDIR:-/tmp}/tinymux-direnv-env.XXXXXX")
-        stderr_file=$(mktemp "${TMPDIR:-/tmp}/tinymux-direnv-stderr.XXXXXX")
-        DIRENV_INSTANT_SHELL=${DIRENV_INSTANT_SHELL:-} emit_export DIRENV_WRAPPED from-file > "$env_file"
-
-        emit_export __DIRENV_INSTANT_CURRENT_DIR "$root"
-        emit_export __DIRENV_INSTANT_ENV_FILE "$env_file"
-        emit_export __DIRENV_INSTANT_STDERR_FILE "$stderr_file"
-        if [ -n "${TINYMUX:-}" ]; then
-            emit_export DIRENV_WRAPPED inside
-            tmux split-window -d -l 5 /bin/sh -lc 'printf DIRENV_TINYMUX_LOG_READY; sleep 10'
-        else
-            emit_export DIRENV_WRAPPED outside
-        fi
-        ;;
-    stop)
-        printf 'STOP|PWD=%s\\n' "$PWD" >> "$TINYMUX_DIRENV_STUB_LOG"
-        ;;
-    *)
-        printf 'unexpected direnv-instant command: %s\\n' "${1:-}" >&2
-        exit 2
-        ;;
-esac
-"""
-        )
-    os.chmod(stub, 0o755)
-
-
-def direnv_wrapper_test_env(tinymux_abs: str, bash: str, root: str, bin_dir: str, log: str) -> dict[str, str]:
-    env = handoff_test_env(tinymux_abs, bash, root)
-    tinymux_dir = os.path.dirname(tinymux_abs)
-    env["PATH"] = f"{bin_dir}:{tinymux_dir}:{env.get('PATH', '')}"
-    env["TINYMUX_DIRENV_INSTANT_BIN"] = "direnv-instant"
-    env["TINYMUX_DIRENV_STUB_LOG"] = log
-    return env
-
-
 def wait_file_contains(path: str, marker: str, timeout: float = 5.0) -> str:
     deadline = time.monotonic() + timeout
+    content = ""
     while time.monotonic() < deadline:
         try:
             with open(path, "r", encoding="utf-8") as file:
@@ -1291,20 +1295,6 @@ def wait_file_contains(path: str, marker: str, timeout: float = 5.0) -> str:
     raise AssertionError(f"timed out waiting for {marker!r} in {path}; content={content!r}")
 
 
-def setup_direnv_wrapper_project(root: str) -> tuple[str, str, str, str]:
-    project = os.path.join(root, "project")
-    outside = os.path.join(root, "outside")
-    bin_dir = os.path.join(root, "bin")
-    log = os.path.join(root, "direnv-instant.log")
-    os.mkdir(project)
-    os.mkdir(outside)
-    os.mkdir(bin_dir)
-    with open(os.path.join(project, ".envrc"), "w", encoding="utf-8") as file:
-        file.write("export DIRENV_WRAPPED=real\n")
-    write_direnv_instant_stub(bin_dir)
-    return project, outside, bin_dir, log
-
-
 def write_fish_command(session: Session | ForkSession, command: str) -> None:
     """Submit a command to Fish's interactive reader.
 
@@ -1313,211 +1303,6 @@ def write_fish_command(session: Session | ForkSession, command: str) -> None:
     redraws the command line and can leave an end-to-end test hung.
     """
     session.write(command.encode() + b"\r")
-
-
-def test_direnv_instant_wrapper_enters_tinymux_and_returns_after_leaving_root(tinymux: str) -> None:
-    bash = shutil.which("bash")
-    if bash is None:
-        return
-
-    tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
-    with tempfile.TemporaryDirectory() as root:
-        project, outside, bin_dir, log = setup_direnv_wrapper_project(root)
-        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
-        session = ForkSession([bash, "--noprofile", "--norc", "-i"], extra_env=env)
-        try:
-            session.write(b"stty -echo\n")
-            session.write(b"PS1=''\n")
-            session.write(f'eval "$({shlex.quote(wrapper)} hook bash)"\n'.encode())
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-
-            enter_start = len(session.output)
-            session.write(f"cd {shlex.quote(project)}\n".encode())
-            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", enter_start, timeout=10.0)
-            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
-
-            leave_start = len(session.output)
-            session.write(f"cd {shlex.quote(outside)}\n".encode())
-            session.wait_for_after(b"\x1b[?1049l", leave_start, timeout=10.0)
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-
-            after_start = len(session.output)
-            session.write(b"printf '%s|%s|%s|%s\\n' AFTER \"$PWD\" \"${TINYMUX:-}\" \"${DIRENV_WRAPPED:-}\"\n")
-            session.wait_for_after(b"AFTER|", after_start, timeout=10.0)
-            after = session.output[after_start:]
-            expected = f"AFTER|{outside}||".encode()
-            assert expected in after, (
-                "leaving the direnv root did not restore the parent shell outside tinymux; "
-                f"expected={expected!r} output={after[-2000:]!r}"
-            )
-        finally:
-            session.close()
-
-
-def test_direnv_instant_fish_wrapper_enters_tinymux_without_env_command_error(tinymux: str) -> None:
-    fish = shutil.which("fish")
-    bash = shutil.which("bash")
-    if fish is None or bash is None:
-        return
-
-    tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
-    with tempfile.TemporaryDirectory() as root:
-        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
-        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
-        env["SHELL"] = fish
-        session = ForkSession([fish, "--no-config", "--interactive"], extra_env=env)
-        try:
-            write_fish_command(session, "function fish_prompt; end")
-            write_fish_command(session, f"{shlex.quote(wrapper)} hook fish | source")
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-
-            enter_start = len(session.output)
-            write_fish_command(session, f"cd {shlex.quote(project)}")
-            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", enter_start, timeout=10.0)
-            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
-            after = session.output[enter_start:]
-            assert b"env: \xe2\x80\x98command\xe2\x80\x99" not in after
-            assert b"env: 'command'" not in after, (
-                "fish hook tried to run a shell builtin through env; "
-                f"output={after[-2000:]!r}"
-            )
-        finally:
-            session.close()
-
-
-def test_direnv_instant_fish_wrapper_enters_tinymux_when_sourced_inside_root(tinymux: str) -> None:
-    fish = shutil.which("fish")
-    bash = shutil.which("bash")
-    if fish is None or bash is None:
-        return
-
-    tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
-    with tempfile.TemporaryDirectory() as root:
-        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
-        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
-        env["SHELL"] = fish
-        session = ForkSession([fish, "--no-config", "--interactive"], extra_env=env)
-        try:
-            write_fish_command(session, "function fish_prompt; end")
-            write_fish_command(session, f"cd {shlex.quote(project)}")
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-
-            start = len(session.output)
-            write_fish_command(session, f"{shlex.quote(wrapper)} hook fish | source")
-            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", start, timeout=10.0)
-            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
-            after = session.output[start:]
-            assert b"NotATerminal" not in after, (
-                "fish startup hook tried to capture handoff state while stdin was the source pipe; "
-                f"output={after[-2000:]!r}"
-            )
-        finally:
-            session.close()
-
-
-def test_direnv_instant_fish_startup_enters_before_parent_greeting(tinymux: str) -> None:
-    fish = shutil.which("fish")
-    bash = shutil.which("bash")
-    if fish is None or bash is None:
-        return
-
-    tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
-    with tempfile.TemporaryDirectory() as root:
-        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
-        xdg_config = os.path.join(root, "xdg-config")
-        fish_config_dir = os.path.join(xdg_config, "fish")
-        os.makedirs(fish_config_dir)
-        with open(os.path.join(fish_config_dir, "config.fish"), "w", encoding="utf-8") as file:
-            file.write(
-                f"""
-function fish_greeting
-    printf 'GREETING|TERM=%s|TINYMUX=%s\\n' "$TERM" "$TINYMUX"
-end
-{shlex.quote(wrapper)} hook fish | source
-"""
-            )
-
-        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
-        env["SHELL"] = fish
-        env["XDG_CONFIG_HOME"] = xdg_config
-        session = ForkSession([fish, "--interactive"], extra_env=env, cwd=project)
-        try:
-            session.wait_for(b"DIRENV_TINYMUX_LOG_READY", timeout=10.0)
-            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
-            assert b"NotATerminal" not in session.output, (
-                "fish startup hook tried to enter tinymux before reconnecting to /dev/tty; "
-                f"output={session.output[-2000:]!r}"
-            )
-            assert b"|TINYMUX=\r\n" not in session.output, (
-                "parent fish greeting ran before the tinymux handoff child took over; "
-                f"output={session.output[-2000:]!r}"
-            )
-            assert b"|TINYMUX=1" in session.output, (
-                "tinymux handoff child did not run the interactive fish greeting; "
-                f"output={session.output[-2000:]!r}"
-            )
-        finally:
-            session.close()
-
-
-def test_direnv_instant_fish_startup_drains_child_pty_without_input(tinymux: str) -> None:
-    """The child prompt must render before the physical terminal sends input."""
-    fish = shutil.which("fish")
-    bash = shutil.which("bash")
-    if fish is None or bash is None:
-        return
-
-    tinymux_abs = os.path.abspath(tinymux)
-    with tempfile.TemporaryDirectory() as root:
-        project, outside, bin_dir, log = setup_direnv_wrapper_project(root)
-        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
-        env["SHELL"] = fish
-        env["XDG_CONFIG_HOME"] = os.path.join(env["HOME"], ".config")
-
-        fish_config_dir = os.path.join(env["XDG_CONFIG_HOME"], "fish")
-        os.makedirs(fish_config_dir)
-        with open(os.path.join(fish_config_dir, "config.fish"), "w", encoding="utf-8") as file:
-            file.write(
-                """
-function fish_greeting; end
-function fish_prompt; printf 'TINYMUX_E2E_CHILD_PROMPT>'; end
-if set -q TINYMUX
-    printf 'TINYMUX_E2E_CHILD_CONFIG_READY\n'
-end
-"""
-            )
-
-        stub = os.path.join(bin_dir, "direnv-instant")
-        with open(stub, "r", encoding="utf-8") as file:
-            stub_text = file.read()
-        stub_text = stub_text.replace(
-            "tmux split-window -d -l 5 /bin/sh -lc 'printf DIRENV_TINYMUX_LOG_READY; sleep 10'",
-            ": # The startup regression is in seamless passthrough mode",
-        )
-        with open(stub, "w", encoding="utf-8") as file:
-            file.write(stub_text)
-
-        session = ForkSession(
-            [fish, "--no-config", "--interactive"],
-            extra_env=env,
-            cwd=outside,
-        )
-        try:
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-            write_fish_command(session, "tinymux-direnv-instant hook fish | source")
-            wait_file_contains(log, "TINYMUX=", timeout=10.0)
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-
-            write_fish_command(session, f"cd {shlex.quote(project)}")
-            wait_file_contains(log, "TINYMUX=1", timeout=10.0)
-            session.wait_for(b"TINYMUX_E2E_CHILD_CONFIG_READY", timeout=10.0)
-            session.wait_for(b"TINYMUX_E2E_CHILD_PROMPT>", timeout=10.0)
-        finally:
-            session.close()
 
 
 def test_seamless_fish_does_not_reload_host_terminal_integration_or_submit_keys(tinymux: str) -> None:
@@ -1614,68 +1399,6 @@ def test_seamless_child_does_not_inherit_host_terminal_integration_env(tinymux: 
         )
     finally:
         session.close()
-
-
-def test_direnv_instant_wrapper_child_exit_exits_parent_shell(tinymux: str) -> None:
-    bash = shutil.which("bash")
-    if bash is None:
-        return
-
-    tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
-    with tempfile.TemporaryDirectory() as root:
-        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
-        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
-        session = ForkSession([bash, "--noprofile", "--norc", "-i"], extra_env=env)
-        try:
-            session.write(b"stty -echo\n")
-            session.write(b"PS1=''\n")
-            session.write(f'eval "$({shlex.quote(wrapper)} hook bash)"\n'.encode())
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-
-            enter_start = len(session.output)
-            session.write(f"cd {shlex.quote(project)}\n".encode())
-            session.wait_for_after(b"DIRENV_TINYMUX_LOG_READY", enter_start, timeout=10.0)
-            wait_file_contains(log, "TINYMUX=1", timeout=5.0)
-
-            session.write(b"exit\n")
-            status = session.wait_exited(timeout=10.0)
-            assert os.WIFEXITED(status), f"parent shell did not exit cleanly: status={status}"
-        finally:
-            session.close()
-
-
-def test_direnv_instant_wrapper_skips_entry_inside_foreign_mux(tinymux: str) -> None:
-    bash = shutil.which("bash")
-    if bash is None:
-        return
-
-    tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
-    with tempfile.TemporaryDirectory() as root:
-        project, _, bin_dir, log = setup_direnv_wrapper_project(root)
-        env = direnv_wrapper_test_env(tinymux_abs, bash, root, bin_dir, log)
-        env["TMUX"] = "/tmp/foreign-tmux,123,0"
-        session = ForkSession([bash, "--noprofile", "--norc", "-i"], extra_env=env)
-        try:
-            session.write(b"stty -echo\n")
-            session.write(b"PS1=''\n")
-            session.write(f'eval "$({shlex.quote(wrapper)} hook bash)"\n'.encode())
-            session.drain_until_idle(idle=0.2, timeout=5.0)
-
-            session.write(f"cd {shlex.quote(project)}\n".encode())
-            wait_file_contains(log, f"PWD={project}", timeout=5.0)
-            after_start = len(session.output)
-            session.write(b"printf '%s|%s|%s\\n' SKIP \"${TINYMUX:-}\" \"${DIRENV_WRAPPED:-}\"\n")
-            session.wait_for_after(b"SKIP|", after_start, timeout=5.0)
-            after = session.output[after_start:]
-            assert b"SKIP||outside" in after, (
-                "wrapper entered tinymux even though a foreign mux was already active; "
-                f"output={after[-2000:]!r}"
-            )
-            assert b"DIRENV_TINYMUX_LOG_READY" not in after
-        finally:
-            session.close()
 
 
 def handoff_test_env(tinymux_abs: str, shell_path: str, root: str) -> dict[str, str]:
@@ -1779,7 +1502,8 @@ def test_persistent_main_preserves_host_integration_but_auxiliary_scrubs_it(tiny
             (
                 "printf 'SESSION_HOST_ENV|%s|%s\\n' "
                 "\"${GHOSTTY_RESOURCES_DIR:-}\" \"${GHOSTTY_SHELL_INTEGRATION_XDG_DIR:-}\"; "
-                "tmux split-window -d -l 4 /bin/sh -lc "
+                "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+                "/bin/sh -lc "
                 "'printf \"AUX_HOST_ENV|%s|%s\\n\" "
                 "\"${GHOSTTY_RESOURCES_DIR:-}\" \"${GHOSTTY_SHELL_INTEGRATION_XDG_DIR:-}\"; sleep 2'; "
                 "sleep 3"
@@ -2028,7 +1752,7 @@ def test_raw_only_does_not_parse_prefix(tinymux: str) -> None:
         session.close()
 
 
-def test_tmux_compat_env_and_private_shim(tinymux: str) -> None:
+def test_kitty_compat_env_and_private_shim(tinymux: str) -> None:
     session = Session(
         [
             tinymux,
@@ -2036,27 +1760,45 @@ def test_tmux_compat_env_and_private_shim(tinymux: str) -> None:
             "/bin/sh",
             "-c",
             (
-                "tmux_path=$(command -v tmux || true); "
-                "printf 'TMUX_ENV|%s|%s|%s|%s\\n' "
-                "\"$TINYMUX\" \"$TMUX_PANE\" \"${TMUX:+set}\" \"$tmux_path\"; "
+                "kitty_path=$(command -v kitty || true); "
+                "printf 'KITTY_ENV|%s|%s|%s|%s|%s|%s\\n' "
+                "\"$TINYMUX\" \"$KITTY_WINDOW_ID\" \"$KITTY_LISTEN_ON\" "
+                "\"${TMUX:-}\" \"${TMUX_PANE:-}\" \"$kitty_path\"; "
                 "cat"
             ),
         ]
     )
     try:
-        session.wait_for(b"TMUX_ENV|1|%0|set|")
+        session.wait_for(b"KITTY_ENV|1|1|unix:")
         line = next(
-            part for part in session.output.splitlines() if part.startswith(b"TMUX_ENV|")
+            part for part in session.output.splitlines() if part.startswith(b"KITTY_ENV|")
         )
-        assert b"/tinymux-" in line and line.rstrip().endswith(b"/tmux"), (
-            "tmux command did not resolve to tinymux's private shim; "
+        assert b"|||" in line
+        assert line.rstrip().endswith(b"/libexec/tinymux/kitty"), (
+            "kitty command did not resolve to tinymux's private shim; "
             f"line={line!r}"
         )
     finally:
         session.close()
 
 
-def test_real_direnv_instant_daemon_opens_tmux_split(tinymux: str) -> None:
+def test_kitty_compat_opt_out_keeps_native_control(tinymux: str) -> None:
+    tinymux_abs = os.path.abspath(tinymux)
+    command = (
+        "printf 'KITTY_DISABLED|%s|%s|%s|%s\\n' "
+        '"${KITTY_LISTEN_ON:-}" "${KITTY_WINDOW_ID:-}" "${TINYMUX_CONTROL:+set}" '
+        f'"$({shlex.quote(tinymux_abs)} pane status)"'
+    )
+    session = Session(
+        [tinymux_abs, "--no-kitty-compat", "--", "/bin/sh", "-c", command]
+    )
+    try:
+        session.wait_for(b"KITTY_DISABLED|||set|none")
+    finally:
+        session.close()
+
+
+def test_real_direnv_instant_daemon_opens_kitty_split(tinymux: str) -> None:
     """A fragmented request from the real daemon must reach the split pane."""
     bash = shutil.which("bash")
     direnv = shutil.which("direnv")
@@ -2086,6 +1828,7 @@ def test_real_direnv_instant_daemon_opens_tmux_split(tinymux: str) -> None:
             "XDG_CACHE_HOME": cache,
             "DIRENV_CONFIG": config,
             "DIRENV_INSTANT_MUX_DELAY": "0",
+            "DIRENV_INSTANT_KITTY_LAUNCH_ARGS": "--location\nhsplit\n--keep-focus\n--self",
         }
         allow_env = os.environ.copy()
         allow_env.update(env)
@@ -2132,7 +1875,6 @@ def test_real_direnv_instant_fish_is_usable_after_split_closes(tinymux: str) -> 
         return
 
     tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory(
         prefix="tinymux-fish-cache-", dir="/tmp"
     ) as cache:
@@ -2152,7 +1894,7 @@ def test_real_direnv_instant_fish_is_usable_after_split_closes(tinymux: str) -> 
         with open(os.path.join(project, ".envrc"), "w", encoding="utf-8") as file:
             file.write(
                 "printf 'TINYMUX_REAL_FISH_CTX|%s|%s|%s\\n' "
-                '"${TMUX-}" "${TINYMUX_CONTROL-}" "$(command -v tmux || true)" >&2\n'
+                '"${KITTY_LISTEN_ON-}" "${TINYMUX_CONTROL-}" "$(command -v kitty || true)" >&2\n'
                 "echo TINYMUX_REAL_FISH_PROGRESS >&2\n"
                 "sleep 1\n"
                 "echo TINYMUX_REAL_FISH_DONE >&2\n"
@@ -2164,7 +1906,7 @@ def test_real_direnv_instant_fish_is_usable_after_split_closes(tinymux: str) -> 
             "XDG_CACHE_HOME": cache,
             "DIRENV_CONFIG": config,
             "DIRENV_INSTANT_MUX_DELAY": "0",
-            "TINYMUX_DIRENV_INSTANT_BIN": direnv_instant,
+            "DIRENV_INSTANT_KITTY_LAUNCH_ARGS": "--location\nhsplit\n--keep-focus\n--self",
             "DIRENV_INSTANT_DEBUG_LOG": os.path.join(root, "direnv-instant.log"),
             "SHELL": fish,
             "PATH": f"{os.path.dirname(tinymux_abs)}:{os.environ.get('PATH', '')}",
@@ -2188,7 +1930,7 @@ def test_real_direnv_instant_fish_is_usable_after_split_closes(tinymux: str) -> 
         )
         try:
             write_fish_command(session, "function fish_prompt; printf 'TINYMUX_OUTER_FISH>'; end")
-            write_fish_command(session, f"{shlex.quote(wrapper)} hook fish | source")
+            write_fish_command(session, f"{shlex.quote(direnv_instant)} hook fish | source")
             session.drain_until_idle(idle=0.2, timeout=12.0)
 
             write_fish_command(session, f"cd {shlex.quote(project)}")
@@ -2234,7 +1976,8 @@ def assert_focus_event_does_not_leak(
             split_start = len(session.output)
             write_fish_command(
                 session,
-                "tmux split-window -d -l 5 /bin/sh -lc "
+                "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+                "/bin/sh -lc "
                 + shlex.quote("printf TINYMUX_SPLIT_READY; sleep 10"),
             )
             session.wait_for_after(b"TINYMUX_SPLIT_READY", split_start, timeout=8.0)
@@ -2369,7 +2112,7 @@ def test_color_scheme_queries_are_correlated_terminal_reports(tinymux: str) -> N
         session = Session(argv)
         try:
             session.wait_for(b"TINYMUX_COLOR_QUERY_SENT", timeout=8.0)
-            assert b"\x1b[?996n" in session.output
+            session.wait_for(b"\x1b[?996n", timeout=2.0)
             reply_start = len(session.output)
             session.write(b"\x1b[?997;1n")
             session.wait_for_after(
@@ -2471,7 +2214,6 @@ def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str)
         return
 
     tinymux_abs = os.path.abspath(tinymux)
-    wrapper = direnv_wrapper_for(tinymux_abs)
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory(
         prefix="tinymux-persistent-cache-", dir="/tmp"
     ) as cache:
@@ -2508,12 +2250,20 @@ def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str)
             "XDG_CACHE_HOME": cache,
             "DIRENV_CONFIG": config,
             "DIRENV_INSTANT_MUX_DELAY": "0",
-            "TINYMUX_DIRENV_INSTANT_BIN": direnv_instant,
+            "DIRENV_INSTANT_KITTY_LAUNCH_ARGS": "--location\nhsplit\n--keep-focus\n--self",
+            "DIRENV_DIFF": None,
+            "DIRENV_DIR": None,
+            "DIRENV_FILE": None,
+            "DIRENV_WATCHES": None,
             "SHELL": fish,
             "PATH": f"{os.path.dirname(tinymux_abs)}:{os.environ.get('PATH', '')}",
         }
         allow_env = os.environ.copy()
-        allow_env.update(env)
+        for key, value in env.items():
+            if value is None:
+                allow_env.pop(key, None)
+            else:
+                allow_env[key] = value
         for project in (project_a, project_b):
             subprocess.run(
                 [direnv, "allow", project],
@@ -2531,7 +2281,7 @@ def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str)
             controlling_terminal=True,
         )
         try:
-            write_fish_command(session, f"{shlex.quote(wrapper)} hook fish | source")
+            write_fish_command(session, f"{shlex.quote(direnv_instant)} hook fish | source")
             session.drain_until_idle(idle=0.2, timeout=12.0)
 
             offsets: list[int] = []
@@ -2555,10 +2305,10 @@ def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str)
             assert parsed[0][2] == parsed[1][2] and parsed[0][2], contexts
             assert parsed[0][3] == parsed[1][3] and parsed[0][3], contexts
             assert b"\xe2\x94\x80" in session.output[offsets[0] : offsets[1]], (
-                "root A did not render a split"
+                f"root A did not render a split: {session.output[offsets[0]:offsets[1]][-4000:]!r}"
             )
             assert b"\xe2\x94\x80" in session.output[offsets[1] :], (
-                "direct sibling root B did not render a split"
+                f"direct sibling root B did not render a split: {session.output[offsets[1]:][-4000:]!r}"
             )
 
             command_offset = len(session.output)
@@ -2696,57 +2446,36 @@ def test_native_pane_generations_ignore_stale_close(tinymux: str) -> None:
             session.close()
 
 
-def test_tmux_split_window_opens_split_and_keeps_main_focus(tinymux: str) -> None:
+def test_kitty_launch_opens_split_and_keeps_main_focus(tinymux: str) -> None:
     session = Session([tinymux, "--", "/bin/sh", "-c", "printf 'MAIN_READY\\n'; /bin/sh"])
     try:
         session.wait_for(b"MAIN_READY")
         session.write(b"stty -echo\n")
         session.drain_until_idle()
         session.write(
-            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_SPLIT_READY; sleep 5'\n"
+            b"kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+            b"/bin/sh -lc 'printf KITTY_SPLIT_READY; sleep 5'\n"
         )
-        session.wait_for(b"TMUX_SPLIT_READY")
-        assert b"\xe2\x94\x80" in session.output, "tmux-created split border was not rendered"
+        session.wait_for(b"KITTY_SPLIT_READY")
+        assert b"\xe2\x94\x80" in session.output, "Kitty-created split border was not rendered"
 
-        session.write(b"printf MAIN_AFTER_TMUX\\n\n")
-        session.wait_for(b"MAIN_AFTER_TMUX")
+        session.write(b"printf MAIN_AFTER_KITTY\\n\n")
+        session.wait_for(b"MAIN_AFTER_KITTY")
     finally:
         session.close()
 
 
-def test_tmux_kill_pane_closes_split(tinymux: str) -> None:
+def test_kitty_launch_auto_closes_after_child_exit(tinymux: str) -> None:
     session = Session([tinymux, "--", "/bin/sh", "-c", "printf 'MAIN_READY\\n'; /bin/sh"])
     try:
         session.wait_for(b"MAIN_READY")
         session.write(b"stty -echo\n")
         session.drain_until_idle()
         session.write(
-            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_KILL_READY; sleep 5'\n"
+            b"kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+            b"/bin/sh -lc 'printf KITTY_AUTO_CLOSE_ONE; sleep 0.5'\n"
         )
-        session.wait_for(b"TMUX_KILL_READY")
-        close_start = len(session.output)
-        session.write(b"tmux kill-pane; printf TMUX_KILL_RETURNED\\n\n")
-        session.wait_for_after(b"TMUX_KILL_RETURNED", close_start)
-        session.drain_until_idle()
-        assert b"\x1b[?1049h" not in session.output[close_start:]
-        assert b"\x1b[?1049l" not in session.output[close_start:]
-
-        session.write(b"printf AFTER_TMUX_KILL\\n\n")
-        session.wait_for(b"AFTER_TMUX_KILL")
-    finally:
-        session.close()
-
-
-def test_tmux_split_window_auto_closes_after_child_exit(tinymux: str) -> None:
-    session = Session([tinymux, "--", "/bin/sh", "-c", "printf 'MAIN_READY\\n'; /bin/sh"])
-    try:
-        session.wait_for(b"MAIN_READY")
-        session.write(b"stty -echo\n")
-        session.drain_until_idle()
-        session.write(
-            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_AUTO_CLOSE_ONE; sleep 0.5'\n"
-        )
-        session.wait_for(b"TMUX_AUTO_CLOSE_ONE")
+        session.wait_for(b"KITTY_AUTO_CLOSE_ONE")
         close_start = len(session.output)
         time.sleep(1.0)
         session.drain_until_idle(idle=0.2, timeout=3.0)
@@ -2755,31 +2484,34 @@ def test_tmux_split_window_auto_closes_after_child_exit(tinymux: str) -> None:
 
         reopen_start = len(session.output)
         session.write(
-            b"tmux split-window -d -l 5 /bin/sh -lc 'printf TMUX_AUTO_CLOSE_TWO; sleep 0.5'\n"
+            b"kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+            b"/bin/sh -lc 'printf KITTY_AUTO_CLOSE_TWO; sleep 0.5'\n"
         )
-        session.wait_for_after(b"TMUX_AUTO_CLOSE_TWO", reopen_start)
-        assert b"tmux: SplitAlreadyOpen" not in session.output[reopen_start:], (
-            "exited tmux-created split stayed open and blocked a new split"
+        session.wait_for_after(b"KITTY_AUTO_CLOSE_TWO", reopen_start)
+        assert b"kitty: SplitAlreadyOpen" not in session.output[reopen_start:], (
+            "exited Kitty-created split stayed open and blocked a new split"
         )
     finally:
         session.close()
 
 
-def test_tmux_split_window_fails_when_split_already_open(tinymux: str) -> None:
+def test_kitty_launch_fails_when_split_already_open(tinymux: str) -> None:
     session = Session([tinymux, "--", "/bin/sh", "-c", "printf 'MAIN_READY\\n'; /bin/sh"])
     try:
         session.wait_for(b"MAIN_READY")
         session.write(b"stty -echo\n")
         session.drain_until_idle()
         session.write(
-            b"tmux split-window -d -l 5 /bin/sh -lc 'printf FIRST_TMUX_SPLIT; sleep 5'\n"
+            b"kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+            b"/bin/sh -lc 'printf FIRST_KITTY_SPLIT; sleep 5'\n"
         )
-        session.wait_for(b"FIRST_TMUX_SPLIT")
+        session.wait_for(b"FIRST_KITTY_SPLIT")
         second_start = len(session.output)
         session.write(
-            b"tmux split-window -d -l 5 /bin/sh -lc 'printf SHOULD_NOT_APPEAR; sleep 1'\n"
+            b"kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+            b"/bin/sh -lc 'printf SHOULD_NOT_APPEAR; sleep 1'\n"
         )
-        session.wait_for_after(b"tmux: SplitAlreadyOpen", second_start)
+        session.wait_for_after(b"kitty: SplitAlreadyOpen", second_start)
         assert b"SHOULD_NOT_APPEAR" not in session.output[second_start:], (
             "busy split request replaced or started a second split"
         )
@@ -2800,16 +2532,19 @@ def main() -> int:
         test_unsolicited_size_reports_are_not_keyboard_input,
         test_split_close_then_dirty_main_exit_restores_parent_shell,
         test_split_close_preserves_primary_terminal_without_whitespace,
-        test_in_place_split_resizes_main_like_tmux,
+        test_in_place_split_resizes_main_for_kitty_launch,
         test_alternate_screen_scroll_does_not_scroll_outer_terminal,
         test_lazygit_bottom_row_loader_does_not_shift_outer_screen,
         test_split_close_reconciles_application_alternate_screen,
         test_persistent_split_hands_kitty_placements_back_to_raw_mode,
+        test_persistent_split_tracks_kitty_file_transmissions,
+        test_raw_iterm_image_is_normalized_to_kitty,
+        test_raw_sixel_image_is_normalized_to_kitty,
         test_persistent_split_keeps_kitty_images_screen_local,
-        test_direnv_instant_wrapper_outputs_hooks,
         test_persistent_main_preserves_host_integration_but_auxiliary_scrubs_it,
-        test_tmux_compat_env_and_private_shim,
-        test_real_direnv_instant_daemon_opens_tmux_split,
+        test_kitty_compat_env_and_private_shim,
+        test_kitty_compat_opt_out_keeps_native_control,
+        test_real_direnv_instant_daemon_opens_kitty_split,
         test_persistent_focus_event_does_not_leak_into_child_stdin,
         test_pane_mode_output_wins_simultaneously_ready_focus_input,
         test_color_scheme_queries_are_correlated_terminal_reports,
@@ -2824,10 +2559,9 @@ def main() -> int:
         test_persistent_control_client_cannot_block_main_input,
         test_persistent_session_survives_control_socket_failure,
         test_native_pane_generations_ignore_stale_close,
-        test_tmux_split_window_opens_split_and_keeps_main_focus,
-        test_tmux_kill_pane_closes_split,
-        test_tmux_split_window_auto_closes_after_child_exit,
-        test_tmux_split_window_fails_when_split_already_open,
+        test_kitty_launch_opens_split_and_keeps_main_focus,
+        test_kitty_launch_auto_closes_after_child_exit,
+        test_kitty_launch_fails_when_split_already_open,
     ]
     tests = persistent_tests if args.persistent_only else [
         test_parser_warnings_do_not_touch_outer_terminal,
@@ -2838,7 +2572,6 @@ def main() -> int:
         test_seamless_raw_only_has_no_terminal_redraw,
         test_handoff_apply_emits_safe_shell_state,
         test_common_shell_init_outputs_entrypoint_functions,
-        test_direnv_instant_wrapper_outputs_hooks,
         test_seamless_fish_does_not_reload_host_terminal_integration_or_submit_keys,
         test_seamless_child_does_not_inherit_host_terminal_integration_env,
         test_persistent_main_preserves_host_integration_but_auxiliary_scrubs_it,
@@ -2862,13 +2595,17 @@ def main() -> int:
         test_split_replays_kitty_png_graphics,
         test_split_close_switches_to_raw_main,
         test_split_close_preserves_primary_terminal_without_whitespace,
-        test_in_place_split_resizes_main_like_tmux,
+        test_in_place_split_resizes_main_for_kitty_launch,
         test_split_close_reconciles_application_alternate_screen,
         test_persistent_split_hands_kitty_placements_back_to_raw_mode,
+        test_persistent_split_tracks_kitty_file_transmissions,
+        test_raw_iterm_image_is_normalized_to_kitty,
+        test_raw_sixel_image_is_normalized_to_kitty,
         test_persistent_split_keeps_kitty_images_screen_local,
         test_raw_output_is_tracked_for_reopened_split,
-        test_tmux_compat_env_and_private_shim,
-        test_real_direnv_instant_daemon_opens_tmux_split,
+        test_kitty_compat_env_and_private_shim,
+        test_kitty_compat_opt_out_keeps_native_control,
+        test_real_direnv_instant_daemon_opens_kitty_split,
         test_real_direnv_instant_fish_is_usable_after_split_closes,
         test_persistent_focus_event_does_not_leak_into_child_stdin,
         test_pane_mode_output_wins_simultaneously_ready_focus_input,
@@ -2880,10 +2617,9 @@ def main() -> int:
         test_persistent_control_client_cannot_block_main_input,
         test_persistent_session_survives_control_socket_failure,
         test_native_pane_generations_ignore_stale_close,
-        test_tmux_split_window_opens_split_and_keeps_main_focus,
-        test_tmux_kill_pane_closes_split,
-        test_tmux_split_window_auto_closes_after_child_exit,
-        test_tmux_split_window_fails_when_split_already_open,
+        test_kitty_launch_opens_split_and_keeps_main_focus,
+        test_kitty_launch_auto_closes_after_child_exit,
+        test_kitty_launch_fails_when_split_already_open,
     ]
     for test in tests:
         test(args.tinymux)

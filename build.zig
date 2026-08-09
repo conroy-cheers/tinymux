@@ -34,8 +34,12 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     b.installArtifact(exe);
-    const direnv_wrapper = b.addInstallFileWithDir(exe.getEmittedBin(), .bin, "tinymux-direnv-instant");
-    b.getInstallStep().dependOn(&direnv_wrapper.step);
+    const kitty_shim = b.addInstallFileWithDir(
+        exe.getEmittedBin(),
+        .{ .custom = "libexec/tinymux" },
+        "kitty",
+    );
+    b.getInstallStep().dependOn(&kitty_shim.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

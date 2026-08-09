@@ -31,17 +31,27 @@ The main application may enter or leave its own alternate screen while a split
 is visible. Those application-owned switches are mirrored to the outer
 terminal, and both touched buffers are reconciled before raw handoff.
 
-Kitty graphics have the same ownership boundary. Before composition Tinymux
-removes app-owned images from each outer screen using their application image
-ID or image number, while retaining the decoded image in the shadow model.
-Composition uses a private image-ID range and independent primary/alternate
-screen caches. On close, those private images are deleted and the application
-images and placements are restored under their original references before raw
-passthrough resumes. The restored physical references are retained per screen
-for the next ownership transition, including the distinct handling required
-when an image number has multiple historical images. Implicit-ID images, which
-have no stable protocol reference on the first transition, are removed by
-their visible placement cell and thereafter use a remembered shadow-owned ID.
+Graphics cross a protocol-normalization boundary before raw passthrough or VT
+modeling. Kitty file, temporary-file, and shared-memory transmissions are read
+once and re-emitted as bounded direct Kitty pixel chunks. Static iTerm2 inline
+PNG/JPEG and Sixel images are decoded into the same direct RGBA representation.
+This gives the outer terminal and the shadow model identical bytes, placement,
+and cursor semantics. Animated, relative, virtual, malformed, oversized, or
+otherwise unrepresentable graphics fail closed by deleting images instead of
+creating an outer-terminal layer Tinymux cannot later move or erase. Non-image
+OSC, DCS, and APC strings remain byte-for-byte passthrough.
+
+Before composition Tinymux also sends a screen-local delete-all safety barrier,
+then removes modeled app-owned images using their application image ID, image
+number, or visible placement cell while retaining decoded pixels in the shadow
+model. Composition uses a private image-ID range and independent
+primary/alternate screen caches. On close, those private images are deleted and
+the application images and placements are restored under their original
+references before raw passthrough resumes. The restored physical references
+are retained per screen for the next ownership transition, including the
+distinct handling required when an image number has multiple historical
+images. Implicit-ID images use a remembered shadow-owned ID after their first
+transition.
 
 ## Scrollback and host effects
 
@@ -79,7 +89,9 @@ tinymux pane status
 There is one auxiliary slot. A busy `run` is rejected, and a stale generation
 close is a successful no-op. Pane roles, replacement policies, argv inspection,
 and direnv-specific lifecycle behavior are not part of the architecture. The
-tmux `split-window` and `kill-pane` shim maps onto the same operations.
+narrow Kitty remote-control `launch` shim maps onto `pane run` with a ten-row
+bottom split, retained main-pane focus, and automatic close when the launched
+process exits.
 
 Malformed requests and normal busy/stale conditions are client errors. Once a
 valid terminal transition begins, an inability to resize, render, or reconcile
