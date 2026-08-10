@@ -23,6 +23,7 @@ pub const FeedResult = struct {
 /// delete-all command, so it can never create an untracked outer-terminal layer.
 pub const Normalizer = struct {
     state: State = .ground,
+    utf8_continuations: u3 = 0,
     pending: std.ArrayList(u8) = .empty,
     overflowed: bool = false,
     multipart: Multipart = .{},
@@ -65,9 +66,12 @@ pub const Normalizer = struct {
     }
 
     pub fn needsProcessing(self: *const Normalizer, input: []const u8) bool {
-        if (self.hasPending()) return true;
+        if (self.hasPending() or self.utf8_continuations > 0) return true;
         for (input, 0..) |byte, i| {
-            if (byte == 0x90 or byte == 0x9d or byte == 0x9f) return true;
+            // Route UTF-8 through `feed` so a character split across PTY reads
+            // cannot make a continuation byte look like an 8-bit C1 string
+            // introducer in the following chunk.
+            if (byte >= 0x80) return true;
             if (byte != 0x1b) continue;
             if (i + 1 == input.len) return true;
             const next = input[i + 1];
@@ -90,7 +94,7 @@ pub const Normalizer = struct {
             switch (self.state) {
                 .ground => {
                     const start = i;
-                    while (i < input.len and !isStringIntroducer(input[i])) : (i += 1) {}
+                    while (i < input.len and !self.beginsString(input[i])) : (i += 1) {}
                     if (i > start) try out.appendSlice(alloc, input[start..i]);
                     if (i == input.len) break;
                     try self.begin(alloc, input[i]);
@@ -172,6 +176,27 @@ pub const Normalizer = struct {
             0x9d => .osc,
             else => unreachable,
         };
+    }
+
+    fn beginsString(self: *Normalizer, byte: u8) bool {
+        if (self.utf8_continuations > 0) {
+            if (byte >= 0x80 and byte <= 0xbf) {
+                self.utf8_continuations -= 1;
+                return false;
+            }
+            // Invalid UTF-8 ends the partial character. Reconsider this byte
+            // normally so a real C1 control sequence is still recognized.
+            self.utf8_continuations = 0;
+        }
+
+        if (isStringIntroducer(byte)) return true;
+        self.utf8_continuations = switch (byte) {
+            0xc2...0xdf => 1,
+            0xe0...0xef => 2,
+            0xf0...0xf4 => 3,
+            else => 0,
+        };
+        return false;
     }
 
     fn appendPending(self: *Normalizer, alloc: std.mem.Allocator, byte: u8) !void {
@@ -820,6 +845,35 @@ test "normalizer preserves fragmented non-graphics strings" {
     _ = try normalizer.feed(testing.io, testing.allocator, "/tmp", "a\x1b]0;hel", &out);
     _ = try normalizer.feed(testing.io, testing.allocator, "/tmp", "lo\x1b\\b", &out);
     try testing.expectEqualStrings("a\x1b]0;hello\x1b\\b", out.items);
+}
+
+test "normalizer preserves fragmented UTF-8 across C1 byte values" {
+    const testing = std.testing;
+    var normalizer: Normalizer = .{};
+    defer normalizer.deinit(testing.allocator);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const text = "before ❯АП after";
+
+    for (text) |byte| {
+        _ = try normalizer.feed(testing.io, testing.allocator, "/tmp", &.{byte}, &out);
+    }
+
+    try testing.expectEqualStrings(text, out.items);
+    try testing.expect(!normalizer.hasPending());
+}
+
+test "normalizer still recognizes standalone 8-bit C1 strings" {
+    const testing = std.testing;
+    var normalizer: Normalizer = .{};
+    defer normalizer.deinit(testing.allocator);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    _ = try normalizer.feed(testing.io, testing.allocator, "/tmp", "\x9d0;title\x07", &out);
+
+    try testing.expectEqualStrings("\x9d0;title\x07", out.items);
+    try testing.expect(!normalizer.hasPending());
 }
 
 test "normalizer identifies the zero-copy fast path" {
