@@ -1,14 +1,10 @@
-{ self }:
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.programs.tinymux;
   inherit (lib) elem mkEnableOption mkIf mkOption types;
 
-  system = pkgs.stdenv.hostPlatform.system;
-  tinymuxPackage =
-    self.packages.${system}.tinymux
-      or (throw "tinymux does not provide a package for ${system}");
+  tinymuxPackage = pkgs.callPackage ../../package.nix { };
 in
 {
   options.programs.tinymux = {
@@ -17,7 +13,7 @@ in
     package = mkOption {
       type = types.package;
       default = tinymuxPackage;
-      defaultText = lib.literalExpression "tinymux.packages.\${pkgs.stdenv.hostPlatform.system}.tinymux";
+      defaultText = lib.literalExpression "pkgs.callPackage <tinymux/package.nix> { }";
       description = "The tinymux package to install.";
     };
 

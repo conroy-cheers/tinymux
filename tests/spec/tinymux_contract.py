@@ -16,11 +16,35 @@ import sys
 import termios
 import tempfile
 import time
+import zlib
 from collections.abc import Sequence
 
 
 DEFAULT_ROWS = 24
 DEFAULT_COLS = 80
+
+
+def rgba_png(width: int, height: int) -> bytes:
+    """Build a deterministic PNG large enough to exercise vectorized checksums."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload))
+
+    rows = []
+    for y in range(height):
+        row = bytearray([0])
+        for x in range(width):
+            row.extend((x & 0xFF, y & 0xFF, (x ^ y) & 0xFF, 0xFF))
+        rows.append(bytes(row))
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"".join(rows)))
+        + chunk(b"IEND", b"")
+    )
 
 
 def set_winsize(fd: int, rows: int = DEFAULT_ROWS, cols: int = DEFAULT_COLS) -> None:
@@ -851,15 +875,11 @@ def test_persistent_split_hands_kitty_placements_back_to_raw_mode(tinymux: str) 
 
 def test_persistent_split_tracks_kitty_file_transmissions(tinymux: str) -> None:
     """Fastfetch's persistent file transport must participate in graphics handoff."""
-    png = (
-        "iVBORw0KGgoAAAANSUhEUgAAADIAAABMAQMAAAAV2XZDAAAAA1BMVEUrLzc5wwm5"
-        "AAAADklEQVR4AWOgIRgFowAAAmAAATnED6oAAAAASUVORK5CYII="
-    )
     outer_id = 0x70000000
     with tempfile.TemporaryDirectory(prefix="tinymux-kitty-file-") as directory:
         image_path = os.path.join(directory, "fastfetch.png")
         with open(image_path, "wb") as image_file:
-            image_file.write(__import__("base64").b64decode(png))
+            image_file.write(rgba_png(512, 512))
         encoded_path = __import__("base64").b64encode(image_path.encode()).decode()
         command = (
             "printf '\\033[2;3H"
@@ -881,16 +901,16 @@ def test_persistent_split_tracks_kitty_file_transmissions(tinymux: str) -> None:
             session.drain_until_idle(idle=0.2, timeout=3.0)
             output = session.output
 
-            raw_upload = output.index(b"a=T,t=d,f=32,s=50,v=76,c=10,r=5")
+            raw_upload = output.index(b"a=T,t=d,f=32,s=512,v=512,c=10,r=5")
             raw_delete_all = output.index(b"a=d,d=A", raw_upload)
             raw_delete = output.index(b"a=d,d=p,x=3,y=2", raw_delete_all)
             managed_upload = output.index(
-                f"a=t,t=d,f=32,s=50,v=76,i={outer_id}".encode(), raw_delete
+                f"a=t,t=d,f=32,s=512,v=512,i={outer_id}".encode(), raw_delete
             )
             managed_delete = output.index(
                 f"a=d,d=I,i={outer_id}".encode(), managed_upload
             )
-            restored_upload = output.index(b"a=t,t=d,f=32,s=50,v=76,i=", managed_delete)
+            restored_upload = output.index(b"a=t,t=d,f=32,s=512,v=512,i=", managed_delete)
             restored_placement = output.index(b"a=p,i=", restored_upload)
 
             assert b"t=f" not in output, "file transport escaped the normalization boundary"

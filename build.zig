@@ -1,7 +1,17 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const requested_target = b.standardTargetOptions(.{});
+    var target_query = requested_target.query;
+    // LLVM's fast-dpwssd combine can choose the AVX-VNNI VEX encoding when a
+    // target only supports the AVX-512-VNNI EVEX encoding. Keep the requested
+    // CPU and ISA features, but disable that unsafe tuning preference.
+    if (requested_target.result.cpu.arch == .x86_64) {
+        target_query.cpu_features_sub.addFeature(
+            @intFromEnum(std.Target.x86.Feature.fast_dpwssd),
+        );
+    }
+    const target = b.resolveTargetQuery(target_query);
     const optimize = b.standardOptimizeOption(.{});
 
     const exe_mod = b.createModule(.{
