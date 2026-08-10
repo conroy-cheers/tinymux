@@ -34,24 +34,40 @@ terminal, and both touched buffers are reconciled before raw handoff.
 Graphics cross a protocol-normalization boundary before raw passthrough or VT
 modeling. Kitty file, temporary-file, and shared-memory transmissions are read
 once and re-emitted as bounded direct Kitty pixel chunks. Static iTerm2 inline
-PNG/JPEG and Sixel images are decoded into the same direct RGBA representation.
-This gives the outer terminal and the shadow model identical bytes, placement,
-and cursor semantics. Animated, relative, virtual, malformed, oversized, or
-otherwise unrepresentable graphics fail closed by deleting images instead of
-creating an outer-terminal layer Tinymux cannot later move or erase. Non-image
-OSC, DCS, and APC strings remain byte-for-byte passthrough.
+PNG/JPEG and Sixel images are decoded into the same direct RGBA representation;
+iTerm2 sizing/aspect options and the supported Sixel cursor, palette,
+transparency, and raster modes are converted to explicit Kitty placement and
+cursor operations. This gives the outer terminal and the shadow model identical
+bytes, placement, and cursor semantics. Direct Kitty transfers stream through
+without whole-image buffering, while static virtual placements are modeled and
+replayed through the compositor.
 
-Before composition Tinymux also sends a screen-local delete-all safety barrier,
-then removes modeled app-owned images using their application image ID, image
-number, or visible placement cell while retaining decoded pixels in the shadow
-model. Composition uses a private image-ID range and independent
+Every completed graphics command records an ordered, screen-local ownership
+effect. Explicitly referenced static images can be removed and restored
+precisely. Fully modeled static images without an application reference mark
+their active screen for an outer-only clear while retaining their decoded
+shadow pixels. Native-only operations such as animations and relative
+placements remain available during unsplit raw passthrough, but require both
+outer and shadow graphics to be cleared before composition. Malformed,
+oversized, or otherwise unsafe graphics fail closed immediately by deleting
+images rather than creating an outer-terminal layer Tinymux cannot later
+reconcile. Non-image OSC, DCS, and APC strings remain byte-for-byte passthrough.
+
+Before composition Tinymux checks both application screen buffers. It emits a
+delete-all safety barrier only for a screen containing raw graphics that cannot
+be addressed precisely. If those graphics are fully modeled, the barrier is
+outer-only and composition immediately redraws the retained pixels and
+placements. If the screen contains native-only graphics, Tinymux feeds the same
+deletion into the shadow model so unsupported state cannot be resurrected.
+Precisely referenced app-owned images are instead removed using their
+application image ID or image number while retaining decoded pixels in the
+shadow model. Composition uses a private image-ID range and independent
 primary/alternate screen caches. On close, those private images are deleted and
-the application images and placements are restored under their original
-references before raw passthrough resumes. The restored physical references
-are retained per screen for the next ownership transition, including the
-distinct handling required when an image number has multiple historical
-images. Implicit-ID images use a remembered shadow-owned ID after their first
-transition.
+the application images and placements are restored before raw passthrough
+resumes. An initially implicit image is restored under its shadow-assigned ID,
+making subsequent ownership transitions precise. Existing physical references
+are retained per screen, including the distinct handling required when an image
+number has multiple historical images.
 
 ## Scrollback and host effects
 
