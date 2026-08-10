@@ -874,7 +874,7 @@ def test_persistent_split_hands_kitty_placements_back_to_raw_mode(tinymux: str) 
 
 
 def test_persistent_split_tracks_kitty_file_transmissions(tinymux: str) -> None:
-    """Fastfetch's persistent file transport must participate in graphics handoff."""
+    """Fastfetch's persistent file transport must survive graphics handoff."""
     outer_id = 0x70000000
     with tempfile.TemporaryDirectory(prefix="tinymux-kitty-file-") as directory:
         image_path = os.path.join(directory, "fastfetch.png")
@@ -921,6 +921,126 @@ def test_persistent_split_tracks_kitty_file_transmissions(tinymux: str) -> None:
             session.close()
 
 
+def test_fastfetch_image_split_then_atuin_starts_at_the_top(tinymux: str) -> None:
+    """A raw file image must survive without offsetting the following UI."""
+    outer_id = 0x70000000
+    with tempfile.TemporaryDirectory(prefix="tinymux-fastfetch-atuin-") as directory:
+        image_path = os.path.join(directory, "fastfetch.png")
+        with open(image_path, "wb") as image_file:
+            image_file.write(rgba_png(512, 512))
+        encoded_path = __import__("base64").b64encode(image_path.encode()).decode()
+        command = (
+            "printf '\033[2;3H"
+            f"\033_Ga=T,f=100,t=f,c=10,r=5,q=2;{encoded_path}\033\\"
+            "\033[8;1HFASTFETCH_READY'; "
+            "sleep 0.2; "
+            "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+            "/bin/sh -lc 'sleep 0.4'; "
+            "sleep 1; "
+            "printf '\033[?1049h\033[H\033[2JATUIN_TOP\033[10;1HATUIN_ROW_10'; "
+            "sleep 5"
+        )
+        session = Session(
+            [tinymux, "session", "--", "/bin/sh", "-c", command],
+            extra_env={"TERM": "xterm-ghostty"},
+        )
+        try:
+            session.wait_for(b"ATUIN_ROW_10", timeout=8.0)
+            session.drain_until_idle(idle=0.2, timeout=3.0)
+            output = session.output
+
+            raw_upload = output.index(b"a=T,t=d,f=32,s=512,v=512,c=10,r=5")
+            split_barrier = output.index(b"a=d,d=A", raw_upload)
+            managed_upload = output.index(
+                f"a=t,t=d,f=32,s=512,v=512,i={outer_id}".encode(), split_barrier
+            )
+            managed_delete = output.index(
+                f"a=d,d=I,i={outer_id}".encode(), managed_upload
+            )
+            restored_upload = output.index(b"a=t,t=d,f=32,s=512,v=512,i=", managed_delete)
+            restored_placement = output.index(b"a=p,i=", restored_upload)
+            atuin_start = output.index(b"\x1b[?1049h", restored_placement)
+            assert raw_upload < split_barrier < managed_upload < managed_delete
+            assert managed_delete < restored_upload < restored_placement < atuin_start
+            assert b"t=f" not in output, "file transport escaped the normalization boundary"
+            assert encoded_path.encode() not in output, "local path leaked to the outer terminal"
+
+            # Interpret the bytes from Atuin's alternate-screen entry as a
+            # fresh screen. This catches a graphics-induced cursor mismatch
+            # without depending on an actual image-capable terminal in CI.
+            _, screen = terminal_state(output[atuin_start:])
+            assert screen[0].startswith(b"ATUIN_TOP"), screen
+            assert screen[9].startswith(b"ATUIN_ROW_10"), screen
+        finally:
+            session.close()
+
+
+def test_persistent_split_retains_normalized_iterm_and_sixel_images(tinymux: str) -> None:
+    png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    command = (
+        "printf '\033[2;2H"
+        f"\033]1337;File=inline=1;width=2;height=3:{png}\007"
+        "\033[5;5H\033Pq#1;2;100;0;0~\033\\"
+        "\033[10;1HSTATIC_PROTOCOLS_READY'; "
+        "sleep 0.2; "
+        "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+        "/bin/sh -lc 'sleep 0.4'; "
+        "sleep 1; printf 'STATIC_PROTOCOLS_CLOSE_DONE'; sleep 5"
+    )
+    session = Session(
+        [tinymux, "session", "--", "/bin/sh", "-c", command],
+        extra_env={"TERM": "xterm-ghostty"},
+    )
+    try:
+        session.wait_for(b"STATIC_PROTOCOLS_CLOSE_DONE", timeout=8.0)
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+        output = session.output
+
+        raw_iterm = output.index(b"a=T,t=d,f=32,s=1,v=1,c=2,r=1")
+        raw_sixel = output.index(b"a=T,t=d,f=32,s=1,v=6,c=1,r=1")
+        barrier = output.index(b"a=d,d=A", max(raw_iterm, raw_sixel))
+        managed_iterm = output.index(b"a=t,t=d,f=32,s=1,v=1,i=", barrier)
+        managed_sixel = output.index(b"a=t,t=d,f=32,s=1,v=6,i=", barrier)
+        delete_zero = output.index(b"a=d,d=I,i=1879048192", max(managed_iterm, managed_sixel))
+        delete_one = output.index(b"a=d,d=I,i=1879048193", max(managed_iterm, managed_sixel))
+        restored = output[max(delete_zero, delete_one) :]
+
+        assert b"a=t,t=d,f=32,s=1,v=1,i=" in restored
+        assert b"a=t,t=d,f=32,s=1,v=6,i=" in restored
+    finally:
+        session.close()
+
+
+def test_native_only_graphics_discard_shadow_state_before_split(tinymux: str) -> None:
+    command = (
+        "printf '\033_Ga=T,f=24,t=d,i=77,s=1,v=1,c=1,r=1,q=2;////\033\\"
+        "\033_Ga=a,i=77,s=3,q=2;\033\\NATIVE_GRAPHICS_READY'; "
+        "sleep 0.2; "
+        "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+        "/bin/sh -lc 'sleep 0.4'; "
+        "sleep 1; printf 'NATIVE_GRAPHICS_CLOSE_DONE'; sleep 5"
+    )
+    session = Session(
+        [tinymux, "session", "--", "/bin/sh", "-c", command],
+        extra_env={"TERM": "xterm-ghostty"},
+    )
+    try:
+        session.wait_for(b"NATIVE_GRAPHICS_CLOSE_DONE", timeout=8.0)
+        session.drain_until_idle(idle=0.2, timeout=3.0)
+        output = session.output
+
+        animation = output.index(b"a=a,i=77,s=3")
+        barrier = output.index(b"a=d,d=A", animation)
+        assert b"a=t,t=d,f=24,s=1,v=1" not in output[barrier:], (
+            "native-only graphics were resurrected from the shadow model"
+        )
+    finally:
+        session.close()
+
+
 def test_raw_iterm_image_is_normalized_to_kitty(tinymux: str) -> None:
     png = (
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
@@ -935,7 +1055,7 @@ def test_raw_iterm_image_is_normalized_to_kitty(tinymux: str) -> None:
         session.wait_for(b"ITERM_DONE")
         output = session.output
         assert b"\x1b]1337;File=" not in output
-        assert b"a=T,t=d,f=32,s=1,v=1,c=2,r=3" in output
+        assert b"a=T,t=d,f=32,s=1,v=1,c=2,r=1" in output
     finally:
         session.close()
 
@@ -2558,6 +2678,9 @@ def main() -> int:
         test_split_close_reconciles_application_alternate_screen,
         test_persistent_split_hands_kitty_placements_back_to_raw_mode,
         test_persistent_split_tracks_kitty_file_transmissions,
+        test_fastfetch_image_split_then_atuin_starts_at_the_top,
+        test_persistent_split_retains_normalized_iterm_and_sixel_images,
+        test_native_only_graphics_discard_shadow_state_before_split,
         test_raw_iterm_image_is_normalized_to_kitty,
         test_raw_sixel_image_is_normalized_to_kitty,
         test_persistent_split_keeps_kitty_images_screen_local,
@@ -2619,6 +2742,9 @@ def main() -> int:
         test_split_close_reconciles_application_alternate_screen,
         test_persistent_split_hands_kitty_placements_back_to_raw_mode,
         test_persistent_split_tracks_kitty_file_transmissions,
+        test_fastfetch_image_split_then_atuin_starts_at_the_top,
+        test_persistent_split_retains_normalized_iterm_and_sixel_images,
+        test_native_only_graphics_discard_shadow_state_before_split,
         test_raw_iterm_image_is_normalized_to_kitty,
         test_raw_sixel_image_is_normalized_to_kitty,
         test_persistent_split_keeps_kitty_images_screen_local,
