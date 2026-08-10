@@ -88,6 +88,7 @@ fn sleepNanoseconds(duration_ns: u64) void {
 
 const default_split_rows: u16 = 9;
 const exit_drain_ms: i64 = 50;
+const graphics_transition_settle_ms: i64 = 50;
 const termination_poll_ns: u64 = 1 * std.time.ns_per_ms;
 const termination_grace_polls: usize = 100;
 const composed_idle_poll_ms: i32 = 50;
@@ -2156,6 +2157,14 @@ fn cloneEnvMap(alloc: std.mem.Allocator, source: *const EnvMap) !EnvMap {
     return env;
 }
 
+const GraphicsSafety = enum(u3) {
+    clean,
+    precise,
+    clear_retain,
+    clear_discard,
+    unmanaged,
+};
+
 const Pane = struct {
     alloc: std.mem.Allocator,
     pty_fd: posix.fd_t,
@@ -2178,8 +2187,8 @@ const Pane = struct {
     color_scheme_queries_to_outer: usize = 0,
     color_scheme_query_owner: ?posix.pid_t = null,
     graphics_normalizer: graphics_protocol.Normalizer = .{},
-    graphics_seen: bool = false,
-    graphics_dropped: bool = false,
+    primary_graphics_safety: GraphicsSafety = .clean,
+    alternate_graphics_safety: GraphicsSafety = .clean,
 
     pub const TerminalHandler = vt.TerminalStream.Handler;
     pub const Stream = vt.Stream(StreamHandler);
@@ -2341,6 +2350,30 @@ const Pane = struct {
         self.term.deinit(self.alloc);
         self.alloc.free(self.command_title);
         self.alloc.destroy(self);
+    }
+
+    fn graphicsSafetyFor(self: *Pane, key: vt.ScreenSet.Key) *GraphicsSafety {
+        return switch (key) {
+            .primary => &self.primary_graphics_safety,
+            .alternate => &self.alternate_graphics_safety,
+        };
+    }
+
+    fn noteGraphicsEffect(self: *Pane, effect: graphics_protocol.Effect) void {
+        const safety = self.graphicsSafetyFor(self.term.screens.active_key);
+        switch (effect) {
+            .cleared => safety.* = .clean,
+            .precise => if (safety.* == .clean) {
+                safety.* = .precise;
+            },
+            .clear_retain => if (safety.* == .clean or safety.* == .precise) {
+                safety.* = .clear_retain;
+            },
+            .clear_discard => if (safety.* != .unmanaged) {
+                safety.* = .clear_discard;
+            },
+            .unmanaged => safety.* = .unmanaged,
+        }
     }
 
     fn fromHandler(handler: *TerminalHandler) *Pane {
@@ -3044,6 +3077,44 @@ const GraphicsState = struct {
             const request = placementRequest(pane, image, entry.value_ptr.*, viewport_tl, origin_row, placement_seq) orelse continue;
             try emitPlacement(alloc, out, outer_id, request);
         }
+
+        const viewport_br_pin = screen.pages.pin(.{ .viewport = .{
+            .x = pane.term.cols -| 1,
+            .y = pane.term.rows -| 1,
+        } }) orelse return;
+        var virtual_iter = vt.kitty.graphics.unicode.placementIterator(viewport_tl_pin, viewport_br_pin);
+        while (virtual_iter.next()) |virtual| : (placement_seq +%= 1) {
+            const image = storage.images.get(virtual.image_id) orelse continue;
+            const outer_id = try self.ensureImage(alloc, out, pane_id, image) orelse continue;
+            const rendered = virtual.renderPlacement(
+                storage,
+                &image,
+                pane.cell_size.width,
+                pane.cell_size.height,
+            ) catch continue;
+            const point = (screen.pages.pointFromPin(.screen, rendered.top_left) orelse continue).screen;
+            const row = @as(i64, point.y) - @as(i64, viewport_tl.y);
+            const col = @as(i64, point.x) - @as(i64, viewport_tl.x);
+            if (row < 0 or col < 0 or row >= pane.term.rows or col >= pane.term.cols) continue;
+            const columns = ceilDivU32(rendered.offset_x +| rendered.dest_width, pane.cell_size.width) orelse continue;
+            const rows = ceilDivU32(rendered.offset_y +| rendered.dest_height, pane.cell_size.height) orelse continue;
+            if (columns == 0 or rows == 0) continue;
+            const z = virtualPlacementZ(storage, virtual.image_id, virtual.placement_id);
+            try emitPlacement(alloc, out, outer_id, .{
+                .row = @as(u32, origin_row) + @as(u32, @intCast(row)),
+                .col = @intCast(col),
+                .placement_id = placement_seq,
+                .source_x = rendered.source_x,
+                .source_y = rendered.source_y,
+                .source_width = rendered.source_width,
+                .source_height = rendered.source_height,
+                .x_offset = rendered.offset_x,
+                .y_offset = rendered.offset_y,
+                .columns = @min(columns, @as(u32, pane.term.cols) - @as(u32, @intCast(col))),
+                .rows = @min(rows, @as(u32, pane.term.rows) - @as(u32, @intCast(row))),
+                .z = z,
+            });
+        }
     }
 
     fn ensureImage(
@@ -3090,6 +3161,24 @@ const GraphicsState = struct {
         return outer_id;
     }
 };
+
+fn ceilDivU32(value: u32, divisor: u32) ?u32 {
+    if (divisor == 0) return null;
+    return (value +| (divisor - 1)) / divisor;
+}
+
+fn virtualPlacementZ(storage: anytype, image_id: u32, placement_id: u32) i32 {
+    var iter = storage.placements.iterator();
+    while (iter.next()) |entry| {
+        if (entry.key_ptr.image_id != image_id) continue;
+        if (rawPlacementId(entry.key_ptr.*) != placement_id) continue;
+        switch (entry.value_ptr.location) {
+            .virtual => return entry.value_ptr.z,
+            .pin => {},
+        }
+    }
+    return 0;
+}
 
 const PlacementRequest = struct {
     row: u32,
@@ -3305,6 +3394,34 @@ fn emitPlacement(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outer_id: u3
     try emitPlacementReferenced(alloc, out, .{ .id = outer_id }, request);
 }
 
+fn emitVirtualPlacementReferenced(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    reference: ImageReference,
+    placement_id: u32,
+    placement: anytype,
+) !void {
+    const reference_key: u8, const reference_value: u32 = switch (reference) {
+        .id => |value| .{ 'i', value },
+        .number => |value| .{ 'I', value },
+    };
+    try out.print(alloc, "\x1b_Ga=p,{c}={d},p={d},U=1", .{
+        reference_key,
+        reference_value,
+        placement_id,
+    });
+    if (placement.source_x != 0) try out.print(alloc, ",x={d}", .{placement.source_x});
+    if (placement.source_y != 0) try out.print(alloc, ",y={d}", .{placement.source_y});
+    if (placement.source_width != 0) try out.print(alloc, ",w={d}", .{placement.source_width});
+    if (placement.source_height != 0) try out.print(alloc, ",h={d}", .{placement.source_height});
+    if (placement.x_offset != 0) try out.print(alloc, ",X={d}", .{placement.x_offset});
+    if (placement.y_offset != 0) try out.print(alloc, ",Y={d}", .{placement.y_offset});
+    if (placement.columns != 0) try out.print(alloc, ",c={d}", .{placement.columns});
+    if (placement.rows != 0) try out.print(alloc, ",r={d}", .{placement.rows});
+    if (placement.z != 0) try out.print(alloc, ",z={d}", .{placement.z});
+    try out.appendSlice(alloc, ",C=1,q=2;\x1b\\");
+}
+
 fn emitDeleteImage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), outer_id: u32) !void {
     try out.print(alloc, "\x1b_Ga=d,d=I,i={d},q=2;\x1b\\", .{outer_id});
 }
@@ -3376,6 +3493,12 @@ const RawGraphicsOwnership = struct {
         }
     }
 };
+
+fn activeScreenHasKittyGraphics(pane: *Pane) bool {
+    if (comptime !kitty_graphics_enabled) return false;
+    const storage = &pane.term.screens.active.kitty_images;
+    return storage.images.count() != 0 or storage.placements.count() != 0;
+}
 
 fn rawPlacementId(key: anytype) u32 {
     return switch (key.placement_id.tag) {
@@ -3467,6 +3590,20 @@ fn appendRawGraphicsRestore(
     var placement_iter = storage.placements.iterator();
     while (placement_iter.next()) |entry| {
         const image = storage.images.get(entry.key_ptr.image_id) orelse continue;
+        const reference = rawRestoreImageReference(storage, image);
+        switch (entry.value_ptr.location) {
+            .virtual => {
+                try emitVirtualPlacementReferenced(
+                    alloc,
+                    out,
+                    reference,
+                    rawPlacementId(entry.key_ptr.*),
+                    entry.value_ptr.*,
+                );
+                continue;
+            },
+            .pin => {},
+        }
         const request = placementRequest(
             pane,
             image,
@@ -3475,7 +3612,6 @@ fn appendRawGraphicsRestore(
             0,
             rawPlacementId(entry.key_ptr.*),
         ) orelse continue;
-        const reference = rawRestoreImageReference(storage, image);
         try emitPlacementReferenced(alloc, out, reference, request);
     }
 }
@@ -4513,8 +4649,27 @@ const App = struct {
             self.main_pane.term.screens.switchTo(key);
             var deletes: std.ArrayList(u8) = .empty;
             defer deletes.deinit(self.alloc);
-            if (self.main_pane.graphics_seen) {
-                try deletes.appendSlice(self.alloc, "\x1b_Ga=d,d=A,q=2;\x1b\\");
+            const safety = self.main_pane.graphicsSafetyFor(key);
+            if (safety.* == .unmanaged) return error.UnmanagedGraphics;
+            switch (safety.*) {
+                .clear_retain => {
+                    // The outer image has no stable application reference, so
+                    // clear it before composition. Its decoded pixels and
+                    // placement remain in the shadow model and are immediately
+                    // redrawn under compositor ownership.
+                    try deletes.appendSlice(self.alloc, "\x1b_Ga=d,d=A,q=2;\x1b\\");
+                    safety.* = .clean;
+                },
+                .clear_discard => {
+                    try deletes.appendSlice(self.alloc, "\x1b_Ga=d,d=A,q=2;\x1b\\");
+                    // Native-only graphics cannot be reconstructed faithfully.
+                    // Apply the same clear to the shadow model so they cannot
+                    // be resurrected during composition or raw handoff.
+                    self.main_pane.feed("\x1b_Ga=d,d=A,q=2;\x1b\\");
+                    safety.* = .clean;
+                },
+                .clean, .precise => {},
+                .unmanaged => unreachable,
             }
             const removed_modeled = try appendRawGraphicsRemoval(
                 self.alloc,
@@ -4551,6 +4706,14 @@ const App = struct {
         try outer_terminal.write(out.items);
         self.outer_primary_graphics.clear();
         self.outer_alternate_graphics.clear();
+    }
+
+    fn ensureGraphicsComposable(self: *App) !void {
+        if (self.main_pane.primary_graphics_safety == .unmanaged or
+            self.main_pane.alternate_graphics_safety == .unmanaged)
+        {
+            return error.UnmanagedGraphics;
+        }
     }
 
     fn pollTimeoutMs(self: *const App, now_ns: i128) i32 {
@@ -5108,10 +5271,12 @@ const App = struct {
 
     fn readPaneInto(self: *App, pane: *Pane, which: WhichPane, buf: *[64 * 1024]u8) !usize {
         const n = os.read(pane.pty_fd, buf) catch {
+            try self.finishPaneNormalizer(pane, which);
             pane.markDead();
             return 0;
         };
         if (n == 0) {
+            try self.finishPaneNormalizer(pane, which);
             pane.markDead();
             return 0;
         }
@@ -5124,18 +5289,70 @@ const App = struct {
         }
         var normalized: std.ArrayList(u8) = .empty;
         defer normalized.deinit(self.alloc);
-        const normalization = try pane.graphics_normalizer.feed(
+        _ = try pane.graphics_normalizer.feedWithOptions(
             currentIo(),
             self.alloc,
             getenv("TMPDIR") orelse "/tmp",
+            .{
+                .mode = if (!self.composed and which == .main) .raw else .composed,
+                .geometry = .{
+                    .rows = pane.term.rows,
+                    .columns = pane.term.cols,
+                    .cell_width = pane.cell_size.width,
+                    .cell_height = pane.cell_size.height,
+                },
+            },
             buf[0..n],
             &normalized,
         );
-        pane.graphics_seen = pane.graphics_seen or normalization.graphics;
-        pane.graphics_dropped = pane.graphics_dropped or normalization.dropped;
-        try self.processPaneOutput(pane, which, normalized.items);
+        try self.processNormalizedPaneOutput(
+            pane,
+            which,
+            normalized.items,
+            pane.graphics_normalizer.events(),
+        );
+        if (pane.graphics_normalizer.replies().len > 0) {
+            pane.writeTerminalReply(
+                pane.graphics_normalizer.replies(),
+                pane.foregroundPgrp(),
+            );
+        }
         try self.flushPaneOuterQueries(pane, which);
         return n;
+    }
+
+    fn finishPaneNormalizer(self: *App, pane: *Pane, which: WhichPane) !void {
+        if (!self.graphics_normalization_enabled or !pane.graphics_normalizer.hasPending()) return;
+        var normalized: std.ArrayList(u8) = .empty;
+        defer normalized.deinit(self.alloc);
+        _ = try pane.graphics_normalizer.finish(self.alloc, &normalized);
+        try self.processNormalizedPaneOutput(
+            pane,
+            which,
+            normalized.items,
+            pane.graphics_normalizer.events(),
+        );
+    }
+
+    fn processNormalizedPaneOutput(
+        self: *App,
+        pane: *Pane,
+        which: WhichPane,
+        bytes: []const u8,
+        events: []const graphics_protocol.Event,
+    ) !void {
+        var offset: usize = 0;
+        for (events) |event| {
+            const end = @min(event.output_end, bytes.len);
+            if (end > offset) try self.processPaneOutput(pane, which, bytes[offset..end]);
+            // Raw main output advances through the bounded shadow journal.
+            // Catch it up at graphics boundaries so screen attribution is
+            // exact even when a screen switch and image share a PTY read.
+            if (!self.composed and which == .main) self.flushDeferredMainState();
+            pane.noteGraphicsEffect(event.effect);
+            offset = end;
+        }
+        if (offset < bytes.len) try self.processPaneOutput(pane, which, bytes[offset..]);
     }
 
     fn processPaneOutput(self: *App, pane: *Pane, which: WhichPane, bytes: []const u8) !void {
@@ -5771,8 +5988,10 @@ const App = struct {
         if (self.split_pane != null) return error.SplitAlreadyOpen;
 
         try self.drainMainForSplitTransition();
+        try self.settleGraphicsForSplit();
         try self.flushRawControlPending();
         self.flushDeferredMainState();
+        try self.ensureGraphicsComposable();
 
         self.active_split_rows = rows;
         self.layout = Layout.compute(self.last_size.row, self.last_size.col, true, self.active_split_rows);
@@ -5870,6 +6089,10 @@ const App = struct {
         try graphics_handoff.appendSlice(self.alloc, synchronized_update_end);
         try outer_terminal.write(graphics_handoff.items);
         try self.rawGraphicsFor(key).capture(self.alloc, self.main_pane);
+        self.main_pane.graphicsSafetyFor(key).* = if (activeScreenHasKittyGraphics(self.main_pane))
+            .precise
+        else
+            .clean;
 
         const screen_state = try self.main_pane.screenState(self.alloc);
         defer self.alloc.free(screen_state);
@@ -5896,6 +6119,30 @@ const App = struct {
 
             var buf: [64 * 1024]u8 = undefined;
             _ = try self.readPaneInto(self.main_pane, .main, &buf);
+        }
+    }
+
+    fn settleGraphicsForSplit(self: *App) !void {
+        if (!self.graphics_normalization_enabled or
+            !self.main_pane.graphics_normalizer.hasPending()) return;
+        const deadline = milliTimestamp() + graphics_transition_settle_ms;
+        while (self.main_pane.pty_fd >= 0 and
+            self.main_pane.graphics_normalizer.hasPending() and
+            milliTimestamp() < deadline)
+        {
+            var fds = [_]posix.pollfd{.{
+                .fd = self.main_pane.pty_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const remaining: i32 = @intCast(@max(@as(i64, 0), deadline - milliTimestamp()));
+            const ready = try posix.poll(&fds, remaining);
+            if (ready == 0 or fds[0].revents == 0) break;
+            var buf: [64 * 1024]u8 = undefined;
+            _ = try self.readPaneInto(self.main_pane, .main, &buf);
+        }
+        if (self.main_pane.graphics_normalizer.hasPending()) {
+            try self.finishPaneNormalizer(self.main_pane, .main);
         }
     }
 
@@ -7194,7 +7441,8 @@ test "raw graphics handoff preserves application image references and placements
             "\x1b[2;3H" ++
             "\x1b_Ga=T,f=24,t=d,I=42,p=24,s=1,v=1,c=1,r=1,q=2;////\x1b\\" ++
             "\x1b[3;4H" ++
-            "\x1b_Ga=T,f=24,t=d,I=42,p=25,s=1,v=1,c=1,r=1,q=2;AAAA\x1b\\",
+            "\x1b_Ga=T,f=24,t=d,I=42,p=25,s=1,v=1,c=1,r=1,q=2;AAAA\x1b\\" ++
+            "\x1b_Ga=p,i=77,p=26,U=1,c=2,r=1,C=1,q=2;\x1b\\",
     );
 
     const newest_numbered_id = pane.term.screens.active.kitty_images.imageByNumber(42).?.id;
@@ -7221,6 +7469,7 @@ test "raw graphics handoff preserves application image references and placements
     try std.testing.expect(std.mem.indexOf(u8, out.items, "a=t,t=d,f=24,s=1,v=1,i=77") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.items, "a=t,t=d,f=24,s=1,v=1,I=42"));
     try std.testing.expect(std.mem.indexOf(u8, out.items, "a=p,i=77,p=23") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "a=p,i=77,p=26,U=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "a=p,I=42,p=25") != null);
     var older_upload_buf: [96]u8 = undefined;
     const older_upload = try std.fmt.bufPrint(
@@ -7248,6 +7497,53 @@ test "raw graphics handoff preserves application image references and placements
         .{older_numbered_id.?},
     );
     try std.testing.expect(std.mem.indexOf(u8, out.items, older_delete) != null);
+}
+
+test "graphics compositor renders Kitty unicode placeholder placements" {
+    if (comptime !kitty_graphics_enabled) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var pane: Pane = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = 0,
+        .command_title = "test",
+        .cell_size = .{},
+        .term = try initTerminal(alloc, .{
+            .cols = 10,
+            .rows = 5,
+            .max_scrollback_bytes = scrollback_bytes,
+            .kitty_image_storage_limit = kitty_image_storage_limit,
+            .kitty_image_loading_limits = kitty_image_loading_limits,
+        }),
+        .stream = undefined,
+    };
+    defer pane.term.deinit(alloc);
+    pane.cell_size.applyToTerm(&pane.term);
+
+    var stream = pane.term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b_Ga=t,f=24,t=d,i=1,s=1,v=1,q=2;////\x1b\\" ++
+            "\x1b_Ga=p,i=1,p=8,U=1,c=1,r=1,C=1,q=2;\x1b\\" ++
+            "\x1b[38;5;1m\u{10EEEE}\u{0305}\u{0305}\x1b[39m",
+    );
+
+    var graphics: GraphicsState = .{};
+    defer graphics.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try graphics.render(
+        alloc,
+        &out,
+        Layout.compute(5, 10, false, 0),
+        &pane,
+        null,
+        true,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "a=t,t=d,f=24,s=1,v=1,i=1879048192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "a=p,i=1879048192") != null);
 }
 
 test "graphics replay keeps image upload cached across placement updates" {
