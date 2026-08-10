@@ -335,6 +335,18 @@ def workload_cases(profile: str, byte_count: int, rows: int, cols: int) -> list[
             ),
         ),
         CommandCase(
+            "bulk-utf8",
+            "throughput",
+            "UTF-8 line output that exercises continuation bytes overlapping C1 controls",
+            py_child(
+                "import sys\n"
+                f"unit = {'❯АП🙂'!r}\n"
+                f"line = ((unit * {max(1, (cols - 4) // 5)}) + '\\n').encode()\n"
+                f"for _ in range(max(1, {byte_count} // len(line))): sys.stdout.buffer.write(line)\n"
+                "sys.stdout.flush()\n"
+            ),
+        ),
+        CommandCase(
             "bulk-ansi",
             "throughput",
             "SGR-heavy output with color resets on every line",

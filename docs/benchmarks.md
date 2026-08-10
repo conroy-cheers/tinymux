@@ -28,6 +28,8 @@ The command workloads are:
 
 - `bulk-plain`: line-oriented plain output, expected to exercise the scroll
   fast path.
+- `bulk-utf8`: line-oriented UTF-8 output spanning two-, three-, and four-byte
+  characters, including continuation bytes that overlap 8-bit C1 controls.
 - `bulk-ansi`: SGR-heavy output with color resets on every line.
 - `wide-wrap`: long wrapped lines that stress row-cache and viewport pin churn.
 - `alt-screen`: alternate-screen enter, repaint, clear, and exit churn.
@@ -61,6 +63,16 @@ zig build bench-full -- --json target/bench/full.json
 The JSON schema includes per-sample metrics, environment metadata, ratios, and
 latency distributions. It is intended to be checked into benchmark artifacts or
 compared by local scripts, not used as a stable public API.
+
+For a focused baseline of the UTF-8 graphics-normalizer path, use an optimized
+build and retain both machine-readable and reviewable results:
+
+```sh
+zig build -Doptimize=ReleaseFast bench-full -- \
+  --only bulk-plain --only bulk-utf8 --modes direct,raw,split \
+  --json target/bench/utf8-baseline.json \
+  --markdown target/bench/utf8-baseline.md
+```
 
 ## Threshold Mode
 
