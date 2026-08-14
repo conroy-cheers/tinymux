@@ -9,6 +9,8 @@
 , fish
 , zsh
 , nushell
+, apple-sdk
+, writeShellScriptBin
 , zigCpu ? null
 ,
 }:
@@ -33,6 +35,9 @@ let
     platform = stdenv.hostPlatform;
     cpuOverride = zigCpu;
   };
+  xcodeSelect = writeShellScriptBin "xcode-select" ''
+    echo ${apple-sdk}
+  '';
 in
 stdenv.mkDerivation {
   pname = "tinymux";
@@ -47,7 +52,10 @@ stdenv.mkDerivation {
     fish
     zsh
     nushell
-  ];
+  ]
+  ++ lib.optionals stdenv.hostPlatform.isDarwin [ xcodeSelect ];
+
+  buildInputs = lib.optionals stdenv.hostPlatform.isDarwin [ apple-sdk ];
 
   patchPhase = ''
     runHook prePatch

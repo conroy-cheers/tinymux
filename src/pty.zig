@@ -10,11 +10,6 @@ extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
-extern "c" fn execvpe(
-    file: [*:0]const u8,
-    argv: [*:null]const ?[*:0]const u8,
-    envp: [*:null]const ?[*:0]const u8,
-) c_int;
 
 pub const Tio = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => struct {
@@ -107,8 +102,6 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
     errdefer os.close(pty.master);
     errdefer os.close(pty.slave);
 
-    const argv0 = try alloc.dupeZ(u8, opts.argv[0]);
-    defer alloc.free(argv0);
     const argv = try alloc.allocSentinel(?[*:0]const u8, opts.argv.len, null);
     defer alloc.free(argv);
 
@@ -118,6 +111,7 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
         argv[i] = try arena.allocator().dupeZ(u8, arg);
     }
     const env_block = try opts.env.createPosixBlock(arena.allocator(), .{});
+    const exec_paths = try executablePaths(arena.allocator(), opts.argv[0], opts.env);
     const cwd_z: ?[:0]const u8 = if (opts.cwd) |d|
         try arena.allocator().dupeZ(u8, d)
     else
@@ -137,10 +131,36 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
 
         if (cwd_z) |d| if (std.c.chdir(d) != 0) std.process.exit(127);
 
-        _ = execvpe(argv0, argv, env_block.slice.ptr);
+        for (exec_paths) |path| {
+            _ = std.c.execve(path.ptr, argv, env_block.slice.ptr);
+        }
         std.process.exit(127);
     }
 
     os.close(pty.slave);
     return .{ .pid = pid, .master = pty.master };
+}
+
+fn executablePaths(
+    alloc: std.mem.Allocator,
+    file: []const u8,
+    env: *std.process.Environ.Map,
+) ![]const [:0]const u8 {
+    if (std.mem.indexOfScalar(u8, file, '/') != null) {
+        const paths = try alloc.alloc([:0]const u8, 1);
+        paths[0] = try alloc.dupeZ(u8, file);
+        return paths;
+    }
+
+    const path_value = env.get("PATH") orelse "/usr/bin:/bin";
+    var paths: std.ArrayList([:0]const u8) = .empty;
+    var entries = std.mem.splitScalar(u8, path_value, ':');
+    while (entries.next()) |entry| {
+        const candidate = if (entry.len == 0)
+            file
+        else
+            try std.fs.path.join(alloc, &.{ entry, file });
+        try paths.append(alloc, try alloc.dupeZ(u8, candidate));
+    }
+    return paths.items;
 }
