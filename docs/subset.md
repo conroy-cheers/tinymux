@@ -93,6 +93,10 @@ contract is defined in `persistent-session.md`.
   action boundary, including multiple actions received in one PTY read.
 - `TERM-019` REQUIRED: cached row identity includes the Ghostty page
   generation; a recycled page pointer alone is not a reusable row identity.
+- `TERM-020` REQUIRED for persistent sessions: a composition round trip
+  preserves the effective mouse tracking and encoding selected by the main
+  pane when raw passthrough resumes, including when multiple mutually exclusive
+  DEC mode bits are set.
 
 ## Terminal Profiles
 

@@ -134,10 +134,12 @@ const style_dim = "\x1b[2m";
 const synchronized_update_begin = "\x1b[?2026h";
 const synchronized_update_end = "\x1b[?2026l";
 const mux_mouse_enable = "\x1b[?1002h\x1b[?1006h";
+const mouse_event_reset = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l";
+const mouse_format_reset = "\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l";
 const composed_input_reset =
     "\x1b[2l\x1b[12h\x1b[20l" ++
     "\x1b[?1l\x1b[?8h\x1b[?66l\x1b[?67l\x1b[?1035l\x1b[?1036l\x1b[?1039l" ++
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l" ++
+    mouse_event_reset ++ mouse_format_reset ++
     "\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?2033l" ++
     "\x1b[>4;0m\x1b[=0;1u";
 const composed_input_capture = mux_mouse_enable ++ "\x1b[?1004h\x1b[?2004h\x1b[?2031h\x1b[?2033h";
@@ -2721,7 +2723,8 @@ const Pane = struct {
         try out.writer.print("{f}", .{terminal_formatter});
         var filtered: std.ArrayList(u8) = .empty;
         defer filtered.deinit(alloc);
-        try appendWithoutScreenSwitchModes(alloc, &filtered, out.writer.buffered());
+        try appendFilteredTerminalModes(alloc, &filtered, out.writer.buffered());
+        try appendEffectiveMouseModes(alloc, &filtered, &self.term);
         return alloc.dupe(u8, filtered.items);
     }
 
@@ -2759,7 +2762,7 @@ const Pane = struct {
     }
 };
 
-fn appendWithoutScreenSwitchModes(
+fn appendFilteredTerminalModes(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(u8),
     input: []const u8,
@@ -2769,6 +2772,18 @@ fn appendWithoutScreenSwitchModes(
         "\x1b[?1047h", "\x1b[?1047l",
         "\x1b[?1049h", "\x1b[?1049l",
         "\x1b[?2048h", "\x1b[?2048l",
+        // These modes form two mutually exclusive effective-state families.
+        // Replaying their independent mode bits in enum order can change the
+        // active tracking or encoding, so appendEffectiveMouseModes emits a
+        // canonical physical-terminal state after the generic formatter.
+        "\x1b[?9h",    "\x1b[?9l",
+        "\x1b[?1000h", "\x1b[?1000l",
+        "\x1b[?1002h", "\x1b[?1002l",
+        "\x1b[?1003h", "\x1b[?1003l",
+        "\x1b[?1005h", "\x1b[?1005l",
+        "\x1b[?1006h", "\x1b[?1006l",
+        "\x1b[?1015h", "\x1b[?1015l",
+        "\x1b[?1016h", "\x1b[?1016l",
     };
     var offset: usize = 0;
     while (offset < input.len) {
@@ -2786,12 +2801,36 @@ fn appendWithoutScreenSwitchModes(
     }
 }
 
+fn appendEffectiveMouseModes(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    term: *const vt.Terminal,
+) !void {
+    try out.appendSlice(alloc, mouse_event_reset);
+    try out.appendSlice(alloc, switch (term.flags.mouse_event) {
+        .none => "",
+        .x10 => "\x1b[?9h",
+        .normal => "\x1b[?1000h",
+        .button => "\x1b[?1002h",
+        .any => "\x1b[?1003h",
+    });
+
+    try out.appendSlice(alloc, mouse_format_reset);
+    try out.appendSlice(alloc, switch (term.flags.mouse_format) {
+        .x10 => "",
+        .utf8 => "\x1b[?1005h",
+        .sgr => "\x1b[?1006h",
+        .urxvt => "\x1b[?1015h",
+        .sgr_pixels => "\x1b[?1016h",
+    });
+}
+
 const reset_state_sequence = "\x0f\x1b(B" ++
     "\x1b[0m\x1b[0 q\x1b[2l\x1b[12h\x1b[20l" ++
     "\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?7h\x1b[?8h" ++
     "\x1b[4l\x1b[r\x1b[?69l\x1b[?25h" ++
     "\x1b[?66l\x1b[?67l\x1b[?1035l\x1b[?1036l\x1b[?1039l" ++
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l" ++
+    mouse_event_reset ++ mouse_format_reset ++
     "\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?2033l\x1b[?2048l" ++
     "\x1b[>4;0m\x1b[=0;1u";
 const restore_terminal_sequence = reset_state_sequence ++ "\x1b[?2026l";
@@ -6420,12 +6459,82 @@ test "terminal mode handoff excludes screen switches and mode 2048" {
     const alloc = std.testing.allocator;
     var filtered: std.ArrayList(u8) = .empty;
     defer filtered.deinit(alloc);
-    try appendWithoutScreenSwitchModes(
+    try appendFilteredTerminalModes(
         alloc,
         &filtered,
         "a\x1b[?1049hb\x1b[?2048hc\x1b[?2048ld\x1b[31me",
     );
     try std.testing.expectEqualStrings("abcd\x1b[31me", filtered.items);
+}
+
+test "terminal mode handoff preserves effective mouse state" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        input: []const u8,
+        event: []const u8,
+        format: []const u8,
+    };
+    const cases = [_]Case{
+        // Crossterm enables RXVT before SGR so SGR remains the preferred
+        // effective encoding even though both DEC mode bits are set.
+        .{
+            .input = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h",
+            .event = "any",
+            .format = "sgr",
+        },
+        // The inverse order must remain RXVT rather than being normalized to
+        // whichever numeric mode the generic formatter happens to emit last.
+        .{
+            .input = "\x1b[?1003h\x1b[?1000h\x1b[?1006h\x1b[?1015h",
+            .event = "normal",
+            .format = "urxvt",
+        },
+        // Resetting any member makes Ghostty's effective family state fall
+        // back to its default even when a different family bit remains set.
+        .{
+            .input = "\x1b[?1003h\x1b[?1000l\x1b[?1006h\x1b[?1015l",
+            .event = "none",
+            .format = "x10",
+        },
+        .{
+            .input = "\x1b[?9h\x1b[?1005h",
+            .event = "x10",
+            .format = "utf8",
+        },
+        .{
+            .input = "\x1b[?1002h\x1b[?1016h",
+            .event = "button",
+            .format = "sgr_pixels",
+        },
+    };
+
+    for (cases) |case| {
+        var pane: Pane = .{
+            .alloc = alloc,
+            .pty_fd = -1,
+            .child_pid = 0,
+            .command_title = "test",
+            .cell_size = .{},
+            .term = try initTerminal(alloc, .{ .cols = 80, .rows = 24 }),
+            .stream = undefined,
+        };
+        defer pane.term.deinit(alloc);
+        var source_stream = pane.term.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(case.input);
+
+        const replay = try pane.terminalModes(alloc);
+        defer alloc.free(replay);
+
+        var restored = try initTerminal(alloc, .{ .cols = 80, .rows = 24 });
+        defer restored.deinit(alloc);
+        var restored_stream = restored.vtStream();
+        defer restored_stream.deinit();
+        restored_stream.nextSlice(replay);
+
+        try std.testing.expectEqualStrings(case.event, @tagName(restored.flags.mouse_event));
+        try std.testing.expectEqualStrings(case.format, @tagName(restored.flags.mouse_format));
+    }
 }
 
 test "layout clamps split while preserving rows when possible" {

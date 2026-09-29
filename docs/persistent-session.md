@@ -27,6 +27,13 @@ scrollback, or waits for application-specific prompt markers. Once the main
 terminal modes and screen state have been restored, future output resumes raw
 passthrough.
 
+Mouse tracking and mouse encoding are each effective-state families, even
+though applications manipulate them through separate DEC private mode bits.
+During handoff Tinymux resets each family and then enables only the effective
+state recorded by the VT model. This avoids changing the selected protocol when
+an application, such as Crossterm, has enabled more than one family member in a
+deliberate order.
+
 The main application may enter or leave its own alternate screen while a split
 is visible. Those application-owned switches are mirrored to the outer
 terminal, and both touched buffers are reconciled before raw handoff.

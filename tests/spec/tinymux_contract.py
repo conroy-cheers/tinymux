@@ -755,6 +755,45 @@ def test_mouse_wheel_forwards_when_child_requests_mouse(tinymux: str) -> None:
         session.close()
 
 
+def test_auto_close_restores_effective_crossterm_mouse_modes(tinymux: str) -> None:
+    """A split round trip must preserve Crossterm's preferred SGR encoding."""
+    command = (
+        "printf '\\033[?1000h\\033[?1002h\\033[?1003h"
+        "\\033[?1015h\\033[?1006hCROSSTERM_MOUSE_READY'; "
+        "kitty @ --to \"$KITTY_LISTEN_ON\" launch --location hsplit --keep-focus --self "
+        "/bin/sh -lc 'printf CROSSTERM_MOUSE_SPLIT_OPEN; sleep 0.3'; "
+        "sleep 1; "
+        "printf CROSSTERM_MOUSE_AFTER_CLOSE; "
+        "sleep 5"
+    )
+    session = Session([tinymux, "session", "--", "/bin/sh", "-c", command])
+    try:
+        session.wait_for(b"CROSSTERM_MOUSE_SPLIT_OPEN", timeout=5.0)
+        close_start = len(session.output)
+        session.wait_for_after(
+            b"CROSSTERM_MOUSE_AFTER_CLOSE", close_start, timeout=8.0
+        )
+        marker = session.output.index(b"CROSSTERM_MOUSE_AFTER_CLOSE", close_start)
+        handoff = session.output[close_start:marker]
+
+        sgr = handoff.rfind(b"\x1b[?1006h")
+        urxvt = handoff.rfind(b"\x1b[?1015h")
+        assert sgr >= 0 and (urxvt < 0 or sgr > urxvt), (
+            "split close changed Crossterm's effective mouse encoding from SGR "
+            f"to RXVT; handoff={handoff!r}"
+        )
+
+        any_motion = handoff.rfind(b"\x1b[?1003h")
+        normal = handoff.rfind(b"\x1b[?1000h")
+        button_motion = handoff.rfind(b"\x1b[?1002h")
+        assert any_motion >= 0 and any_motion > max(normal, button_motion), (
+            "split close changed Crossterm's effective mouse tracking mode; "
+            f"handoff={handoff!r}"
+        )
+    finally:
+        session.close()
+
+
 def test_alternate_screen_wheel_translates_to_cursor_input(tinymux: str) -> None:
     session = Session(
         [
@@ -2695,6 +2734,7 @@ def main() -> int:
         test_composed_strips_paste_framing_when_pane_disables_it,
         test_composed_virtualizes_keyboard_action_mode,
         test_alternate_screen_wheel_translates_to_cursor_input,
+        test_auto_close_restores_effective_crossterm_mouse_modes,
         # The real Fish daemon lifecycle tests remain in the full suite. The
         # Darwin Nix sandbox does not deliver direnv-instant's watcher-exit
         # signal, so use the deterministic watcher-EOF regression above as
@@ -2733,6 +2773,7 @@ def main() -> int:
         test_mouse_drag_scrollbar_scrolls_main_pane_viewport,
         test_mouse_wheel_scrolls_split_pane_viewport,
         test_mouse_wheel_forwards_when_child_requests_mouse,
+        test_auto_close_restores_effective_crossterm_mouse_modes,
         test_alternate_screen_wheel_translates_to_cursor_input,
         test_split_replays_kitty_graphics,
         test_split_replays_kitty_png_graphics,
