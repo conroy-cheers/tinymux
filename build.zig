@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,
+        .@"emit-lib-vt" = true,
     })) |dep| {
         exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
         if (dep.builder.lazyDependency("wuffs", .{

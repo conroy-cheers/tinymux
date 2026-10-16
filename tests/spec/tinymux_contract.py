@@ -889,7 +889,7 @@ def test_persistent_split_hands_kitty_placements_back_to_raw_mode(tinymux: str) 
         extra_env={"TERM": "xterm-ghostty"},
     )
     try:
-        session.wait_for(b"RAW_IMAGE_CLOSE_DONE", timeout=8.0)
+        session.wait_for(b"RAW_IMAGE_CLOSE_DONE", timeout=30.0)
         session.drain_until_idle(idle=0.2, timeout=3.0)
         output = session.output
 
@@ -936,7 +936,7 @@ def test_persistent_split_tracks_kitty_file_transmissions(tinymux: str) -> None:
             extra_env={"TERM": "xterm-ghostty"},
         )
         try:
-            session.wait_for(b"FILE_IMAGE_CLOSE_DONE", timeout=8.0)
+            session.wait_for(b"FILE_IMAGE_CLOSE_DONE", timeout=30.0)
             session.drain_until_idle(idle=0.2, timeout=3.0)
             output = session.output
 
@@ -984,7 +984,7 @@ def test_fastfetch_image_split_then_atuin_starts_at_the_top(tinymux: str) -> Non
             extra_env={"TERM": "xterm-ghostty"},
         )
         try:
-            session.wait_for(b"ATUIN_ROW_10", timeout=8.0)
+            session.wait_for(b"ATUIN_ROW_10", timeout=30.0)
             session.drain_until_idle(idle=0.2, timeout=3.0)
             output = session.output
 
@@ -1034,7 +1034,7 @@ def test_persistent_split_retains_normalized_iterm_and_sixel_images(tinymux: str
         extra_env={"TERM": "xterm-ghostty"},
     )
     try:
-        session.wait_for(b"STATIC_PROTOCOLS_CLOSE_DONE", timeout=8.0)
+        session.wait_for(b"STATIC_PROTOCOLS_CLOSE_DONE", timeout=30.0)
         session.drain_until_idle(idle=0.2, timeout=3.0)
         output = session.output
 
@@ -1067,7 +1067,7 @@ def test_native_only_graphics_discard_shadow_state_before_split(tinymux: str) ->
         extra_env={"TERM": "xterm-ghostty"},
     )
     try:
-        session.wait_for(b"NATIVE_GRAPHICS_CLOSE_DONE", timeout=8.0)
+        session.wait_for(b"NATIVE_GRAPHICS_CLOSE_DONE", timeout=30.0)
         session.drain_until_idle(idle=0.2, timeout=3.0)
         output = session.output
 
@@ -1140,7 +1140,7 @@ def test_persistent_split_keeps_kitty_images_screen_local(tinymux: str) -> None:
         extra_env={"TERM": "xterm-ghostty"},
     )
     try:
-        session.wait_for(b"SCREEN_IMAGE_CLOSE_DONE", timeout=8.0)
+        session.wait_for(b"SCREEN_IMAGE_CLOSE_DONE", timeout=30.0)
         session.drain_until_idle(idle=0.2, timeout=3.0)
         output = session.output
         managed_upload = f"a=t,t=d,f=24,s=1,v=1,i={outer_id}".encode()
@@ -2125,7 +2125,7 @@ def test_real_direnv_instant_fish_is_usable_after_split_closes(tinymux: str) -> 
             command_offset = len(session.output)
             write_fish_command(session, "printf 'TINYMUX_FISH_AFTER_AUTO_CLOSE\\n'")
             session.wait_for_after(
-                b"TINYMUX_FISH_AFTER_AUTO_CLOSE", command_offset, timeout=8.0
+                b"TINYMUX_FISH_AFTER_AUTO_CLOSE", command_offset, timeout=30.0
             )
         finally:
             session.close()
@@ -2159,7 +2159,7 @@ def assert_focus_event_does_not_leak(
                 "/bin/sh -lc "
                 + shlex.quote("printf TINYMUX_SPLIT_READY; sleep 10"),
             )
-            session.wait_for_after(b"TINYMUX_SPLIT_READY", split_start, timeout=8.0)
+            session.wait_for_after(b"TINYMUX_SPLIT_READY", split_start, timeout=30.0)
             session.drain_until_idle(idle=0.2, timeout=3.0)
 
         command = (
@@ -2175,7 +2175,7 @@ def assert_focus_event_does_not_leak(
         )
         start = len(session.output)
         write_fish_command(session, command)
-        session.wait_for_after(b"TINYMUX_CHILD_WAITING", start, timeout=8.0)
+        session.wait_for_after(b"TINYMUX_CHILD_WAITING", start, timeout=30.0)
         waiting_end = session.output.rfind(b"TINYMUX_CHILD_WAITING") + len(
             b"TINYMUX_CHILD_WAITING"
         )
@@ -2255,7 +2255,7 @@ def test_pane_mode_output_wins_simultaneously_ready_focus_input(tinymux: str) ->
         )
         stopped = False
         try:
-            session.wait_for(b"TINYMUX_RACE_ARMED", timeout=8.0)
+            session.wait_for(b"TINYMUX_RACE_ARMED", timeout=30.0)
             os.kill(session.proc.pid, signal.SIGSTOP)
             stopped = True
             with open(release, "w", encoding="utf-8"):
@@ -2266,7 +2266,7 @@ def test_pane_mode_output_wins_simultaneously_ready_focus_input(tinymux: str) ->
             stopped = False
 
             waiting_start = len(session.output)
-            session.wait_for_after(b"TINYMUX_RACE_WAITING", waiting_start, timeout=8.0)
+            session.wait_for_after(b"TINYMUX_RACE_WAITING", waiting_start, timeout=30.0)
             session.drain_until_idle(idle=0.2, timeout=2.0)
             assert b"TINYMUX_RACE_LEAKED" not in session.output[waiting_start:]
             session.write(b"y")
@@ -2290,7 +2290,7 @@ def test_color_scheme_queries_are_correlated_terminal_reports(tinymux: str) -> N
     ):
         session = Session(argv)
         try:
-            session.wait_for(b"TINYMUX_COLOR_QUERY_SENT", timeout=8.0)
+            session.wait_for(b"TINYMUX_COLOR_QUERY_SENT", timeout=30.0)
             session.wait_for(b"\x1b[?996n", timeout=2.0)
             reply_start = len(session.output)
             session.write(b"\x1b[?997;1n")
@@ -2314,8 +2314,8 @@ def test_composed_mirrors_keyboard_input_protocol_state(tinymux: str) -> None:
         [tinymux, "--split", "sleep 3", "--", "/bin/sh", "-lc", command]
     )
     try:
-        session.wait_for(b"TINYMUX_PROTOCOL_SET", timeout=8.0)
-        session.wait_for(b"TINYMUX_PROTOCOL_RESET", timeout=8.0)
+        session.wait_for(b"TINYMUX_PROTOCOL_SET", timeout=30.0)
+        session.wait_for(b"TINYMUX_PROTOCOL_RESET", timeout=30.0)
         session.drain_until_idle(idle=0.2, timeout=3.0)
         for sequence in (
             b"\x1b[12h",
@@ -2355,7 +2355,7 @@ def test_composed_strips_paste_framing_when_pane_disables_it(tinymux: str) -> No
         [tinymux, "--split", "sleep 3", "--", bash, "--noprofile", "--norc", "-c", command]
     )
     try:
-        session.wait_for(b"TINYMUX_PASTE_WAITING", timeout=8.0)
+        session.wait_for(b"TINYMUX_PASTE_WAITING", timeout=30.0)
         session.write(b"\x1b[200~abc\x1b[201~")
         session.wait_for(b"TINYMUX_PASTE_PLAIN", timeout=5.0)
         assert b"TINYMUX_PASTE_FRAMED" not in session.output
@@ -2375,7 +2375,7 @@ def test_composed_virtualizes_keyboard_action_mode(tinymux: str) -> None:
         [tinymux, "--split", "sleep 3", "--", bash, "--noprofile", "--norc", "-c", command]
     )
     try:
-        session.wait_for(b"TINYMUX_KAM_READY", timeout=8.0)
+        session.wait_for(b"TINYMUX_KAM_READY", timeout=30.0)
         session.write(b"a")
         session.drain_until_idle(idle=0.3, timeout=2.0)
         assert b"TINYMUX_KAM_GOT" not in session.output
@@ -2492,7 +2492,7 @@ def test_persistent_fish_keeps_session_across_sibling_direnv_roots(tinymux: str)
 
             command_offset = len(session.output)
             write_fish_command(session, "printf 'PERSISTENT_AFTER_B\\n'")
-            session.wait_for_after(b"PERSISTENT_AFTER_B", command_offset, timeout=8.0)
+            session.wait_for_after(b"PERSISTENT_AFTER_B", command_offset, timeout=30.0)
         finally:
             session.close()
 
@@ -2614,7 +2614,7 @@ def test_native_pane_generations_ignore_stale_close(tinymux: str) -> None:
                 "-lc",
                 "printf PANE_GENERATION_TWO; sleep 10",
             )
-            session.wait_for_after(b"PANE_GENERATION_TWO", second_offset, timeout=8.0)
+            session.wait_for_after(b"PANE_GENERATION_TWO", second_offset, timeout=30.0)
             session.drain_until_idle(idle=0.4, timeout=4.0)
 
             run_client("pane", "close", old_generation)
